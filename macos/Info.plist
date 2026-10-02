@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>clueless</string>
+	<key>CFBundleIdentifier</key>
+	<string>be.tobrun.clueless</string>
+	<key>CFBundleName</key>
+	<string>clueless</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.6</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>clueless records your microphone so it can show what you said in the meeting transcript.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>clueless captures the audio this Mac plays so it can show what the others in the meeting said.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>clueless uses the screen capture API so it can pick up the meeting audio played by this Mac.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>clueless talks to the speech-to-text and language models running on your local network.</string>
+</dict>
+</plist>
