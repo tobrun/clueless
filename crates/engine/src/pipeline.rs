@@ -135,7 +135,6 @@ struct StreamParts {
 pub struct Pipeline {
     streams: Vec<StreamParts>,
     drain: Arc<Drain>,
-    stop_tx: watch::Sender<bool>,
     cancel: CancellationToken,
     progress: Arc<Mutex<HashMap<Speaker, ProgressEntry>>>,
     commits_tx: watch::Sender<u64>,
@@ -161,11 +160,11 @@ impl Pipeline {
         let (panic_tx, panic_rx) = mpsc::unbounded_channel();
         let has_them = sources.iter().any(|(speaker, _)| *speaker == Speaker::Them);
         let drain = Arc::new(Drain::new(sources.len()));
-        let (stop_tx, stop_rx) = watch::channel(false);
         let (commits_tx, _) = watch::channel(0_u64);
         let progress: Arc<Mutex<HashMap<Speaker, ProgressEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let them_pending: Arc<Mutex<VecDeque<u64>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let them_open_t0 = Arc::new(AtomicU64::new(u64::MAX));
 
         // Build every clock first and hand out the shared watermark handles:
         // the Me echo hold reads the Them stream's watermark.
@@ -199,6 +198,7 @@ impl Pipeline {
                 final_seq_watermark: final_seq_watermark.clone(),
                 drain: drain.clone(),
                 them_pending: them_pending.clone(),
+                them_open_t0: them_open_t0.clone(),
                 panic_tx: panic_tx.clone(),
                 shutdown: shutdown.clone(),
                 idle_poll: deps.timings.idle_poll,
@@ -218,6 +218,7 @@ impl Pipeline {
                 (Speaker::Me, true) => Some(asr_worker::EchoCtx {
                     them_watermark: watermarks[&Speaker::Them].clone(),
                     them_pending: them_pending.clone(),
+                    them_open_t0: them_open_t0.clone(),
                     hold: deps.timings.echo_hold,
                 }),
                 _ => None,
@@ -231,7 +232,6 @@ impl Pipeline {
                 progress: progress.clone(),
                 them_pending: them_pending.clone(),
                 drain: drain.clone(),
-                stop: stop_rx.clone(),
                 cancel: cancel.clone(),
                 echo,
                 timings: deps.timings,
@@ -257,7 +257,6 @@ impl Pipeline {
         Self {
             streams,
             drain,
-            stop_tx,
             cancel,
             progress,
             commits_tx,
@@ -311,10 +310,11 @@ impl Pipeline {
         self.drain.pending_finals()
     }
 
-    /// The spec's stop steps: flush both stream threads, release every echo
-    /// hold at once, wait up to `wait` for queued finals to land, cancel
-    /// what is still in flight, drop the rest with `TranscriptDropped`, and
-    /// join every thread and task.
+    /// The spec's stop steps: flush both stream threads, wait up to `wait`
+    /// for queued finals and pending echo decisions to land (an echo hold is
+    /// never cut short by the stop itself, so a tail echo cannot commit while
+    /// its Them final is still in flight), cancel what is still in flight,
+    /// drop the rest with `TranscriptDropped`, and join every thread and task.
     pub async fn stop(&mut self, wait: Duration) {
         if self.stop_done {
             return;
@@ -324,11 +324,10 @@ impl Pipeline {
         for parts in &self.streams {
             parts.handle.request_stop();
         }
-        // 2. Release every echo hold at once.
-        self.stop_tx.send_replace(true);
-        // 3. Wait for queued and flushed finals to finish, bounded.
+        // 2. Wait for queued and flushed finals to finish, bounded. Echo
+        //    holds keep waiting for their Them finals inside this window.
         let _ = tokio::time::timeout(wait, self.drain.settled_wait()).await;
-        // 4. Cancel: every request still in flight aborts, and the workers
+        // 3. Cancel: every request still in flight aborts, and the workers
         //    emit TranscriptDropped for whatever did not commit.
         self.cancel.cancel();
         let joined = async {
@@ -339,7 +338,7 @@ impl Pipeline {
             }
         };
         let _ = tokio::time::timeout(Duration::from_secs(2), joined).await;
-        // 5. Join the stream threads (they exit right after their flush; a
+        // 4. Join the stream threads (they exit right after their flush; a
         //    wedged source would block here and is a manual-check item).
         for parts in &mut self.streams {
             parts.handle.join();
@@ -354,7 +353,6 @@ impl Drop for Pipeline {
         for parts in &mut self.streams {
             parts.handle.request_stop();
         }
-        self.stop_tx.send_replace(true);
     }
 }
 

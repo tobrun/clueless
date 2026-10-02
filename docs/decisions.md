@@ -244,7 +244,7 @@ D-echo-filter: How is the other side's voice kept out of the "Me" lines when the
   ✓ hold Me finals - a Me final waits until the Them stream has processed past its end time, or 3 s, and is dropped when it overlaps Them audio by 70 percent and shares 60 percent of its words with the committed Them lines plus the Them text still in progress; user kept the filter (user 2026-10-02) ⚠ Me lines appear up to 3 s later, and an echo is missed when no Them text for that stretch exists yet after 3 s
   ✗ no filter, headphones only - was the recommendation, overruled by the user
   ✗ acoustic echo cancellation - cpal does not expose Apple's voice processing unit
-  (2026-10-02, meeting-copilot-mvp/spec.md)
+  (2026-10-02, meeting-copilot-mvp/spec.md; build refinements 2026-10-02: the 60 percent word rule counts a word as reappearing on soundex equality when both words carry at least four letters, because the live ASR heard "the final chains" on the Them track and "Final change" on the echoing mic and the exact-identity rule leaked the echo in the e2e replay; the hold also waits while a Them segment is still open across the Me end time, and a meeting stop no longer cuts a hold short - the stop's drain window waits for the decision and a still-held final drops on cancel, because releasing holds at stop leaked tail echoes like "Have a nice weekend." as Me lines at replay end-of-file)
 
 D-health: How does the user know the servers are reachable?
   ✓ one check at meeting start - GET /v1/models on both servers with a 2 s timeout, and the status label names a server that is offline or a model that is missing

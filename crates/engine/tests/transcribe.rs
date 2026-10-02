@@ -602,8 +602,62 @@ async fn me_echo_of_them_interim_is_dropped() {
     h.stop().await;
 }
 
+/// The replay-EOF race: a Me tail echo is held while Them's final covering
+/// it is still in flight, and the meeting stops in between. The stop must
+/// let the decision finish inside its drain window, so the echo is dropped
+/// and only Them's line commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stop_releases_hold_and_flushes() {
+async fn stop_waits_for_them_to_clear_a_tail_echo() {
+    let mock = MockAsr::start().await;
+    // Me's short utterance closes first (answer lands at once), Them's
+    // longer one closes second with its answer landing 800 ms later.
+    mock.enqueue_final(Respond::text("hello there"));
+    mock.enqueue_final(Respond::Delay {
+        ms: 800,
+        then: Box::new(Respond::text("hello there")),
+    });
+    let opts = Opts {
+        timings: EngineTimings {
+            echo_hold: Duration::from_secs(3),
+            stop_wait: Duration::from_secs(3),
+            ..fast_timings()
+        },
+        ..Opts::default()
+    };
+    let (them_frames, them_probs) = pattern(&[(11, 0.0), (25, 0.9), (20, 0.0)]);
+    let (me_frames, me_probs) = pattern(&[(11, 0.0), (15, 0.9), (20, 0.0)]);
+    let mut h = start(
+        vec![
+            StreamSpec::new(Speaker::Me, me_frames, 2.0, me_probs),
+            StreamSpec::new(Speaker::Them, them_frames, 2.0, them_probs),
+        ],
+        &mock,
+        opts,
+    );
+
+    // Both finals reached the mock (Them's is in its delay) and Me's answer
+    // landed, so Me sits in the echo hold while the stop begins.
+    assert!(
+        mock.wait_requests(2, Duration::from_secs(6)).await,
+        "both finals reached the mock"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.stop().await;
+
+    let finals = h.finals();
+    assert_eq!(finals.len(), 1, "only Them committed: {finals:?}");
+    assert_eq!(finals[0].id.speaker, Speaker::Them);
+    assert_eq!(finals[0].text, "hello there");
+    let dropped = h.dropped();
+    assert_eq!(dropped.len(), 1, "the tail echo dropped: {dropped:?}");
+    assert_eq!(dropped[0].speaker, Speaker::Me);
+    assert_eq!(h.pipeline.pending_finals(), 0);
+}
+
+/// The same stop, but Them's final never lands: the cancel must drop the
+/// held Me final rather than decide it with what is known.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_during_hold_drops_the_held_me_final() {
     let mock = MockAsr::start().await;
     mock.set_final_min_ms(2_048);
     mock.block();
@@ -650,20 +704,18 @@ async fn stop_releases_hold_and_flushes() {
         "stop returned in {took:?}, not waiting for the hold"
     );
     let finals = h.finals();
-    assert_eq!(
-        finals.len(),
-        1,
-        "Me decided when the stop released the hold"
+    assert!(
+        finals.is_empty(),
+        "a Me final still under echo hold must not commit at stop: {finals:?}"
     );
-    assert_eq!(finals[0].id.speaker, Speaker::Me);
-    assert_eq!(finals[0].text, "me text");
     let dropped = h.dropped();
     assert_eq!(
         dropped.len(),
-        1,
-        "the blocked Them final was cancelled and dropped"
+        2,
+        "the blocked Them final and the held Me final both drop: {dropped:?}"
     );
-    assert_eq!(dropped[0].speaker, Speaker::Them);
+    assert!(dropped.iter().any(|d| d.speaker == Speaker::Them));
+    assert!(dropped.iter().any(|d| d.speaker == Speaker::Me));
     assert_eq!(
         h.pipeline.pending_finals(),
         0,

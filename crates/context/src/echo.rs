@@ -10,6 +10,10 @@ use clueless_types::Utterance;
 /// True when `me` overlaps the `them` entries in time for at least 70 percent
 /// of its own length and at least 60 percent of its words reappear, in order,
 /// in the text of the overlapping entries.
+///
+/// A word "reappears" on exact identity or on an equal soundex code (words of
+/// at least four letters): the live ASR hears the same utterance differently
+/// on the mic and on the loopback track ("final change" vs "final chains").
 pub fn is_echo(me: &Utterance, them: &[Utterance]) -> bool {
     let me_words = tokenize(&me.text);
     if me_words.is_empty() {
@@ -70,6 +74,43 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Two words count as the same when they are equal, or when both carry at
+/// least four letters and share a soundex code. The length guard keeps short
+/// function words ("the"/"they") from colliding phonetically.
+fn words_match(a: &str, b: &str) -> bool {
+    a == b || (a.len() >= 4 && b.len() >= 4 && soundex(a) == soundex(b))
+}
+
+/// The classic 4-character soundex code of a word: first letter kept, the
+/// rest mapped to consonant classes, adjacent equal classes and vowels
+/// dropped, padded or truncated to four characters.
+fn soundex(word: &str) -> String {
+    let mut code = String::with_capacity(4);
+    let mut previous = '0';
+    for ch in word.chars().filter(|c| c.is_ascii_alphabetic()) {
+        let digit = match ch.to_ascii_lowercase() {
+            'b' | 'f' | 'p' | 'v' => '1',
+            'c' | 'g' | 'j' | 'k' | 'q' | 's' | 'x' | 'z' => '2',
+            'd' | 't' => '3',
+            'l' => '4',
+            'm' | 'n' => '5',
+            'r' => '6',
+            _ => '0',
+        };
+        if code.is_empty() {
+            code.push(ch.to_ascii_uppercase());
+        } else if digit != '0' && digit != previous {
+            code.push(digit);
+        }
+        previous = digit;
+    }
+    code.truncate(4);
+    while code.len() < 4 {
+        code.push('0');
+    }
+    code
+}
+
 /// Length of the longest common subsequence of two word lists.
 fn longest_common_subsequence(a: &[String], b: &[String]) -> usize {
     let mut previous = vec![0_usize; b.len() + 1];
@@ -77,7 +118,7 @@ fn longest_common_subsequence(a: &[String], b: &[String]) -> usize {
     for ai in a {
         current[0] = 0;
         for (j, bj) in b.iter().enumerate() {
-            current[j + 1] = if ai == bj {
+            current[j + 1] = if words_match(ai, bj) {
                 previous[j] + 1
             } else {
                 current[j].max(previous[j + 1])
@@ -152,6 +193,29 @@ mod tests {
     fn me_text_without_words_is_not_echo() {
         let me = utterance(Speaker::Me, 1000, 3000, "... !?");
         let them = [them(900, 3100, "... !?")];
+        assert!(!is_echo(&me, &them));
+    }
+
+    #[test]
+    fn asr_spelling_variants_still_count_as_echo() {
+        // The live failure this guards: the Them track transcribed as
+        // "Sarah will review the final chains." while the quieter echoing
+        // mic came back as "Final change." Exact word identity matched only
+        // 1 of 2 words (50 percent) and missed; soundex matching lands it.
+        let me = utterance(Speaker::Me, 43_700, 46_001, "Final change.");
+        let them = [
+            them(42_000, 43_400, "I will write the notes."),
+            them(43_500, 46_129, "Sarah will review the final chains."),
+        ];
+        assert!(is_echo(&me, &them));
+    }
+
+    #[test]
+    fn short_words_are_not_matched_phonetically() {
+        // "the" and "pin" share soundex codes with "they" and "pine", but
+        // the four-letter guard keeps them exact: 0 of 2 words match here.
+        let me = utterance(Speaker::Me, 1000, 3000, "the pin");
+        let them = [them(900, 3100, "they pine")];
         assert!(!is_echo(&me, &them));
     }
 }

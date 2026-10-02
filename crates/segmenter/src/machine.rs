@@ -123,6 +123,13 @@ impl Machine {
         self.seq
     }
 
+    /// The audio start time of the currently open segment, if one is open.
+    /// Listeners that wait for "everything Them said around time T" must not
+    /// treat an open segment as settled: it becomes text only when it closes.
+    pub fn open_t0_ms(&self) -> Option<u64> {
+        self.open.as_ref().map(|segment| segment.t0_ms)
+    }
+
     /// Feed 16 kHz mono audio for frame `frame` onward, in frame order.
     /// Frames skipped over read as silence; audio is frame-aligned.
     pub fn push_audio(&mut self, frame: u64, samples: &[f32]) {

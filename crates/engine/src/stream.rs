@@ -35,6 +35,9 @@ pub struct StreamPipes {
     pub drain: Arc<Drain>,
     /// t0 of every queued or in-flight Them final (echo hold reads this).
     pub them_pending: Arc<Mutex<VecDeque<u64>>>,
+    /// Start time of Them's currently open segment, or `u64::MAX` when none
+    /// is open (echo hold reads this: an open segment is not text yet).
+    pub them_open_t0: Arc<AtomicU64>,
     pub panic_tx: tokio::sync::mpsc::UnboundedSender<String>,
     pub shutdown: Arc<AtomicBool>,
     pub idle_poll: Duration,
@@ -142,6 +145,7 @@ fn stream_loop(
                         send_segment(speaker, segment, pipes);
                     }
                 }
+                sync_them_open_t0(speaker, &machine, pipes);
             }
             SourceRead::Empty => {
                 clock.follow_wall_clock();
@@ -197,6 +201,7 @@ fn stream_loop(
                 if let Some(segment) = machine.close_segment() {
                     send_segment(speaker, segment, pipes);
                 }
+                sync_them_open_t0(speaker, &machine, pipes);
                 clock.set_infinite();
                 pipes.drain.source_ended();
                 return;
@@ -209,6 +214,7 @@ fn stream_loop(
     if let Some(segment) = machine.flush() {
         send_segment(speaker, segment, pipes);
     }
+    sync_them_open_t0(speaker, &machine, pipes);
     clock.set_infinite();
     pipes.drain.source_ended();
 }
@@ -227,9 +233,21 @@ fn close_and_reanchor(
     if let Some(segment) = machine.close_segment() {
         send_segment(speaker, segment, pipes);
     }
+    sync_them_open_t0(speaker, machine, pipes);
     vad.reset();
     resampler.reset();
     clock.anchor_now();
+}
+
+/// Mirror the segmenter's open-segment state for the Me echo hold: the t0 of
+/// Them's open segment, or `u64::MAX` when none is open. Always called after
+/// any `send_segment` of a close, so a hold that sees the open t0 cleared
+/// already sees the closed final registered in `them_pending`.
+fn sync_them_open_t0(speaker: Speaker, machine: &Machine, pipes: &StreamPipes) {
+    if speaker == Speaker::Them {
+        let t0 = machine.open_t0_ms().unwrap_or(u64::MAX);
+        pipes.them_open_t0.store(t0, Ordering::Release);
+    }
 }
 
 /// Route one machine segment: interims replace the latest-wins slot, finals

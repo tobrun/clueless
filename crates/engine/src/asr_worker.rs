@@ -95,6 +95,10 @@ pub struct EchoCtx {
     pub them_watermark: Arc<AtomicU64>,
     /// `t0_ms` of every queued or in-flight Them final.
     pub them_pending: Arc<Mutex<VecDeque<u64>>>,
+    /// Start of Them's currently open segment, or `u64::MAX` when none is
+    /// open: an open segment is Them text not yet on its way to becoming a
+    /// final, so the hold keeps waiting while it lies below the Me end time.
+    pub them_open_t0: Arc<AtomicU64>,
     pub hold: Duration,
 }
 
@@ -112,8 +116,6 @@ pub struct WorkerCtx {
     /// removes its own entries, the Me hold reads them.
     pub them_pending: Arc<Mutex<VecDeque<u64>>>,
     pub drain: Arc<Drain>,
-    /// Set by `Pipeline::stop`: releases every echo hold at once.
-    pub stop: watch::Receiver<bool>,
     /// The meeting's cancel token: aborts in-flight requests.
     pub cancel: CancellationToken,
     /// Some only for a Me stream while a Them source is open.
@@ -199,7 +201,7 @@ async fn process_final(
             return None;
         }
     };
-    tracing::debug!(
+    tracing::info!(
         speaker = ?segment.id.speaker,
         seq = segment.id.seq,
         vad_end_ms = segment.t1_ms,
@@ -278,16 +280,18 @@ async fn process_final(
     Some(text)
 }
 
-/// Hold a Me final until the Them watermark passed `t1_ms` with nothing of
-/// theirs before it still uncommitted, or the hold timed out, or the meeting
-/// stopped (decide at once with what is known).
+/// Hold a Me final until the Them watermark passed `t1_ms`, no Them segment
+/// is open across it, and nothing of theirs before it is still uncommitted -
+/// or the hold timed out (decide with what is known). A meeting stop does
+/// NOT cut this short: the pipeline's stop waits inside `stop_wait` for the
+/// decision, so a tail echo can never commit while the Them final covering
+/// it is still in flight. Only the meeting's cancel token releases early.
 async fn hold_for_them(ctx: &WorkerCtx, echo: &EchoCtx, t1_ms: u64) {
     let deadline = tokio::time::Instant::now() + echo.hold;
     let mut ticker = tokio::time::interval(Duration::from_millis(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut stop = ctx.stop.clone();
     loop {
-        if *stop.borrow_and_update() || ctx.cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return;
         }
         if echo_released(echo, t1_ms) {
@@ -299,7 +303,6 @@ async fn hold_for_them(ctx: &WorkerCtx, echo: &EchoCtx, t1_ms: u64) {
         }
         tokio::select! {
             _ = ticker.tick() => {}
-            _ = stop.changed() => {}
             _ = ctx.cancel.cancelled() => return,
         }
     }
@@ -310,8 +313,15 @@ fn echo_released(echo: &EchoCtx, t1_ms: u64) -> bool {
     if echo.them_watermark.load(Ordering::Acquire) < t1_ms {
         return false;
     }
-    // Watermark passed: everything Them will say that could be an echo of
-    // this is registered unless still queued or in flight.
+    // A Them segment still open across this Me end has spoken into the span
+    // but produced no text yet: it closes as a final shortly and could hold
+    // the echo, so the hold keeps waiting.
+    if echo.them_open_t0.load(Ordering::Acquire) < t1_ms {
+        return false;
+    }
+    // Watermark passed and no open segment: everything Them will say that
+    // could be an echo of this is registered unless still queued or in
+    // flight.
     !echo
         .them_pending
         .lock()
@@ -369,7 +379,7 @@ pub async fn run_interim(
         if seq < final_seq_watermark.load(Ordering::Acquire) {
             continue;
         }
-        tracing::debug!(
+        tracing::info!(
             speaker = ?ctx.speaker,
             seq,
             vad_end_ms = segment.t1_ms,
@@ -380,7 +390,7 @@ pub async fn run_interim(
             result = ctx.asr.transcribe(&segment.pcm, 1) => result,
             _ = ctx.cancel.cancelled() => break,
         };
-        tracing::debug!(
+        tracing::info!(
             speaker = ?ctx.speaker,
             seq,
             vad_end_ms = segment.t1_ms,
