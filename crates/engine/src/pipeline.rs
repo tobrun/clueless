@@ -294,6 +294,12 @@ impl Pipeline {
         self.drain.settled_wait().await;
     }
 
+    /// A shared handle to the drain state, so the meeting loop can await
+    /// settlement in a task without borrowing the pipeline.
+    pub fn drain_handle(&self) -> Arc<Drain> {
+        self.drain.clone()
+    }
+
     /// The receiver of internal panic messages from stream threads and
     /// worker tasks; taken once by the meeting loop.
     pub fn panics(&mut self) -> Option<mpsc::UnboundedReceiver<String>> {

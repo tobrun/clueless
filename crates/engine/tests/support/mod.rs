@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,22 +13,26 @@ use std::time::{Duration, Instant};
 use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 
 use asr::client::AsrClient;
 use clueless_types::UtteranceId;
 use clueless_types::audio::{SampleSource, SourceError, SourceFactory, SourceRead};
-use clueless_types::events::{Speaker, StatusLevel, StatusSink, StatusSource, UiEvent, Utterance};
+use clueless_types::config::{Config, LlmConfig, ServerConfig, VadConfig};
+use clueless_types::events::{
+    EngineCommand, MeetingState, Speaker, StatusLevel, StatusSink, StatusSource, UiEvent, Utterance,
+};
 use context::store::TranscriptStore;
 use segmenter::machine::MachineParams;
 use segmenter::vad::SpeechProb;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use engine::clock::MeetingClock;
 use engine::deps::{EngineDeps, EngineTimings};
+use engine::meeting::Engine;
 use engine::pipeline::Pipeline;
 
 // ---------------------------------------------------------------- vad
@@ -246,10 +250,12 @@ struct MockState {
     /// A request whose audio is at least this long counts as a `Final` for
     /// the queues and counters (tests size utterances to be separable).
     final_min_ms: AtomicU64,
+    models: Mutex<Vec<String>>,
 }
 
 pub struct MockAsr {
     pub base_url: String,
+    pub port: u16,
     state: Arc<MockState>,
 }
 
@@ -267,6 +273,7 @@ impl MockAsr {
             blocked: watch::channel(false).0,
             started: Instant::now(),
             final_min_ms: AtomicU64::new(0),
+            models: Mutex::new(vec!["mock-model".to_owned()]),
         });
         let app = Router::new()
             .route("/v1/audio/transcriptions", any(transcribe))
@@ -279,8 +286,14 @@ impl MockAsr {
         });
         Self {
             base_url: format!("http://{addr}"),
+            port: addr.port(),
             state,
         }
+    }
+
+    /// Replace the ids `GET /v1/models` lists (health-check tests).
+    pub fn set_models(&self, models: Vec<String>) {
+        *self.state.models.lock().unwrap() = models;
     }
 
     /// Queue one scripted answer for a final request (arrival order).
@@ -427,11 +440,15 @@ async fn play(state: &Arc<MockState>, mut response: Respond) -> Response {
     }
 }
 
-async fn models() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "object": "list",
-        "data": [{ "id": "mock-model", "object": "model" }],
-    }))
+async fn models(State(state): State<Arc<MockState>>) -> Json<serde_json::Value> {
+    let data: Vec<serde_json::Value> = state
+        .models
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|id| serde_json::json!({ "id": id, "object": "model" }))
+        .collect();
+    Json(serde_json::json!({ "object": "list", "data": data }))
 }
 
 // ---------------------------------------------------------------- harness
@@ -696,4 +713,546 @@ pub fn temp_path(name: &str) -> PathBuf {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     path
+}
+
+// ------------------------------------------------------- meeting support
+
+/// Vad script for the meeting harness: a probability script, or a
+/// detector that panics at its Nth scored frame.
+pub enum VadScript {
+    Probs(Vec<f32>),
+    PanicsAt(usize),
+}
+
+pub struct PanickingVad {
+    calls: usize,
+    at: usize,
+}
+
+impl SpeechProb for PanickingVad {
+    fn prob(&mut self, _frame: &[f32]) -> f32 {
+        self.calls += 1;
+        if self.calls == self.at {
+            panic!("scripted vad panic");
+        }
+        0.9
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// Vad factory handing out one script per created detector, in creation
+/// order (the pipeline creates detectors in source-open order).
+pub fn vad_factory_scripts(
+    scripts: Vec<VadScript>,
+) -> Arc<dyn Fn() -> Box<dyn SpeechProb> + Send + Sync> {
+    let queue = Arc::new(Mutex::new(VecDeque::from(scripts)));
+    Arc::new(move || match queue.lock().unwrap().pop_front() {
+        Some(VadScript::Probs(probs)) => Box::new(FixedVad { probs, index: 0 }),
+        Some(VadScript::PanicsAt(at)) => Box::new(PanickingVad { calls: 0, at }),
+        None => Box::new(FixedVad {
+            probs: Vec::new(),
+            index: 0,
+        }),
+    })
+}
+
+/// What `ScriptedFactory::open` hands out for one open call.
+#[derive(Clone)]
+pub struct SourcePlan {
+    pub frames: usize,
+    pub speed: f64,
+    pub never_end: bool,
+}
+
+impl SourcePlan {
+    pub fn new(frames: usize) -> Self {
+        Self {
+            frames,
+            speed: 1000.0,
+            never_end: false,
+        }
+    }
+
+    /// Runs out of frames but never returns `Ended` (a live-like source).
+    pub fn endless(frames: usize) -> Self {
+        Self {
+            never_end: true,
+            ..Self::new(frames)
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum OpenPlan {
+    Ok(SourcePlan),
+    Fail(SourceError),
+}
+
+/// Source factory with a per-speaker queue of open outcomes; opens pop
+/// in order, so a second meeting gets the second plan.
+pub struct ScriptedFactory {
+    speakers: Vec<Speaker>,
+    plans: Mutex<HashMap<Speaker, VecDeque<OpenPlan>>>,
+}
+
+impl ScriptedFactory {
+    pub fn new(entries: Vec<(Speaker, Vec<OpenPlan>)>) -> Self {
+        let mut speakers = Vec::new();
+        let mut plans = HashMap::new();
+        for (speaker, list) in entries {
+            if !speakers.contains(&speaker) {
+                speakers.push(speaker);
+            }
+            plans.insert(speaker, VecDeque::from(list));
+        }
+        Self {
+            speakers,
+            plans: Mutex::new(plans),
+        }
+    }
+}
+
+impl SourceFactory for ScriptedFactory {
+    fn speakers(&self) -> Vec<Speaker> {
+        self.speakers.clone()
+    }
+
+    fn open(
+        &self,
+        speaker: Speaker,
+        _status: StatusSink,
+    ) -> Result<Box<dyn SampleSource>, SourceError> {
+        let plan = self
+            .plans
+            .lock()
+            .unwrap()
+            .get_mut(&speaker)
+            .and_then(|queue| queue.pop_front());
+        match plan {
+            Some(OpenPlan::Ok(plan)) => {
+                let source = ScriptedSource::new(plan.frames, plan.speed);
+                Ok(Box::new(if plan.never_end {
+                    source.never_end()
+                } else {
+                    source
+                }))
+            }
+            Some(OpenPlan::Fail(error)) => Err(error),
+            None => Err(SourceError::DeviceNotFound(format!(
+                "no scripted source for {speaker:?}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- mock llm
+
+/// One SSE production step of a scripted chat stream.
+#[derive(Clone, Debug)]
+pub enum Step {
+    Chunk(String),
+    Sleep(Duration),
+}
+
+impl Step {
+    pub fn chunk(text: &str) -> Self {
+        Step::Chunk(text.to_owned())
+    }
+
+    pub fn sleep_ms(ms: u64) -> Self {
+        Step::Sleep(Duration::from_millis(ms))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum LlmReply {
+    /// Delta steps, then `data: [DONE]`.
+    Stream(Vec<Step>),
+    /// Delta steps, then the body ends without `[DONE]` (client: Closed).
+    CloseMidStream(Vec<Step>),
+    /// HTTP error status with a JSON error body.
+    Http { status: u16, body: String },
+}
+
+impl LlmReply {
+    pub fn stream(deltas: &[&str]) -> Self {
+        LlmReply::Stream(
+            deltas
+                .iter()
+                .map(|d| Step::Chunk((*d).to_owned()))
+                .collect(),
+        )
+    }
+
+    /// Deltas with `gap` between them (for cancellation races).
+    pub fn slow_stream(deltas: &[&str], gap: Duration) -> Self {
+        let mut steps = Vec::new();
+        for (index, delta) in deltas.iter().enumerate() {
+            if index > 0 {
+                steps.push(Step::Sleep(gap));
+            }
+            steps.push(Step::Chunk((*delta).to_owned()));
+        }
+        LlmReply::Stream(steps)
+    }
+}
+
+struct LlmState {
+    replies: Mutex<VecDeque<LlmReply>>,
+    models: Mutex<Vec<String>>,
+    bodies: Mutex<Vec<serde_json::Value>>,
+    started: Instant,
+}
+
+pub struct MockLlm {
+    pub base_url: String,
+    pub port: u16,
+    state: Arc<LlmState>,
+}
+
+impl MockLlm {
+    pub async fn start() -> Self {
+        let state = Arc::new(LlmState {
+            replies: Mutex::new(VecDeque::new()),
+            models: Mutex::new(vec!["mock-model".to_owned()]),
+            bodies: Mutex::new(Vec::new()),
+            started: Instant::now(),
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(llm_chat))
+            .route("/v1/models", get(llm_models))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            port: addr.port(),
+            state,
+        }
+    }
+
+    /// Queue one scripted answer (arrival order; default is a one-delta stream).
+    pub fn enqueue(&self, reply: LlmReply) {
+        self.state.replies.lock().unwrap().push_back(reply);
+    }
+
+    pub fn set_models(&self, models: Vec<String>) {
+        *self.state.models.lock().unwrap() = models;
+    }
+
+    pub fn bodies(&self) -> Vec<serde_json::Value> {
+        self.state.bodies.lock().unwrap().clone()
+    }
+
+    pub fn body_count(&self) -> usize {
+        self.state.bodies.lock().unwrap().len()
+    }
+
+    pub fn last_body(&self) -> Option<serde_json::Value> {
+        self.state.bodies.lock().unwrap().last().cloned()
+    }
+
+    pub async fn wait_bodies(&self, count: usize, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.body_count() >= count {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+async fn llm_models(State(state): State<Arc<LlmState>>) -> Json<serde_json::Value> {
+    let data: Vec<serde_json::Value> = state
+        .models
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|id| serde_json::json!({ "id": id, "object": "model" }))
+        .collect();
+    Json(serde_json::json!({ "object": "list", "data": data }))
+}
+
+async fn llm_chat(State(state): State<Arc<LlmState>>, body: axum::body::Bytes) -> Response {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    state.bodies.lock().unwrap().push(parsed);
+    let reply = state
+        .replies
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or_else(|| LlmReply::stream(&["mock answer"]));
+    match reply {
+        LlmReply::Stream(steps) => sse_response(steps, false),
+        LlmReply::CloseMidStream(steps) => sse_response(steps, true),
+        LlmReply::Http { status, body } => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+    }
+}
+
+fn sse_chunk(text: &str) -> axum::body::Bytes {
+    let event = serde_json::json!({ "choices": [{ "index": 0, "delta": { "content": text } }] });
+    axum::body::Bytes::from(format!("data: {event}\n\n"))
+}
+
+fn sse_response(steps: Vec<Step>, close_early: bool) -> Response {
+    struct SseState {
+        steps: Vec<Step>,
+        index: usize,
+        finished: bool,
+        close_early: bool,
+    }
+    let stream = futures_util::stream::unfold(
+        SseState {
+            steps,
+            index: 0,
+            finished: false,
+            close_early,
+        },
+        |mut state| async move {
+            if state.finished {
+                return None;
+            }
+            while let Some(Step::Sleep(duration)) = state.steps.get(state.index) {
+                tokio::time::sleep(*duration).await;
+                state.index += 1;
+            }
+            match state.steps.get(state.index).cloned() {
+                Some(Step::Chunk(text)) => {
+                    state.index += 1;
+                    Some((Ok::<_, std::io::Error>(sse_chunk(&text)), state))
+                }
+                _ => {
+                    state.finished = true;
+                    if state.close_early {
+                        None
+                    } else {
+                        Some((
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                b"data: [DONE]\n\n",
+                            )),
+                            state,
+                        ))
+                    }
+                }
+            }
+        },
+    );
+    axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .body(axum::body::Body::from_stream(stream))
+        .expect("valid sse response")
+        .into_response()
+}
+
+// ---------------------------------------------------------------- meeting harness
+
+pub struct MeetingOpts {
+    pub timings: EngineTimings,
+    pub machine: MachineParams,
+    pub compress_threshold_tokens: usize,
+    pub profile_path: Option<String>,
+    /// Override the asr model name in the config (model-missing tests).
+    pub asr_model: Option<String>,
+    /// Override the llm port (closed-port tests pass a freed one).
+    pub llm_port: Option<u16>,
+}
+
+impl Default for MeetingOpts {
+    fn default() -> Self {
+        Self {
+            timings: fast_timings(),
+            machine: MachineParams::default(),
+            compress_threshold_tokens: 1_000,
+            profile_path: None,
+            asr_model: None,
+            llm_port: None,
+        }
+    }
+}
+
+/// Runs a real `Engine` over scripted sources and both mocks, recording
+/// every UI event with its arrival time.
+pub struct MeetingHarness {
+    pub events: Arc<Mutex<Vec<Timed>>>,
+    pub commands: mpsc::UnboundedSender<EngineCommand>,
+    pub engine: tokio::task::JoinHandle<()>,
+    pub started: Instant,
+}
+
+impl MeetingHarness {
+    pub async fn start(
+        asr: &MockAsr,
+        llm: &MockLlm,
+        factory: ScriptedFactory,
+        vad: Vec<VadScript>,
+        opts: MeetingOpts,
+    ) -> Self {
+        let events: Arc<Mutex<Vec<Timed>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let started = Instant::now();
+        let ui: StatusSink = Arc::new(move |event| {
+            sink.lock().unwrap().push(Timed {
+                at: Instant::now(),
+                event,
+            });
+        });
+        let config = Config {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                llm_port: opts.llm_port.unwrap_or(llm.port),
+                asr_port: asr.port,
+                llm_model: "mock-model".into(),
+                asr_model: opts
+                    .asr_model
+                    .clone()
+                    .unwrap_or_else(|| "mock-model".into()),
+            },
+            vad: VadConfig {
+                start_threshold: opts.machine.start_threshold,
+                end_threshold: opts.machine.end_threshold,
+                end_silence_frames: opts.machine.end_silence_frames as usize,
+                max_segment_ms: opts.machine.max_segment_ms,
+            },
+            llm: LlmConfig {
+                profile_path: opts.profile_path.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let deps = EngineDeps {
+            factory: Arc::new(factory),
+            ui,
+            vad: vad_factory_scripts(vad),
+            timings: opts.timings,
+            compress_threshold_tokens: opts.compress_threshold_tokens,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let engine = tokio::spawn(Engine::new(config, deps).run(rx));
+        Self {
+            events,
+            commands: tx,
+            engine,
+            started,
+        }
+    }
+
+    pub fn cmd(&self, command: EngineCommand) {
+        self.commands.send(command).expect("engine loop alive");
+    }
+
+    pub fn snapshot(&self) -> Vec<UiEvent> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|timed| timed.event.clone())
+            .collect()
+    }
+
+    pub async fn wait_until(
+        &self,
+        timeout: Duration,
+        pred: impl Fn(&Vec<UiEvent>) -> bool,
+    ) -> Vec<UiEvent> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let events = self.snapshot();
+            if pred(&events) {
+                return events;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    pub fn states(&self) -> Vec<MeetingState> {
+        self.snapshot()
+            .into_iter()
+            .filter_map(|event| match event {
+                UiEvent::MeetingState(state) => Some(state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub async fn wait_state(&self, wanted: MeetingState, timeout: Duration) -> bool {
+        self.wait_until(timeout, |events| {
+            events.contains(&UiEvent::MeetingState(wanted))
+        })
+        .await
+        .contains(&UiEvent::MeetingState(wanted))
+    }
+
+    pub fn statuses(&self) -> Vec<(StatusSource, StatusLevel, String)> {
+        self.snapshot()
+            .into_iter()
+            .filter_map(|event| match event {
+                UiEvent::Status {
+                    source,
+                    level,
+                    text,
+                } => Some((source, level, text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Index of the first event matching `pred`.
+    pub fn index_where(&self, pred: impl Fn(&UiEvent) -> bool) -> Option<usize> {
+        self.snapshot().iter().position(pred)
+    }
+
+    /// True when the first event matching `before` precedes the first
+    /// matching `after` (both must exist).
+    pub fn ordered(
+        &self,
+        before: impl Fn(&UiEvent) -> bool,
+        after: impl Fn(&UiEvent) -> bool,
+    ) -> bool {
+        match (self.index_where(before), self.index_where(after)) {
+            (Some(first), Some(second)) => first < second,
+            _ => false,
+        }
+    }
+
+    pub async fn shutdown(self) {
+        self.cmd(EngineCommand::Shutdown);
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.engine).await;
+    }
+}
+
+/// A TCP port that was bound and released, so connecting to it is refused.
+pub async fn closed_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    port
+}
+
+/// Build `(frames, probs)` runs into one concatenated source script:
+/// consecutive `(frames, prob)` runs of a pattern.
+pub fn concat_utterances(parts: &[(usize, Vec<f32>)]) -> (usize, Vec<f32>) {
+    let mut frames = 0usize;
+    let mut probs = Vec::new();
+    for (count, run) in parts {
+        frames += count;
+        probs.extend(run.iter().copied());
+    }
+    (frames, probs)
 }
