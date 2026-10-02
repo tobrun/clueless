@@ -6,26 +6,26 @@ Each guarantee carries a verify mark until the change set that implements it has
 ## Capture
 
 C-source-nonblocking: SampleSource::read never blocks and never allocates on the caller's behalf beyond the given buffer
-  guaranteed by: capture sources (stream restarts and rebuilds run on a helper thread, and read returns Empty meanwhile) and the replay source ? verify: the code does not exist yet; check when its change set lands
+  guaranteed by: capture sources (stream restarts and rebuilds run on a helper thread, and read returns Empty meanwhile) and the replay source ? verified 2026-10-02 (CS7/CS10: capture watchdog + ring tests, engine/tests/replay.rs pacing tests)
   relied on by: engine stream threads
   (2026-10-02, meeting-copilot-mvp/spec.md)
 
 C-audio-callback-realtime: the microphone callback does not allocate, lock or log
-  guaranteed by: capture mic callback (per-sample push into the ring) ? verify: the code does not exist yet; check when its change set lands
+  guaranteed by: capture mic callback (per-sample push into the ring) ? verified 2026-10-02 (CS7: mic.rs + ring.rs tests; the callback only writes into the pre-allocated ring)
   relied on by: Core Audio
   (2026-10-02, meeting-copilot-mvp/spec.md)
 
 ## Context
 
 C-prompt-prefix-stable: between two compressions, the user message built after N+1 committed lines starts with the exact bytes of the transcript part built after N lines
-  guaranteed by: context prompt builder (append-only store, tail always last) ? verify: the code does not exist yet; check when its change set lands
+  guaranteed by: context prompt builder (append-only store, tail always last) ? verified 2026-10-02 (CS6: context/src/prompt.rs::transcript_prefix_is_stable_when_a_line_is_committed)
   relied on by: LLM server prefix cache, latency budget
   (2026-10-02, meeting-copilot-mvp/spec.md)
 
 ## Engine
 
 C-finals-in-order: for one speaker, TranscriptFinal events are emitted in increasing seq order, and each seq at most once
-  guaranteed by: engine final worker (one request at a time per stream) ? verify: the code does not exist yet; check when its change set lands
+  guaranteed by: engine final worker (one request at a time per stream) ? verified 2026-10-02 (CS10: engine/tests/transcribe.rs::slow_first_final_keeps_order_and_single_flight)
   relied on by: context transcript store, overlay ticker
   (2026-10-02, meeting-copilot-mvp/spec.md)
 

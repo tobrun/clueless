@@ -489,6 +489,7 @@ dependencies = [
  "hound",
  "llm",
  "segmenter",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tokio-util",

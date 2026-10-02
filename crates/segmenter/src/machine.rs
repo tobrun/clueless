@@ -279,7 +279,9 @@ impl Machine {
             (cut_frame + 1).saturating_sub(OVERLAP_CARRY_FRAMES)
         } else {
             cut_frame + 1
-        };
+        }
+        // a cut landing on the current frame must still leave it open
+        .min(frame);
         let speech_frames = self.count_above_start(next_start, frame);
         let (silence_run, last_above) = self.trailing_silence_state(next_start, frame);
         self.open = Some(OpenSegment {
