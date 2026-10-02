@@ -1,0 +1,67 @@
+# Architecture
+
+Purpose: clueless is a macOS meeting copilot for one user on one Mac. During a meeting it records the microphone ("Me") and the system audio ("Them") as two streams, cuts each into utterances, transcribes each utterance on a speech-to-text server on the LAN, and shows a rolling transcript in a floating overlay panel. On a hotkey it asks an LLM server on the LAN what to say next and streams the answer into the panel. Audio flows capture -> ring buffer -> engine stream thread (resample, voice detection, segmenter) -> ASR worker -> transcript store -> UI event -> overlay; a suggestion flows hotkey -> engine command -> prompt builder -> LLM stream -> overlay.
+
+Captured: 2026-10-02 (full, build) - Updated: 2026-10-02 (change set 1)
+
+## Components
+
+| Component | Responsibility | Lives at | Talks to |
+| --------- | -------------- | -------- | -------- |
+| types | shared data types, config, source traits | `crates/types/` | nothing |
+| segmenter | resample, VAD wrapper, utterance state machine, dedup | `crates/segmenter/` | types |
+| asr | WAV encoding and transcription client | `crates/asr/` | types |
+| llm | streaming chat client | `crates/llm/` | types |
+| context | transcript store, prompt builder, echo test, token estimate | `crates/context/` | types |
+| engine | threads, queues, meeting state, suggestions, replay | `crates/engine/` | types, segmenter, asr, llm, context |
+| capture | microphone and system-audio sources | `crates/capture/` | types |
+| overlay | panel, views, hotkeys, menu-bar item | `crates/overlay/` | types |
+| app | binary: wiring, command line, logging | `crates/app/` | all of the above |
+| xtask | bundle, sign, run | `xtask/` | nothing |
+
+## Flows
+
+### Transcription
+
+1. A capture source (cpal microphone or ScreenCaptureKit system audio) writes mono samples into a ring buffer (`crates/capture/`).
+2. One engine stream thread per source reads the ring, resamples to 16 kHz, scores frames with the VAD and runs the segmenter state machine (`crates/engine/`, `crates/segmenter/`).
+3. Segments go to per-stream ASR workers, which call the transcription server (`crates/asr/`) and commit finished utterances to the transcript store (`crates/context/`).
+4. Every commit, interim and drop becomes a `UiEvent` sent to the overlay panel (`crates/overlay/`).
+
+### Suggestion
+
+1. A global hotkey in the overlay sends `EngineCommand::Suggest` (`crates/overlay/`).
+2. The engine builds one system and one user message from the transcript store, the profile file and the text in progress (`crates/context/`).
+3. The LLM client streams content deltas from the chat server (`crates/llm/`).
+4. Each delta is a `UiEvent` with the suggestion id; the overlay drops events with an old id (`crates/overlay/`).
+
+### Meeting lifecycle
+
+1. A hotkey or menu-bar click sends `StartMeeting` (`crates/overlay/`).
+2. The engine checks both servers, reads the profile file, opens each speaker the factory lists and starts one thread per source (`crates/engine/`, `crates/capture/`).
+3. `StopMeeting` flushes both segmenters, releases echo holds, waits for queued finals, cancels in-flight requests and joins the threads (`crates/engine/`).
+
+### Replay
+
+1. The binary takes one or two WAV files and a speed factor on the command line (`crates/app/`).
+2. Paced in-memory sources feed the same engine (`crates/engine/`), which prints each final utterance on stdout and exits when drained.
+
+## Boundaries
+
+| Boundary | Kind | Owned by | Notes |
+| -------- | ---- | -------- | ----- |
+| LLM server | external HTTP | LAN host port 8000 | OpenAI-compatible /v1/models, /v1/chat/completions |
+| ASR server | external HTTP | LAN host port 8097 | OpenAI-compatible /v1/models, /v1/audio/transcriptions |
+| Microphone | device | capture | cpal input stream, f32 format required |
+| System audio | device | capture | ScreenCaptureKit default, cpal loopback or a named device |
+| Config file | file | types | `--config` path or ~/.config/clueless/config.toml, TOML |
+| Log file | file | app | ~/Library/Logs/clueless/clueless.log |
+| Lock file | file | app | ~/Library/Application Support/clueless/lock, single instance |
+
+## Cross-cutting
+
+Timing: every timeout is a field of `EngineTimings` (engine) so tests inject 100-300 ms values. Logging: tracing to stderr and the log file, per-utterance latency fields, transcript text only at debug. Purity: types, segmenter, asr, llm, context and engine compile without any macOS-only crate (docs/dependencies.md). Threading: DSP runs on one std thread per stream, async network work on one tokio runtime, AppKit only on the main thread, UI events hop through the main dispatch queue.
+
+## Entry points
+
+`crates/app/src/main.rs` (the `clueless` binary: GUI mode and replay mode), `xtask/src/main.rs` (`cargo xtask bundle|run`), `scripts/make-fixtures.sh` (test fixtures), `scripts/smoke-llm.sh` and `scripts/smoke-asr.sh` (server checks).

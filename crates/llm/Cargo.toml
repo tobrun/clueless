@@ -1,0 +1,23 @@
+[package]
+name = "llm"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+clueless-types.workspace = true
+reqwest.workspace = true
+eventsource-stream.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio-stream.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

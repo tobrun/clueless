@@ -1,0 +1,106 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/types",
+    "crates/segmenter",
+    "crates/asr",
+    "crates/llm",
+    "crates/context",
+    "crates/engine",
+    "crates/capture",
+    "crates/overlay",
+    "crates/app",
+    "xtask",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.dependencies]
+# internal crates
+clueless-types = { path = "crates/types" }
+segmenter = { path = "crates/segmenter" }
+asr = { path = "crates/asr" }
+llm = { path = "crates/llm" }
+context = { path = "crates/context" }
+engine = { path = "crates/engine" }
+capture = { path = "crates/capture" }
+overlay = { path = "crates/overlay" }
+
+# pure crates and shared third-party
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.6"
+thiserror = "2.0.21"
+hound = "3.5.1"
+rubato = "5.0.1"
+voice_activity_detector = "0.2.1"
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
+    "multipart",
+    "stream",
+] }
+eventsource-stream = "0.2.3"
+futures-util = "0.3.34"
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+    "net",
+] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+axum = { version = "0.8.9", features = ["multipart"] }
+tokio-stream = { version = "0.1.19", features = ["time"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+# macOS-only crates (capture and overlay only)
+cpal = "0.18.2"
+screencapturekit = { version = "11.0.0", default-features = false }
+rtrb = "0.4.0"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSRunningApplication",
+    "NSResponder",
+    "NSWindow",
+    "NSPanel",
+    "NSGraphics",
+    "NSView",
+    "NSVisualEffectView",
+    "NSScrollView",
+    "NSClipView",
+    "NSText",
+    "NSTextView",
+    "NSTextField",
+    "NSControl",
+    "NSColor",
+    "NSFont",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSButton",
+    "NSMenu",
+    "NSMenuItem",
+    "objc2-core-foundation",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSGeometry",
+    "NSTimer",
+    "NSRunLoop",
+    "NSDate",
+    "NSThread",
+    "block2",
+    "objc2-core-foundation",
+] }
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+global-hotkey = "0.8.0"

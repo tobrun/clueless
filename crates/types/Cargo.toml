@@ -1,0 +1,12 @@
+[package]
+name = "clueless-types"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

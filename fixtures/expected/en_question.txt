@@ -1,0 +1,1 @@
+Can we ship the new release on friday if all the automated tests and the manual checks pass?

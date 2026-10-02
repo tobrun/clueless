@@ -1,0 +1,15 @@
+[package]
+name = "segmenter"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+clueless-types.workspace = true
+rubato.workspace = true
+voice_activity_detector.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
+
+[lints]
+workspace = true

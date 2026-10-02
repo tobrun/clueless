@@ -1,0 +1,8 @@
+Me: Hi everyone, thanks for joining. What is the status of the release?
+Them: Hello. The release is almost ready, only two tests are failing.
+Me: Sounds good. Who is writing the release notes today?
+Them: The tests passed overnight. We can ship on friday.
+Me: I can review the pull request this afternoon.
+Them: I will write the notes. Sarah will review the final change.
+Me: Great. Let us meet again on monday. Bye everyone.
+Them: Perfect. Have a nice weekend. See you monday.

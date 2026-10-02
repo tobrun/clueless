@@ -1,0 +1,10 @@
+[package]
+name = "context"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+clueless-types.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "overlay"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+clueless-types.workspace = true
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+block2.workspace = true
+dispatch2.workspace = true
+global-hotkey.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
