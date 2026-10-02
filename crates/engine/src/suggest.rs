@@ -54,7 +54,7 @@ pub async fn run(
                     first_delta = false;
                     tracing::info!(
                         suggestion = id,
-                        ms = started.elapsed().as_millis(),
+                        llm_first_delta_ms = started.elapsed().as_millis(),
                         "time to first suggestion delta"
                     );
                 }

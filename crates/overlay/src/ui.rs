@@ -197,6 +197,13 @@ fn on_hotkey_event(event: GlobalHotKeyEvent) {
     DispatchQueue::main().exec_async(move || handle_action(action));
 }
 
+/// [`run`] with the main-thread marker taken here, so the binary does not
+/// need to link AppKit itself. Never returns in a healthy app.
+pub fn run_on_main_thread(config: Config, commands: CommandSink) {
+    let mtm = MainThreadMarker::new().expect("overlay::run_on_main_thread runs on the main thread");
+    run(mtm, config, commands);
+}
+
 /// Build the panel, views, status item and hotkeys and run the AppKit
 /// loop. Never returns in a healthy app.
 pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {

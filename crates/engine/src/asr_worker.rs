@@ -10,7 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -69,6 +69,13 @@ impl LatestSlot {
             self.notify.notified().await;
         }
     }
+}
+
+/// Milliseconds since process start: the shared base of the
+/// `asr_sent_ms` / `asr_done_ms` log fields.
+fn uptime_ms() -> u128 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis()
 }
 
 /// The latest interim text of a not-yet-resolved utterance, per speaker
@@ -177,6 +184,14 @@ async fn process_final(
     previous_committed: Option<String>,
 ) -> Option<String> {
     // 1. Transcribe with the client's built-in retries, abortable.
+    // The D-logging latency fields for one utterance (CS12c).
+    tracing::info!(
+        speaker = ?segment.id.speaker,
+        seq = segment.id.seq,
+        vad_end_ms = segment.t1_ms,
+        asr_sent_ms = uptime_ms(),
+        "final transcription request"
+    );
     let result = tokio::select! {
         result = ctx.asr.transcribe(&segment.pcm, 3) => result,
         _ = ctx.cancel.cancelled() => {
@@ -184,6 +199,13 @@ async fn process_final(
             return None;
         }
     };
+    tracing::debug!(
+        speaker = ?segment.id.speaker,
+        seq = segment.id.seq,
+        vad_end_ms = segment.t1_ms,
+        asr_done_ms = uptime_ms(),
+        "final transcription response"
+    );
     let text = match result {
         Ok(Some(text)) => text,
         Ok(None) => {
@@ -347,10 +369,24 @@ pub async fn run_interim(
         if seq < final_seq_watermark.load(Ordering::Acquire) {
             continue;
         }
+        tracing::debug!(
+            speaker = ?ctx.speaker,
+            seq,
+            vad_end_ms = segment.t1_ms,
+            asr_sent_ms = uptime_ms(),
+            "interim transcription request"
+        );
         let result = tokio::select! {
             result = ctx.asr.transcribe(&segment.pcm, 1) => result,
             _ = ctx.cancel.cancelled() => break,
         };
+        tracing::debug!(
+            speaker = ?ctx.speaker,
+            seq,
+            vad_end_ms = segment.t1_ms,
+            asr_done_ms = uptime_ms(),
+            "interim transcription response"
+        );
         // The Final arrived while this request was in flight.
         if seq < final_seq_watermark.load(Ordering::Acquire) {
             continue;
