@@ -31,6 +31,16 @@ pub struct EngineTimings {
     pub compress_retry: Duration,
     /// The stream thread's sleep when a source returns `Empty`.
     pub idle_poll: Duration,
+    /// How long the trigger speaker must stay quiet before an automatic
+    /// request starts.
+    pub turn_settle: Duration,
+    /// How long a busy trigger speaker can hold an automatic request back.
+    pub turn_max_wait: Duration,
+    /// Minimum gap between the starts of two automatic requests (Brainstorm
+    /// uses a multiple of it).
+    pub auto_min_gap: Duration,
+    /// How long automatic requests pause after a failed request.
+    pub auto_failure_pause: Duration,
 }
 
 impl EngineTimings {
@@ -46,6 +56,10 @@ impl EngineTimings {
             llm_stall: Duration::from_secs(10),
             compress_retry: Duration::from_secs(60),
             idle_poll: Duration::from_millis(5),
+            turn_settle: Duration::from_millis(400),
+            turn_max_wait: Duration::from_secs(4),
+            auto_min_gap: Duration::from_secs(2),
+            auto_failure_pause: Duration::from_secs(30),
         }
     }
 }

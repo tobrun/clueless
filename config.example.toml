@@ -21,6 +21,9 @@ max_segment_ms = 15000        # forced cut length
 [overlay]
 hide_from_capture = true      # sets the panel's sharingType to none
 
+[assist]
+start_profile = "manual"      # "manual" | "interview" | "brainstorm"; manual sends nothing by itself
+
 [hotkeys]
 # meeting-only keys (registered only while a meeting runs):
 suggest = "cmd+Enter"
@@ -34,3 +37,4 @@ toggle_meeting = "cmd+shift+KeyR"
 toggle_overlay = "cmd+Backslash"
 toggle_mode = "cmd+shift+Backslash"
 toggle_click_through = "cmd+shift+KeyM"
+cycle_profile = "ctrl+alt+KeyP"       # steps manual, interview, brainstorm

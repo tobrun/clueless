@@ -2,6 +2,7 @@
 //! environment building, and the `.env` variable rules.
 
 use clueless_types::config::{Config, SystemAudioBackend};
+use clueless_types::profile::AssistProfile;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -50,7 +51,7 @@ fn every_toml_key_may_be_absent_and_every_env_default_applies() {
     assert_eq!(cfg.llm.model, "test-llm");
     assert_eq!(cfg.llm.max_tokens, 220);
     assert_eq!(cfg.llm.temperature, 0.4);
-    assert_eq!(cfg.llm.profile_path, None);
+    assert_eq!(cfg.llm.notes_path, None);
     assert_eq!(cfg.llm.api_key, None);
     assert_eq!(cfg.llm.enable_thinking, None);
     assert_eq!(cfg.asr.base_url, "http://asr.test:8097");
@@ -132,11 +133,55 @@ fn base_urls_keep_their_scheme_and_lose_trailing_slashes() {
 }
 
 #[test]
-fn profile_path_expands_a_leading_tilde() {
-    let cfg = load("", "tilde", &[("LLM_PROFILE_PATH", "~/profile.txt")]).unwrap();
-    let path = cfg.llm.profile_path.expect("set");
+fn notes_path_expands_a_leading_tilde() {
+    let cfg = load("", "tilde", &[("LLM_NOTES_PATH", "~/notes.txt")]).unwrap();
+    let path = cfg.llm.notes_path.expect("set");
     assert!(!path.starts_with('~'), "tilde was not expanded: {path}");
-    assert!(path.ends_with("/profile.txt"), "wrong expansion: {path}");
+    assert!(path.ends_with("/notes.txt"), "wrong expansion: {path}");
+}
+
+#[test]
+fn the_old_profile_path_variable_is_an_error_naming_the_new_one() {
+    let err = load("", "old-profile", &[("LLM_PROFILE_PATH", "/tmp/p.txt")]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("LLM_PROFILE_PATH was renamed to LLM_NOTES_PATH"),
+        "error was: {msg}"
+    );
+}
+
+#[test]
+fn assist_defaults_to_manual_and_cycle_profile_to_ctrl_alt_p() {
+    let cfg = load("", "assist-default", &[]).unwrap();
+    assert_eq!(cfg.assist.start_profile, AssistProfile::Manual);
+    assert_eq!(cfg.hotkeys.cycle_profile, "ctrl+alt+KeyP");
+}
+
+#[test]
+fn start_profile_can_be_set_in_toml() {
+    let cfg = load(
+        "[assist]\nstart_profile = \"brainstorm\"\n",
+        "assist-brainstorm",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(cfg.assist.start_profile, AssistProfile::Brainstorm);
+}
+
+#[test]
+fn an_unknown_start_profile_names_the_three_valid_ones() {
+    let err = load("[assist]\nstart_profile = \"coach\"\n", "assist-coach", &[]).unwrap_err();
+    let msg = err.to_string();
+    for key in ["manual", "interview", "brainstorm"] {
+        assert!(msg.contains(key), "error was: {msg}");
+    }
+}
+
+#[test]
+fn a_misspelled_assist_key_is_reported_as_unknown() {
+    let err = load("[assist]\nstart = \"x\"\n", "assist-unknown", &[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unknown key assist.start"), "error was: {msg}");
 }
 
 #[test]

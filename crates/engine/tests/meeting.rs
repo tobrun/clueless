@@ -1135,16 +1135,16 @@ async fn compression_failure_warns_and_retries_after_the_interval() {
     finish(&mut h).await;
 }
 
-// ------------------------------------------------------------------ profile
+// ------------------------------------------------------------------ notes
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn profile_lands_in_system_message() {
+async fn notes_land_in_system_message() {
     let asr = MockAsr::start().await;
     let llm = MockLlm::start().await;
     let path = temp_path("profile").with_extension("txt");
     std::fs::write(&path, "Prefers concise bullet answers.").expect("write profile");
     let opts = MeetingOpts {
-        profile_path: Some(path.display().to_string()),
+        notes_path: Some(path.display().to_string()),
         ..MeetingOpts::default()
     };
     llm.enqueue(LlmReply::stream(&["an answer"]));
@@ -1166,12 +1166,12 @@ async fn profile_lands_in_system_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_profile_warns_and_meeting_starts() {
+async fn missing_notes_warn_and_meeting_starts() {
     let asr = MockAsr::start().await;
     let llm = MockLlm::start().await;
     let missing = temp_path("missing-profile").with_extension("txt");
     let opts = MeetingOpts {
-        profile_path: Some(missing.display().to_string()),
+        notes_path: Some(missing.display().to_string()),
         ..MeetingOpts::default()
     };
     let mut h = running_me_only(&asr, &llm, opts).await;
@@ -1179,9 +1179,9 @@ async fn missing_profile_warns_and_meeting_starts() {
     let statuses = h.statuses();
     assert!(
         statuses.iter().any(|(source, level, text)| {
-            *source == StatusSource::App && *level == StatusLevel::Warn && text.contains("profile")
+            *source == StatusSource::App && *level == StatusLevel::Warn && text.contains("notes")
         }),
-        "App Warn about the profile file: {statuses:?}"
+        "App Warn about the notes file: {statuses:?}"
     );
     assert!(h.states().contains(&MeetingState::Running));
     finish(&mut h).await;

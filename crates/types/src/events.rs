@@ -96,6 +96,8 @@ pub enum UiEvent {
         end: SuggestionEnd,
     },
     ClearSuggestion,
+    /// The active assist profile; sent at engine start and on every change.
+    Profile(crate::profile::AssistProfile),
     Status {
         source: StatusSource,
         level: StatusLevel,
@@ -113,6 +115,10 @@ pub enum EngineCommand {
     ToggleMeeting,
     Suggest,
     ClearSuggestion,
+    /// Step to the next assist profile (the cycle hotkey).
+    CycleProfile,
+    /// Pick one assist profile (the status icon menu).
+    SetProfile(crate::profile::AssistProfile),
     Shutdown,
 }
 
