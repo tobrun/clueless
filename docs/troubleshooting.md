@@ -49,5 +49,5 @@ Each transcribed utterance logs its latency fields, which usually tells you whet
 ## The overlay is visible in a screen share
 
 The standard window is always captured; only the hidden overlay panel can be hidden from capture, so switch to hidden mode with `cmd+shift+Backslash` before sharing.
-`hide_from_capture = true` is best effort: macOS 15.4 and later ignore the panel's sharing type for full-screen shares ([system-audio.md](system-audio.md) has the details), so hidden mode can still show up when a whole screen is shared.
+`hide_from_capture = true` is best effort: macOS 15.4 and later ignore the panel's sharing type for full-screen shares ([configuration.md](configuration.md) has the details), so hidden mode can still show up when a whole screen is shared.
 Hide the overlay with `cmd+Backslash` before sharing, or move it off the part of the screen you will share.
