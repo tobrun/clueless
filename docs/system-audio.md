@@ -20,7 +20,7 @@ cpal 0.18 builds the input stream on the default output device through Apple's p
 
 - Permission needed: Microphone (the tap is presented as an input stream).
 - Caveat: the tap has reported silent-failure cases after an unclean process exit; that is why it is not the default.
-  Whether the tap survives on macOS 15.6.1 has not been verified on this Mac yet; the manual checklist (dev bundle run via `cargo xtask run`) has not been executed, so this page records no result.
+  Whether the tap survives on macOS 15.6.1 has not been verified yet; the manual checklist (dev bundle run via `cargo xtask run`) has not been executed, so this page records no result.
   When the checklist is run, open a meeting with `system_audio_backend = "cpal_loopback"`, play audio, and confirm the Them stream carries samples; record the outcome here.
 
 ### `device:<name>` - a named input device (BlackHole and friends)
@@ -45,6 +45,6 @@ Use this with a virtual audio device when the other two backends misbehave.
 7. Start a meeting; Them now receives whatever the Mac plays.
    Remember to switch the system output back to plain speakers when done, or other apps' volume control behaves oddly.
 
-## Trying `cpal_loopback` on this Mac
+## Trying `cpal_loopback`
 
 Pending the manual checklist (dev certificate, first-launch permission grants, bundle run): once done, set `system_audio_backend = "cpal_loopback"`, play 30 s of audio, and note here whether the tap delivers samples and survives an unclean exit.

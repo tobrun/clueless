@@ -1,8 +1,8 @@
 # Architecture
 
-Purpose: clueless is a macOS meeting copilot for one user on one Mac. During a meeting it records the microphone ("Me") and the system audio ("Them") as two streams, cuts each into utterances, transcribes each utterance on a speech-to-text server on the LAN, and shows a rolling transcript in a floating overlay panel. On a hotkey it asks an LLM server on the LAN what to say next and streams the answer into the panel. Audio flows capture -> ring buffer -> engine stream thread (resample, voice detection, segmenter) -> ASR worker -> transcript store -> UI event -> overlay; a suggestion flows hotkey -> engine command -> prompt builder -> LLM stream -> overlay.
+Purpose: clueless is a macOS meeting copilot for one user on one Mac. During a meeting it records the microphone ("Me") and the system audio ("Them") as two streams, cuts each into utterances, transcribes each utterance on a speech-to-text server over HTTP, and shows a rolling transcript in a floating overlay panel. On a hotkey it asks an LLM server over HTTP what to say next and streams the answer into the panel. Audio flows capture -> ring buffer -> engine stream thread (resample, voice detection, segmenter) -> ASR worker -> transcript store -> UI event -> overlay; a suggestion flows hotkey -> engine command -> prompt builder -> LLM stream -> overlay.
 
-Captured: 2026-10-02 (full, build) - Updated: 2026-10-02 (change set 1)
+Recorded 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.env`.
 
 ## Components
 
@@ -50,11 +50,12 @@ Captured: 2026-10-02 (full, build) - Updated: 2026-10-02 (change set 1)
 
 | Boundary | Kind | Owned by | Notes |
 | -------- | ---- | -------- | ----- |
-| LLM server | external HTTP | LAN host port 8000 | OpenAI-compatible /v1/models, /v1/chat/completions |
-| ASR server | external HTTP | LAN host port 8097 | OpenAI-compatible /v1/models, /v1/audio/transcriptions |
+| LLM server | external HTTP | external, configured by `LLM_BASE_URL` | OpenAI-compatible /v1/models, /v1/chat/completions |
+| ASR server | external HTTP | external, configured by `ASR_BASE_URL` | OpenAI-compatible /v1/models, /v1/audio/transcriptions |
 | Microphone | device | capture | cpal input stream, f32 format required |
 | System audio | device | capture | ScreenCaptureKit default, cpal loopback or a named device |
-| Config file | file | types | `--config` path or ~/.config/clueless/config.toml, TOML |
+| Config file | file | types | `--config` path or ~/.config/clueless/config.toml, TOML, optional |
+| Env file | file | app | `--env-file` path, else ./.env, else ~/.config/clueless/.env; LLM_* and ASR_* variables |
 | Log file | file | app | ~/Library/Logs/clueless/clueless.log |
 | Lock file | file | app | ~/Library/Application Support/clueless/lock, single instance |
 

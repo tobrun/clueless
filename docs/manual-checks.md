@@ -1,14 +1,15 @@
 # Manual checks
 
 The automated suite covers everything that can be proven headlessly.
-These checks need a real desktop session, a real microphone or the LAN servers, so they are done by hand before a release.
+These checks need a real desktop session, a real microphone and reachable ASR/LLM servers, so they are done by hand before a release.
 Run from the repo root after `cargo xtask bundle` (assembles `target/debug/clueless.app`; `cargo xtask run` bundles and launches it).
 
 ## Setup
 
-- [ ] `cp config.example.toml ~/.config/clueless/config.toml` and point `[server] host` at the ASR/LLM machine.
+- [ ] `cp .env.example .env` and fill `ASR_BASE_URL`, `ASR_MODEL`, `LLM_BASE_URL`, `LLM_MODEL` for your servers.
 - [ ] `clueless --help` prints the usage text and exits 0.
 - [ ] `clueless --config /does/not/exist.toml` prints the path and exits 2.
+- [ ] With no `.env` anywhere and no `ASR_*`/`LLM_*` in the environment, startup prints one error naming every missing variable and exits 2.
 
 ## GUI lifecycle
 
@@ -40,5 +41,5 @@ Run from the repo root after `cargo xtask bundle` (assembles `target/debug/cluel
 
 ## Failure modes
 
-- [ ] Turn the LAN server off before launch: the health status goes offline, no transcripts, and the app stays responsive; turning it back recovers transcripts without a restart.
+- [ ] Turn a server off before launch: the health status goes offline, no transcripts, and the app stays responsive; turning it back recovers transcripts without a restart.
 - [ ] Kill the ASR server mid-meeting: statuses go offline and interim lines stop; restart recovers within a few utterances.
