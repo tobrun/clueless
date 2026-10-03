@@ -2,7 +2,7 @@
 
 A meeting copilot for macOS that runs entirely on your own infrastructure.
 It transcribes your meetings live - your microphone as `Me`, the computer's audio as `Them` - and on a hotkey asks a language model what you could say next, streaming the answer into the window.
-No account, no telemetry, nothing written to disk: the transcript lives in memory and dies with the app.
+No account, no telemetry: the transcript lives in memory and dies with the app, and the only thing kept between launches is the window's position on screen.
 The window shows both transcript streams as they finalize, with suggestions streaming in beneath them.
 
 You bring two OpenAI-compatible servers (a chat model and a speech-to-text model, local or hosted) and clueless pipes everything through them.
@@ -88,7 +88,7 @@ The app needs no network access beyond the servers you point it at.
 
 ## Limitations
 
-- Nothing persists: closing the app loses the transcript; there is no history or export yet.
+- The transcript is not persisted: closing the app loses it; there is no history or export yet. Only the window's position survives a restart (see the Window modes section above).
 - `hide_from_capture` (keeping the panel out of screen shares) is best effort; macOS 15.4+ ignores it for full-screen shares.
 - The shipped bundle is a debug build signed with a self-signed dev certificate; there is no notarized release.
 - Speaker diarization inside the Them stream is not attempted - it is one rolling `Them` voice.

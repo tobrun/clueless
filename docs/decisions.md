@@ -113,9 +113,16 @@ D-hotkeys: Which hotkeys, and when are they registered?
   (2026-10-02)
 
 D-quit-path: How does the user quit an app with no Dock icon and no window buttons?
-  ✓ menu-bar item - Start or Stop Meeting, Show or Hide Overlay, Quit; pulled forward from a later phase (2026-10-02)
+  ✓ menu-bar item - pulled forward from a later phase (2026-10-02) ⚠ item list grew with the modes (2026-10-03): Start Meeting / Stop Meeting, Hide Window / Show Window, Switch to Hidden Overlay / Switch to Standard Window, Quit (see D-ui-modes)
   ✗ quit hotkey only - one more always-on global key, and no visible sign the app is running
   (2026-10-02)
+
+D-move-keys: What do the four move hotkeys do, and when are they registered?
+  ✓ registered only while a meeting runs, matching D-hotkeys; they move the active window by 40 points, clamped with the window's real size, and the result is written to the shared frame - a global hotkey takes cmd+shift+arrows (text selection) away from every other app, and dragging the standard window covers placement outside a meeting (promoted from the switchable-ui-modes spec 2026-10-03) ⚠ the hidden overlay cannot be nudged outside a meeting; switch to standard mode and drag
+  ✗ registered whenever hidden mode is active - text selection breaks in other apps for as long as hidden mode is on
+  ✗ always on - contradicts D-hotkeys' cost rule for combinations other apps need
+  ✗ disabled in standard mode - one more rule to explain, no benefit
+  (2026-10-03)
 
 D-suggestion-id: How are late tokens from a cancelled request kept off the screen?
   ✓ id on every suggestion event - the overlay drops any delta whose id is not the newest one
