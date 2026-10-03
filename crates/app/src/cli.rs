@@ -5,13 +5,17 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use clueless_types::profile::AssistProfile;
+
 /// One `--replay` run: one or two WAV files (Me first, then Them), a
-/// playback speed multiplier and whether to ask the LLM afterwards.
+/// playback speed multiplier, whether to ask the LLM afterwards and the
+/// assist profile to run under (`None` means Manual, whatever the config says).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Replay {
     pub files: Vec<PathBuf>,
     pub speed: f64,
     pub ask: bool,
+    pub profile: Option<AssistProfile>,
 }
 
 /// The parsed command line.
@@ -46,6 +50,9 @@ Options:
   --replay ME [THEM] replay WAV file(s) through the engine instead of the GUI
   --speed N          replay speed multiplier (default 1)
   --ask              after a replay, ask the LLM and print the suggestion
+  --profile NAME     replay under an assist profile: manual (default),
+                     interview or brainstorm; automatic answers are printed
+                     between the transcript lines
   -h, --help         print this help and exit
 "
     .to_string()
@@ -74,6 +81,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut replay_files: Option<Vec<PathBuf>> = None;
     let mut speed: Option<f64> = None;
     let mut ask = false;
+    let mut profile: Option<AssistProfile> = None;
 
     while let Some(arg) = args.pop_front() {
         match arg.as_str() {
@@ -115,14 +123,22 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 speed = Some(parsed);
             }
             "--ask" => ask = true,
+            "--profile" => {
+                let value = take_value(&mut args, &arg)?;
+                profile = Some(value.parse::<AssistProfile>()?);
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
 
+    if profile.is_some() && replay_files.is_none() {
+        return Err("--profile only applies to --replay".to_string());
+    }
     let replay = replay_files.map(|files| Replay {
         files,
         speed: speed.unwrap_or(1.0),
         ask,
+        profile,
     });
     Ok(Parsed::Cli(Cli {
         config,
@@ -174,6 +190,36 @@ mod tests {
         assert_eq!(replay.files, vec![PathBuf::from("a.wav")]);
         assert_eq!(replay.speed, 3.5);
         assert!(replay.ask);
+    }
+
+    #[test]
+    fn profile_is_a_replay_option_with_three_valid_names() {
+        let Parsed::Cli(cli) = parse_line("--replay a.wav --profile brainstorm").unwrap() else {
+            panic!("expected a parsed cli");
+        };
+        assert_eq!(
+            cli.replay.expect("replay mode").profile,
+            Some(AssistProfile::Brainstorm)
+        );
+        let Parsed::Cli(cli) = parse_line("--replay a.wav").unwrap() else {
+            panic!("expected a parsed cli");
+        };
+        assert_eq!(cli.replay.expect("replay mode").profile, None);
+    }
+
+    #[test]
+    fn an_unknown_profile_names_the_three_valid_ones() {
+        let error = parse_line("--replay a.wav --profile coach").unwrap_err();
+        for name in ["manual", "interview", "brainstorm"] {
+            assert!(error.contains(name), "error was: {error}");
+        }
+        assert!(parse_line("--replay a.wav --profile").is_err());
+    }
+
+    #[test]
+    fn profile_without_replay_is_an_error() {
+        let error = parse_line("--profile interview").unwrap_err();
+        assert!(error.contains("--replay"), "error was: {error}");
     }
 
     #[test]
