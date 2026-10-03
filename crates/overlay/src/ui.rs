@@ -99,15 +99,39 @@ fn refresh_menu(ui: &Ui, mtm: MainThreadMarker) {
     ui.status_item.rebuild_menu(running, ui.presentation, mtm);
 }
 
+/// Bring this app to the front for the standard window. Hotkey presses
+/// arrive through a listen-only tap, so no user event reaches this app, and
+/// macOS 26 logs `programmatic-activation-denied` for every app-level
+/// activation attempt from that context (verified empirically: `activate`,
+/// `activateIgnoringOtherApps:` and even AX `set frontmost` all fail to
+/// steal the frontmost slot from the terminal). The activation call stays
+/// as a best effort: on launches and clicks the OS does honour it. The
+/// "in front" invariant itself is carried by `orderFrontRegardless` in
+/// [`present_standard_window`], which raises the window above other apps'
+/// windows without needing the app to be active.
+#[allow(deprecated)]
+fn force_activate(app: &NSApplication) {
+    app.activateIgnoringOtherApps(true);
+}
+
+/// Put the standard window on screen in front of everything: key for text
+/// and menu key equivalents, ordered front regardless of this app's active
+/// state (spec D-mode-switch "in front"; see [`force_activate`] for why
+/// app activation alone is not enough on macOS 26).
+fn present_standard_window(ui: &Ui, app: &NSApplication) {
+    ui.panel.orderOut(None);
+    ui.main.makeKeyAndOrderFront(None);
+    ui.main.orderFrontRegardless();
+    force_activate(app);
+}
+
 /// Order the active mode's window in and the other one out (spec D-mode-menu
 /// invariants: at most one window on screen; the invisible mode's window is
 /// ordered out).
 fn show_active_window(ui: &Ui, mtm: MainThreadMarker) {
     match ui.presentation.mode {
         UiMode::Standard => {
-            ui.panel.orderOut(None);
-            ui.main.makeKeyAndOrderFront(None);
-            NSApplication::sharedApplication(mtm).activate();
+            present_standard_window(ui, &NSApplication::sharedApplication(mtm));
         }
         UiMode::Hidden => {
             ui.main.orderOut(None);
@@ -138,9 +162,7 @@ fn switch_mode(ui: &mut Ui, mtm: MainThreadMarker) {
             app.deactivate();
         }
         UiMode::Standard => {
-            ui.panel.orderOut(None);
-            ui.main.makeKeyAndOrderFront(None);
-            app.activate();
+            present_standard_window(ui, &app);
         }
     }
 }
@@ -336,9 +358,11 @@ pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {
     panel.apply_capture_policy(config.overlay.hide_from_capture);
 
     // Every launch starts standard and visible (spec D-launch-mode); the
-    // panel waits for the first mode switch.
+    // panel waits for the first mode switch. Same presentation sequence as
+    // `present_standard_window` (which needs a built `Ui`, not yet here).
     main.makeKeyAndOrderFront(None);
-    app.activate();
+    main.orderFrontRegardless();
+    force_activate(&app);
 
     let status_item = StatusItemController::new(
         mtm,
