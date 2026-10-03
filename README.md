@@ -3,8 +3,7 @@
 A meeting copilot for macOS that runs entirely on your own infrastructure.
 It transcribes your meetings live in a floating overlay - your microphone as `Me`, the computer's audio as `Them` - and on a hotkey asks a language model what you could say next, streaming the answer into the panel.
 No account, no telemetry, nothing written to disk: the transcript lives in memory and dies with the app.
-
-![The overlay panel during a meeting](docs/assets/overlay.png)
+A floating panel shows both transcript streams as they finalize, with suggestions streaming in beneath them.
 
 You bring two OpenAI-compatible servers (a chat model and a speech-to-text model, local or hosted) and clueless pipes everything through them.
 
