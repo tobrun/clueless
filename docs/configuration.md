@@ -154,7 +154,7 @@ Limits on automatic requests:
 
 Answers collect in a feed in both windows, newest at the bottom, older ones stay and can be scrolled to.
 Automatic help continues while the overlay is hidden.
-Each trigger decision writes one info log line with the profile and the outcome (fired, skipped short, waiting for gap, waiting for answer, paused), never transcript text.
+The log gets an info line with the profile and the outcome (`assist_outcome`: `fired` when an automatic request starts, `waiting` when one is held back for the settle time, the gap or a running answer), never transcript text.
 
 Cost note: every automatic request sends the whole transcript.
 On a paid API without prompt caching that costs up to the full context per turn, and on a server with one cache slot a compression request can push the transcript out of the cache.
