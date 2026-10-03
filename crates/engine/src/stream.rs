@@ -33,6 +33,8 @@ pub struct StreamPipes {
     /// this stream (interims at or beyond it are stale).
     pub final_seq_watermark: Arc<AtomicU64>,
     pub drain: Arc<Drain>,
+    /// This speaker's busy record, read by the automatic-request logic.
+    pub activity: Arc<crate::asr_worker::SpeakerActivity>,
     /// t0 of every queued or in-flight Them final (echo hold reads this).
     pub them_pending: Arc<Mutex<VecDeque<u64>>>,
     /// Start time of Them's currently open segment, or `u64::MAX` when none
@@ -244,6 +246,10 @@ fn close_and_reanchor(
 /// any `send_segment` of a close, so a hold that sees the open t0 cleared
 /// already sees the closed final registered in `them_pending`.
 fn sync_them_open_t0(speaker: Speaker, machine: &Machine, pipes: &StreamPipes) {
+    pipes
+        .activity
+        .open
+        .store(machine.open_t0_ms().is_some(), Ordering::Release);
     if speaker == Speaker::Them {
         let t0 = machine.open_t0_ms().unwrap_or(u64::MAX);
         pipes.them_open_t0.store(t0, Ordering::Release);
@@ -263,6 +269,7 @@ fn send_segment(speaker: Speaker, segment: Segment, pipes: &StreamPipes) {
                 .final_seq_watermark
                 .fetch_max(segment.id.seq + 1, Ordering::Relaxed);
             pipes.drain.inc();
+            pipes.activity.unresolved.fetch_add(1, Ordering::AcqRel);
             if speaker == Speaker::Them {
                 pipes.them_pending.lock().unwrap().push_back(segment.t0_ms);
             }
@@ -271,6 +278,7 @@ fn send_segment(speaker: Speaker, segment: Segment, pipes: &StreamPipes) {
                 Err(error) => {
                     let segment = error.into_inner();
                     pipes.drain.dec();
+                    pipes.activity.unresolved.fetch_sub(1, Ordering::AcqRel);
                     if speaker == Speaker::Them {
                         remove_pending(&pipes.them_pending, segment.t0_ms);
                     }

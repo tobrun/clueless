@@ -8,7 +8,7 @@
 //! anything an older result was still replacing.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,31 @@ use segmenter::dedup::strip_overlap;
 
 use crate::deps::EngineTimings;
 use crate::pipeline::Drain;
+
+/// A finished speech piece, reported to the engine loop: committed (`text` is
+/// `Some`) or dropped (`None`).
+#[derive(Debug, Clone)]
+pub struct PieceDone {
+    pub speaker: Speaker,
+    pub text: Option<String>,
+}
+
+/// Whether a speaker has speech the automatic-request logic should wait for:
+/// an open segment in the segmenter, or closed segments whose final is still
+/// queued or in flight.
+#[derive(Debug, Default)]
+pub struct SpeakerActivity {
+    /// The segmenter holds an open (not yet closed) segment.
+    pub open: AtomicBool,
+    /// Finals queued or in flight, not yet committed or dropped.
+    pub unresolved: AtomicUsize,
+}
+
+impl SpeakerActivity {
+    pub fn busy(&self) -> bool {
+        self.open.load(Ordering::Acquire) || self.unresolved.load(Ordering::Acquire) > 0
+    }
+}
 
 /// A single-slot "latest wins" mailbox: an unread segment is replaced, so a
 /// slow interim worker always works on the newest audio and never queues
@@ -118,6 +143,10 @@ pub struct WorkerCtx {
     pub drain: Arc<Drain>,
     /// The meeting's cancel token: aborts in-flight requests.
     pub cancel: CancellationToken,
+    /// This speaker's busy record, updated before a piece is reported.
+    pub activity: Arc<SpeakerActivity>,
+    /// Where every finished piece is reported.
+    pub pieces: mpsc::UnboundedSender<PieceDone>,
     /// Some only for a Me stream while a Them source is open.
     pub echo: Option<EchoCtx>,
     pub timings: EngineTimings,
@@ -126,12 +155,14 @@ pub struct WorkerCtx {
 impl WorkerCtx {
     fn drop_final(&self, segment: &Segment) {
         (self.ui)(UiEvent::TranscriptDropped { id: segment.id });
-        self.release(segment);
+        self.release(segment, None);
     }
 
     /// Common teardown for one final: leave the pending set, clear text in
-    /// progress for this utterance, decrement the drain counter.
-    fn release(&self, segment: &Segment) {
+    /// progress for this utterance, update the busy record, report the
+    /// finished piece, and only then decrement the drain counter - so the
+    /// engine has every piece message queued before it hears "drained".
+    fn release(&self, segment: &Segment, text: Option<String>) {
         if self.speaker == Speaker::Them {
             let mut pending = self.them_pending.lock().unwrap();
             if let Some(index) = pending.iter().position(|t| *t == segment.t0_ms) {
@@ -144,6 +175,12 @@ impl WorkerCtx {
         {
             progress.remove(&self.speaker);
         }
+        drop(progress);
+        self.activity.unresolved.fetch_sub(1, Ordering::AcqRel);
+        let _ = self.pieces.send(PieceDone {
+            speaker: self.speaker,
+            text,
+        });
         self.drain.dec();
     }
 }
@@ -276,7 +313,7 @@ async fn process_final(
     ctx.store.lock().unwrap().push(utterance.clone());
     ctx.commits_tx.send_modify(|count| *count += 1);
     (ctx.ui)(UiEvent::TranscriptFinal(utterance));
-    ctx.release(&segment);
+    ctx.release(&segment, Some(text.clone()));
     Some(text)
 }
 

@@ -264,7 +264,13 @@ async fn suggest_while_idle_emits_nothing() {
     h.cmd(EngineCommand::ClearSuggestion);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    assert!(h.snapshot().is_empty(), "no events while Idle");
+    assert_eq!(
+        h.snapshot(),
+        vec![UiEvent::Profile(
+            clueless_types::profile::AssistProfile::Manual
+        )],
+        "while Idle only the initial profile announcement is emitted"
+    );
     finish(&mut h).await;
 }
 
