@@ -224,6 +224,7 @@ impl UiModel {
                     ..Changes::NONE
                 }
             }
+            UiEvent::Profile(_) => Changes::NONE,
             UiEvent::SourcesDrained => Changes::NONE,
         }
     }

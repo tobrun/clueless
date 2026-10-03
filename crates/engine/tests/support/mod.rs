@@ -19,10 +19,11 @@ use axum::{Json, Router};
 use asr::client::AsrClient;
 use clueless_types::UtteranceId;
 use clueless_types::audio::{SampleSource, SourceError, SourceFactory, SourceRead};
-use clueless_types::config::{AsrConfig, Config, LlmConfig, VadConfig};
+use clueless_types::config::{AsrConfig, AssistConfig, Config, LlmConfig, VadConfig};
 use clueless_types::events::{
     EngineCommand, MeetingState, Speaker, StatusLevel, StatusSink, StatusSource, UiEvent, Utterance,
 };
+use clueless_types::profile::AssistProfile;
 use context::store::TranscriptStore;
 use segmenter::machine::MachineParams;
 use segmenter::vad::SpeechProb;
@@ -464,6 +465,10 @@ pub fn fast_timings() -> EngineTimings {
         llm_stall: Duration::from_secs(1),
         compress_retry: Duration::from_secs(1),
         idle_poll: Duration::from_millis(1),
+        turn_settle: Duration::from_millis(50),
+        turn_max_wait: Duration::from_millis(400),
+        auto_min_gap: Duration::from_millis(150),
+        auto_failure_pause: Duration::from_millis(800),
     }
 }
 
@@ -905,6 +910,9 @@ struct LlmState {
     models: Mutex<Vec<String>>,
     bodies: Mutex<Vec<serde_json::Value>>,
     started: Instant,
+    arrivals: Mutex<Vec<Instant>>,
+    inflight: std::sync::atomic::AtomicUsize,
+    max_inflight: std::sync::atomic::AtomicUsize,
 }
 
 pub struct MockLlm {
@@ -920,6 +928,9 @@ impl MockLlm {
             models: Mutex::new(vec!["mock-model".to_owned()]),
             bodies: Mutex::new(Vec::new()),
             started: Instant::now(),
+            arrivals: Mutex::new(Vec::new()),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            max_inflight: std::sync::atomic::AtomicUsize::new(0),
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(llm_chat))
@@ -952,6 +963,18 @@ impl MockLlm {
 
     pub fn body_count(&self) -> usize {
         self.state.bodies.lock().unwrap().len()
+    }
+
+    /// The arrival time of every chat request, in arrival order.
+    pub fn arrivals(&self) -> Vec<Instant> {
+        self.state.arrivals.lock().unwrap().clone()
+    }
+
+    /// The most chat requests that were open at the same moment.
+    pub fn max_inflight(&self) -> usize {
+        self.state
+            .max_inflight
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn last_body(&self) -> Option<serde_json::Value> {
@@ -987,6 +1010,15 @@ async fn llm_chat(State(state): State<Arc<LlmState>>, body: axum::body::Bytes) -
     let parsed: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     state.bodies.lock().unwrap().push(parsed);
+    state.arrivals.lock().unwrap().push(Instant::now());
+    let now_inflight = state
+        .inflight
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+    state
+        .max_inflight
+        .fetch_max(now_inflight, std::sync::atomic::Ordering::SeqCst);
+    let guard = InflightGuard(state.clone());
     let reply = state
         .replies
         .lock()
@@ -994,8 +1026,8 @@ async fn llm_chat(State(state): State<Arc<LlmState>>, body: axum::body::Bytes) -
         .pop_front()
         .unwrap_or_else(|| LlmReply::stream(&["mock answer"]));
     match reply {
-        LlmReply::Stream(steps) => sse_response(steps, false),
-        LlmReply::CloseMidStream(steps) => sse_response(steps, true),
+        LlmReply::Stream(steps) => sse_response(steps, false, guard),
+        LlmReply::CloseMidStream(steps) => sse_response(steps, true, guard),
         LlmReply::Http { status, body } => (
             StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1010,12 +1042,24 @@ fn sse_chunk(text: &str) -> axum::body::Bytes {
     axum::body::Bytes::from(format!("data: {event}\n\n"))
 }
 
-fn sse_response(steps: Vec<Step>, close_early: bool) -> Response {
+/// Counts one chat request as open until its response is finished or dropped.
+struct InflightGuard(Arc<LlmState>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0
+            .inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn sse_response(steps: Vec<Step>, close_early: bool, guard: InflightGuard) -> Response {
     struct SseState {
         steps: Vec<Step>,
         index: usize,
         finished: bool,
         close_early: bool,
+        _guard: InflightGuard,
     }
     let stream = futures_util::stream::unfold(
         SseState {
@@ -1023,6 +1067,7 @@ fn sse_response(steps: Vec<Step>, close_early: bool) -> Response {
             index: 0,
             finished: false,
             close_early,
+            _guard: guard,
         },
         |mut state| async move {
             if state.finished {
@@ -1066,7 +1111,9 @@ pub struct MeetingOpts {
     pub timings: EngineTimings,
     pub machine: MachineParams,
     pub compress_threshold_tokens: usize,
-    pub profile_path: Option<String>,
+    pub notes_path: Option<String>,
+    /// The assist profile active at engine start.
+    pub start_profile: AssistProfile,
     /// Override the asr model name in the config (model-missing tests).
     pub asr_model: Option<String>,
     /// Override the llm port (closed-port tests pass a freed one).
@@ -1079,7 +1126,8 @@ impl Default for MeetingOpts {
             timings: fast_timings(),
             machine: MachineParams::default(),
             compress_threshold_tokens: 1_000,
-            profile_path: None,
+            notes_path: None,
+            start_profile: AssistProfile::Manual,
             asr_model: None,
             llm_port: None,
         }
@@ -1122,10 +1170,13 @@ impl MeetingHarness {
             llm: LlmConfig {
                 base_url: format!("http://127.0.0.1:{}", opts.llm_port.unwrap_or(llm.port)),
                 model: "mock-model".into(),
-                profile_path: opts.profile_path.clone(),
+                notes_path: opts.notes_path.clone(),
                 // what the app sends when LLM_ENABLE_THINKING is unset
                 enable_thinking: Some(false),
                 ..Default::default()
+            },
+            assist: AssistConfig {
+                start_profile: opts.start_profile,
             },
             asr: AsrConfig {
                 base_url: format!("http://127.0.0.1:{}", asr.port),
