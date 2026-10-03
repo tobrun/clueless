@@ -22,6 +22,8 @@ pub enum HotkeyAction {
     ToggleMode,
     /// Turn interactive mode on or off (panel becomes key-able).
     ToggleClickThrough,
+    /// Step the assist profile (Manual, Interview, Brainstorm, Manual).
+    CycleProfile,
     MoveLeft,
     MoveRight,
     MoveUp,
@@ -54,6 +56,7 @@ impl HotkeyAction {
             Self::Suggest => Some(EngineCommand::Suggest),
             Self::ClearSuggestion => Some(EngineCommand::ClearSuggestion),
             Self::ToggleMeeting => Some(EngineCommand::ToggleMeeting),
+            Self::CycleProfile => Some(EngineCommand::CycleProfile),
             _ => None,
         }
     }
@@ -104,7 +107,7 @@ impl std::fmt::Display for HotkeyParseError {
 
 impl std::error::Error for HotkeyParseError {}
 
-fn table(config: &HotkeysConfig) -> [(HotkeyAction, &'static str, &str); 10] {
+fn table(config: &HotkeysConfig) -> [(HotkeyAction, &'static str, &str); 11] {
     [
         (HotkeyAction::Suggest, "suggest", &config.suggest),
         (HotkeyAction::ClearSuggestion, "clear", &config.clear),
@@ -128,13 +131,18 @@ fn table(config: &HotkeysConfig) -> [(HotkeyAction, &'static str, &str); 10] {
             "toggle_click_through",
             &config.toggle_click_through,
         ),
+        (
+            HotkeyAction::CycleProfile,
+            "cycle_profile",
+            &config.cycle_profile,
+        ),
     ]
 }
 
 /// Parse every configured hotkey. The first bad string is an error naming
 /// the key and the field; callers show it and keep the rest.
 pub fn parse_all(config: &HotkeysConfig) -> Result<Vec<ParsedHotkey>, HotkeyParseError> {
-    let mut out = Vec::with_capacity(10);
+    let mut out = Vec::with_capacity(11);
     for (action, field, raw) in table(config) {
         match raw.parse::<HotKey>() {
             Ok(hotkey) => out.push(ParsedHotkey {
@@ -225,10 +233,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_ten_default_hotkeys_parse() {
+    fn all_eleven_default_hotkeys_parse() {
         let config = HotkeysConfig::default();
         let parsed = parse_all(&config).expect("defaults must parse");
-        assert_eq!(parsed.len(), 10);
+        assert_eq!(parsed.len(), 11);
         // Every action appears exactly once and ids are unique (a duplicate
         // id would misroute presses).
         let mut actions: Vec<HotkeyAction> = parsed.iter().map(|p| p.action).collect();
@@ -268,13 +276,14 @@ mod tests {
             HotkeyAction::ToggleOverlay,
             HotkeyAction::ToggleMode,
             HotkeyAction::ToggleClickThrough,
+            HotkeyAction::CycleProfile,
         ] {
             assert_eq!(action.move_delta(), None, "{action:?} is not a move");
         }
     }
 
     #[test]
-    fn meeting_only_set_is_suggest_clear_and_the_four_moves() {
+    fn meeting_only_set_is_suggest_clear_and_the_four_moves_and_cycle_profile_is_always_on() {
         for action in [
             HotkeyAction::Suggest,
             HotkeyAction::ClearSuggestion,
@@ -290,8 +299,18 @@ mod tests {
             HotkeyAction::ToggleOverlay,
             HotkeyAction::ToggleMode,
             HotkeyAction::ToggleClickThrough,
+            HotkeyAction::CycleProfile,
         ] {
             assert!(!action.meeting_only(), "{action:?} must be always-on");
         }
+    }
+
+    #[test]
+    fn cycle_profile_is_always_on_and_sends_the_engine_command() {
+        assert!(!HotkeyAction::CycleProfile.meeting_only());
+        assert_eq!(
+            HotkeyAction::CycleProfile.engine_command(),
+            Some(EngineCommand::CycleProfile)
+        );
     }
 }
