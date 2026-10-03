@@ -33,6 +33,20 @@ Run from the repo root after `cargo xtask bundle` (assembles `target/debug/cluel
 - [ ] Press it again mid-stream: the old suggestion stops and the new one starts.
 - [ ] Long conversation: once the context passes the compression threshold the suggestion still arrives and `[llm]` history keeps working (check `~/Library/Logs/clueless/clueless.log` for a compress entry).
 
+## Continuous assistance
+
+Needs a real two-sided conversation (a second person or a video call with system sound) and a live LLM server.
+
+- [ ] Fresh launch with no `[assist]` key: the status line starts with "manual" and nothing is asked until `Cmd+Enter` is pressed.
+- [ ] Press `ctrl+alt+KeyP` until the status line reads "interview": the other side asks a real question and an answer streams into the feed without a key press.
+- [ ] Small talk from the other side ("yeah", "okay, thanks") shows nothing.
+- [ ] Switch to brainstorm and talk for a while: ideas as up to 3 dash lines are added to the feed while you keep talking, at least 8 s apart.
+- [ ] Older feed entries stay above the newest one and can be scrolled to in both windows.
+- [ ] Pick a profile from the status icon menu: the status line shows the new name and the active menu item is marked; switching mid-meeting and while idle both work.
+- [ ] `Cmd+Enter` in every profile answers now and cancels a running answer.
+- [ ] Stop the LLM server mid-meeting: the status line shows the error, nothing is added to the feed, and automatic requests resume after the 30 s pause once the server is back.
+- [ ] Note `llm_first_delta_ms` in `~/Library/Logs/clueless/clueless.log` for automatic requests, and whether the model answers PASS when it has nothing to say (the PASS answers must not show).
+
 ## Overlay panel
 
 - [ ] Move the panel with the move hotkeys during a meeting; it stays where left and survives show/hide.

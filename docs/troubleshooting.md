@@ -33,7 +33,22 @@ macOS sometimes asks to re-approve this grant after updates; the same restart ap
 ## Hotkeys do nothing
 
 The suggest, clear and move keys are registered only while a meeting is running, so they are silent outside a meeting.
-`cmd+shift+KeyR`, `cmd+Backslash`, `cmd+shift+KeyM` and `cmd+shift+Backslash` (the mode switch) are always on, which also takes those combinations from every other app; remap them in `[hotkeys]` if they collide with something you need.
+`cmd+shift+KeyR`, `cmd+Backslash`, `cmd+shift+KeyM`, `cmd+shift+Backslash` (the mode switch) and `ctrl+alt+KeyP` (cycle profile) are always on, which also takes those combinations from every other app; remap them in `[hotkeys]` if they collide with something you need.
+
+## No automatic answers
+
+Look at the trigger decision lines in the log (profile and outcome, no transcript text), then check in this order.
+
+- The profile is Manual: the status line starts with the profile name; press `ctrl+alt+KeyP` or pick one from the status icon menu, or set `assist.start_profile`.
+- The turn was too short: turns under 12 characters without a question mark start no request.
+- The gap: automatic requests start at least 2 s apart, 8 s in Brainstorm.
+- The pause after a failure: for 30 s after a failed or interrupted request nothing is asked automatically, unless a request has ended successfully since.
+- System audio is missing in Interview: with no Them stream it never fires; the source status says system audio is missing, see "No Them lines" above.
+
+## Too many answers
+
+The model is expected to answer with the single word PASS when it has nothing to say, and the app hides that.
+If a model ignores PASS and always answers, try a more instruction-following model, switch to Manual, or use Interview instead of Brainstorm.
 
 ## The app does not launch from the terminal or Finder
 
