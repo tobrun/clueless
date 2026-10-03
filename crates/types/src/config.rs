@@ -176,7 +176,7 @@ impl Default for LlmConfig {
             api_key: None,
             max_tokens: 220,
             temperature: 0.4,
-            profile_path: None,
+            notes_path: None,
             enable_thinking: None,
         }
     }
@@ -192,7 +192,9 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     pub max_tokens: u32,
     pub temperature: f32,
-    pub profile_path: Option<String>,
+    /// Text file with the user's own notes (name, role, background); placed
+    /// in the system message of every request.
+    pub notes_path: Option<String>,
     /// `None` omits `chat_template_kwargs` from requests entirely;
     /// `Some(false)` sends `enable_thinking: false` (vLLM/Qwen).
     pub enable_thinking: Option<bool>,
@@ -214,6 +216,9 @@ impl LlmConfig {
             Some(raw) => parse_number("LLM_TEMPERATURE", &raw, &mut problems),
             None => Some(0.4),
         };
+        if lookup_value(lookup, "LLM_PROFILE_PATH").is_some() {
+            problems.push("LLM_PROFILE_PATH was renamed to LLM_NOTES_PATH".to_string());
+        }
         let enable_thinking = match lookup_value(lookup, "LLM_ENABLE_THINKING") {
             Some(raw) => match raw.as_str() {
                 "true" => Some(Some(true)),
@@ -236,7 +241,7 @@ impl LlmConfig {
             api_key: lookup_value(lookup, "LLM_API_KEY"),
             max_tokens: max_tokens.expect("checked above"),
             temperature: temperature.expect("checked above"),
-            profile_path: lookup_value(lookup, "LLM_PROFILE_PATH").map(|p| expand_tilde(&p)),
+            notes_path: lookup_value(lookup, "LLM_NOTES_PATH").map(|p| expand_tilde(&p)),
             enable_thinking: enable_thinking.expect("checked above"),
         })
     }
@@ -251,7 +256,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("api_key", &self.api_key.as_deref().map(|_| "[set]"))
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
-            .field("profile_path", &self.profile_path)
+            .field("notes_path", &self.notes_path)
             .field("enable_thinking", &self.enable_thinking)
             .finish()
     }
@@ -325,6 +330,7 @@ pub struct HotkeysConfig {
     pub toggle_overlay: String,
     pub toggle_mode: String,
     pub toggle_click_through: String,
+    pub cycle_profile: String,
 }
 
 impl Default for HotkeysConfig {
@@ -340,6 +346,23 @@ impl Default for HotkeysConfig {
             toggle_overlay: "cmd+Backslash".into(),
             toggle_mode: "cmd+shift+Backslash".into(),
             toggle_click_through: "cmd+shift+KeyM".into(),
+            cycle_profile: "ctrl+alt+KeyP".into(),
+        }
+    }
+}
+
+/// How the assistant behaves at launch.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AssistConfig {
+    /// The profile that is active when the app starts.
+    pub start_profile: crate::profile::AssistProfile,
+}
+
+impl Default for AssistConfig {
+    fn default() -> Self {
+        Self {
+            start_profile: crate::profile::AssistProfile::Manual,
         }
     }
 }
@@ -352,6 +375,7 @@ struct TomlTuning {
     vad: VadConfig,
     overlay: OverlayConfig,
     hotkeys: HotkeysConfig,
+    assist: AssistConfig,
 }
 
 /// Everything the app needs: the app-behavior tables from the (optional)
@@ -362,6 +386,7 @@ pub struct Config {
     pub vad: VadConfig,
     pub overlay: OverlayConfig,
     pub hotkeys: HotkeysConfig,
+    pub assist: AssistConfig,
     pub llm: LlmConfig,
     pub asr: AsrConfig,
 }
@@ -387,6 +412,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
         ],
     ),
     ("overlay", &["hide_from_capture"]),
+    ("assist", &["start_profile"]),
     (
         "hotkeys",
         &[
@@ -400,6 +426,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "toggle_overlay",
             "toggle_mode",
             "toggle_click_through",
+            "cycle_profile",
         ],
     ),
 ];
@@ -415,7 +442,7 @@ const MOVED_TABLES: &[(&str, &str)] = &[
     (
         "llm",
         "[llm] moved to the environment: use LLM_MAX_TOKENS, LLM_TEMPERATURE, \
-         LLM_PROFILE_PATH and LLM_ENABLE_THINKING (see .env.example)",
+         LLM_NOTES_PATH and LLM_ENABLE_THINKING (see .env.example)",
     ),
 ];
 
@@ -477,6 +504,7 @@ impl Config {
                 vad: tuning.vad,
                 overlay: tuning.overlay,
                 hotkeys: tuning.hotkeys,
+                assist: tuning.assist,
                 llm,
                 asr,
             }),

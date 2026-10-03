@@ -39,7 +39,7 @@ struct Meeting {
     pipeline: Pipeline,
     store: Arc<Mutex<TranscriptStore>>,
     llm: Arc<LlmClient>,
-    profile: Option<String>,
+    notes: Option<String>,
     cancel: CancellationToken,
     compress_cancel: CancellationToken,
     compress_task: JoinHandle<()>,
@@ -140,6 +140,8 @@ impl Engine {
                         return;
                     }
                     EngineCommand::StartMeeting
+                    | EngineCommand::CycleProfile
+                    | EngineCommand::SetProfile(_)
                     | EngineCommand::StopMeeting
                     | EngineCommand::Suggest
                     | EngineCommand::ClearSuggestion => {}
@@ -181,7 +183,7 @@ impl Engine {
         {
             self.emit(event);
         }
-        let profile = self.read_profile();
+        let notes = self.read_notes();
 
         let mut sources = Vec::new();
         for speaker in self.deps.factory.speakers() {
@@ -247,7 +249,7 @@ impl Engine {
             pipeline,
             store,
             llm,
-            profile,
+            notes,
             cancel,
             compress_cancel,
             compress_task,
@@ -301,7 +303,7 @@ impl Engine {
             let store = meeting.store.lock().expect("store lock");
             prompt::build(
                 &store,
-                meeting.profile.as_deref(),
+                meeting.notes.as_deref(),
                 &in_progress,
                 meeting.last_trigger_line_id,
             )
@@ -325,17 +327,17 @@ impl Engine {
         meeting.suggestion = Some((task, cancel));
     }
 
-    /// The profile file is read once per meeting; a missing file is a
+    /// The notes file is read once per meeting; a missing file is a
     /// Warn status and the meeting runs without it.
-    fn read_profile(&self) -> Option<String> {
-        let path = self.config.llm.profile_path.as_deref()?;
+    fn read_notes(&self) -> Option<String> {
+        let path = self.config.llm.notes_path.as_deref()?;
         match std::fs::read_to_string(path) {
             Ok(text) => Some(text),
             Err(error) => {
                 self.emit(UiEvent::Status {
                     source: StatusSource::App,
                     level: StatusLevel::Warn,
-                    text: format!("profile file {path} could not be read: {error}"),
+                    text: format!("notes file {path} could not be read: {error}"),
                 });
                 None
             }
