@@ -207,6 +207,16 @@ fn the_debug_output_never_contains_the_api_keys() {
 }
 
 #[test]
+fn the_llm_debug_output_masks_only_the_key() {
+    let cfg = load("", "llm-debug", &[("LLM_API_KEY", "sk-secret")]).unwrap();
+    let text = format!("{:?}", cfg.llm);
+    assert!(text.contains("LlmConfig"), "{text}");
+    assert!(text.contains("test-llm"), "{text}");
+    assert!(text.contains("api_key: Some(\"[set]\")"), "{text}");
+    assert!(!text.contains("sk-secret"), "{text}");
+}
+
+#[test]
 fn unknown_key_names_the_key() {
     let err = load("[vad]\nfoo = 1\n", "unknown-key", &[]).unwrap_err();
     let msg = err.to_string();

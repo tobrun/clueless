@@ -473,3 +473,35 @@ impl From<&ProgressEntry> for InProgressText {
         }
     }
 }
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    fn activity(open: bool, unresolved: usize) -> SpeakerActivity {
+        let activity = SpeakerActivity::default();
+        activity.open.store(open, Ordering::Release);
+        activity.unresolved.store(unresolved, Ordering::Release);
+        activity
+    }
+
+    #[test]
+    fn a_speaker_with_nothing_open_and_nothing_in_flight_is_not_busy() {
+        assert!(!activity(false, 0).busy());
+    }
+
+    #[test]
+    fn an_open_segment_makes_the_speaker_busy() {
+        assert!(activity(true, 0).busy());
+    }
+
+    #[test]
+    fn one_final_in_flight_makes_the_speaker_busy() {
+        assert!(activity(false, 1).busy());
+    }
+
+    #[test]
+    fn several_finals_in_flight_keep_the_speaker_busy() {
+        assert!(activity(false, 3).busy());
+    }
+}
