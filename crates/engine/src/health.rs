@@ -37,6 +37,11 @@ pub async fn check(
     events
 }
 
+/// The status that replaces an LLM failure after the first good answer.
+pub fn llm_reachable(model: &str) -> UiEvent {
+    reachable(StatusSource::Llm, "LLM", model)
+}
+
 fn status(source: StatusSource, level: StatusLevel, text: String) -> UiEvent {
     UiEvent::Status {
         source,

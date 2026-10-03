@@ -97,22 +97,6 @@ pub fn transcript_part(store: &TranscriptStore) -> String {
     parts.join("\n")
 }
 
-/// Compatibility wrapper for the engine until it switches to [`build_for`]:
-/// a manual request under the Manual profile, no previous answer.
-pub fn build(
-    store: &TranscriptStore,
-    notes: Option<&str>,
-    in_progress: &[InProgressText],
-    last_trigger_line_id: u64,
-) -> Vec<PromptMessage> {
-    let ask = Ask {
-        profile: AssistProfile::Manual,
-        origin: Origin::Manual,
-        previous_answer: None,
-    };
-    build_for(store, notes, in_progress, last_trigger_line_id, &ask).messages
-}
-
 /// Build the two chat messages: the system message (`BASE_RULES`, plus the
 /// notes under `ABOUT THE USER:` when set - identical for every profile) and
 /// the user message (transcript part, a blank line, then the tail: the
@@ -244,6 +228,21 @@ mod tests {
     use super::*;
     use clueless_types::Utterance;
     use clueless_types::UtteranceId;
+
+    /// A manual request under the Manual profile with no previous answer.
+    fn build(
+        store: &TranscriptStore,
+        notes: Option<&str>,
+        in_progress: &[InProgressText],
+        last_trigger_line_id: u64,
+    ) -> Vec<PromptMessage> {
+        let ask = Ask {
+            profile: AssistProfile::Manual,
+            origin: Origin::Manual,
+            previous_answer: None,
+        };
+        build_for(store, notes, in_progress, last_trigger_line_id, &ask).messages
+    }
 
     fn utterance(speaker: Speaker, seq: u64, t0_ms: u64, text: &str) -> Utterance {
         Utterance {

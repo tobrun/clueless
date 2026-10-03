@@ -139,6 +139,10 @@ pub struct Pipeline {
     progress: Arc<Mutex<HashMap<Speaker, ProgressEntry>>>,
     commits_tx: watch::Sender<u64>,
     panic_rx: Option<mpsc::UnboundedReceiver<String>>,
+    activities: HashMap<Speaker, Arc<asr_worker::SpeakerActivity>>,
+    pieces_rx: Option<mpsc::UnboundedReceiver<asr_worker::PieceDone>>,
+    /// Kept so the pieces channel never closes while the pipeline lives.
+    _pieces_tx: mpsc::UnboundedSender<asr_worker::PieceDone>,
     stop_done: bool,
 }
 
@@ -161,6 +165,8 @@ impl Pipeline {
         let has_them = sources.iter().any(|(speaker, _)| *speaker == Speaker::Them);
         let drain = Arc::new(Drain::new(sources.len()));
         let (commits_tx, _) = watch::channel(0_u64);
+        let (pieces_tx, pieces_rx) = mpsc::unbounded_channel::<asr_worker::PieceDone>();
+        let mut activities: HashMap<Speaker, Arc<asr_worker::SpeakerActivity>> = HashMap::new();
         let progress: Arc<Mutex<HashMap<Speaker, ProgressEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let them_pending: Arc<Mutex<VecDeque<u64>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -185,6 +191,8 @@ impl Pipeline {
                 Speaker::Me => StatusSource::Mic,
                 Speaker::Them => StatusSource::SystemAudio,
             };
+            let activity = Arc::new(asr_worker::SpeakerActivity::default());
+            activities.insert(speaker, activity.clone());
             let (final_tx, final_rx) = mpsc::channel::<Segment>(16);
             let slot = Arc::new(LatestSlot::new());
             let final_seq_watermark = Arc::new(AtomicU64::new(0));
@@ -197,6 +205,7 @@ impl Pipeline {
                 interim_slot: slot.clone(),
                 final_seq_watermark: final_seq_watermark.clone(),
                 drain: drain.clone(),
+                activity: activity.clone(),
                 them_pending: them_pending.clone(),
                 them_open_t0: them_open_t0.clone(),
                 panic_tx: panic_tx.clone(),
@@ -233,6 +242,8 @@ impl Pipeline {
                 them_pending: them_pending.clone(),
                 drain: drain.clone(),
                 cancel: cancel.clone(),
+                activity,
+                pieces: pieces_tx.clone(),
                 echo,
                 timings: deps.timings,
             });
@@ -261,6 +272,9 @@ impl Pipeline {
             progress,
             commits_tx,
             panic_rx: Some(panic_rx),
+            activities,
+            pieces_rx: Some(pieces_rx),
+            _pieces_tx: pieces_tx,
             stop_done: false,
         }
     }
@@ -280,6 +294,19 @@ impl Pipeline {
             Speaker::Them => 1,
         });
         entries
+    }
+
+    /// Whether `speaker` has an open segment or finals still in flight.
+    pub fn busy(&self, speaker: Speaker) -> bool {
+        self.activities
+            .get(&speaker)
+            .is_some_and(|activity| activity.busy())
+    }
+
+    /// The receiver of finished-piece reports (committed or dropped); taken
+    /// once by the meeting loop.
+    pub fn pieces(&mut self) -> Option<mpsc::UnboundedReceiver<asr_worker::PieceDone>> {
+        self.pieces_rx.take()
     }
 
     /// Changes after every committed utterance; the value is the count.

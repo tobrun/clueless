@@ -4,6 +4,7 @@
 //! compressed, exactly once per meeting.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -13,14 +14,17 @@ use asr::client::AsrClient;
 use clueless_types::audio::SourceError;
 use clueless_types::config::Config;
 use clueless_types::events::{
-    EngineCommand, MeetingState, Speaker, StatusLevel, StatusSource, UiEvent,
+    EngineCommand, MeetingState, Speaker, StatusLevel, StatusSource, SuggestionEnd, UiEvent,
 };
-use context::prompt;
+use clueless_types::profile::{AssistProfile, Origin};
+use context::assist::{self, AutoPolicy, Decision, Outcome, PolicyTimings};
+use context::prompt::{self, Ask};
 use context::store::TranscriptStore;
 use llm::client::LlmClient;
 use llm::types::ChatRequest;
 use segmenter::machine::MachineParams;
 
+use crate::asr_worker::PieceDone;
 use crate::clock::MeetingClock;
 use crate::compress;
 use crate::deps::EngineDeps;
@@ -45,8 +49,31 @@ struct Meeting {
     compress_task: JoinHandle<()>,
     drained_task: JoinHandle<()>,
     panic_task: Option<JoinHandle<()>>,
-    suggestion: Option<(JoinHandle<()>, CancellationToken)>,
+    suggestion: Option<RunningSuggestion>,
     last_trigger_line_id: u64,
+    /// Finished speech pieces reported by the ASR workers.
+    pieces: mpsc::UnboundedReceiver<PieceDone>,
+    /// When automatic requests start.
+    policy: AutoPolicy,
+    /// The last answer that ended `Done` with shown text.
+    previous_answer: Option<String>,
+    /// Every source ended and every queue is empty.
+    drained: bool,
+    drained_emitted: bool,
+    /// The last suggestion request failed; the next good answer restores the
+    /// LLM status.
+    llm_failed: bool,
+    /// When the engine loop must look at the policy again.
+    wake_at: Option<tokio::time::Instant>,
+    /// Whether the policy was last seen waiting (logging only).
+    was_waiting: bool,
+}
+
+/// The one suggestion request that is open.
+struct RunningSuggestion {
+    id: u64,
+    task: JoinHandle<()>,
+    cancel: CancellationToken,
 }
 
 /// The meeting engine. Construct it with the config and its seams, then
@@ -66,16 +93,23 @@ impl Engine {
     /// dropped. Must run inside a tokio runtime.
     pub async fn run(self, mut commands: mpsc::UnboundedReceiver<EngineCommand>) {
         let (internal_tx, mut internal_rx) = mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel::<suggest::Finished>();
         let mut meeting: Option<Meeting> = None;
         let mut state = MeetingState::Idle;
         let mut next_suggestion_id: u64 = 0;
+        let mut profile = self.config.assist.start_profile;
+        self.emit(UiEvent::Profile(profile));
 
         loop {
             enum Next {
                 Command(EngineCommand),
                 Internal(Internal),
+                Finished(suggest::Finished),
+                Piece(PieceDone),
+                Tick,
                 Closed,
             }
+            let wake = meeting.as_ref().and_then(|current| current.wake_at);
             let next = tokio::select! { biased;
                 message = internal_rx.recv() => match message {
                     Some(message) => Next::Internal(message),
@@ -85,6 +119,25 @@ impl Engine {
                     Some(command) => Next::Command(command),
                     None => Next::Closed,
                 },
+                finished = finished_rx.recv() => match finished {
+                    Some(finished) => Next::Finished(finished),
+                    None => Next::Closed,
+                },
+                piece = async {
+                    match meeting.as_mut() {
+                        Some(current) => current.pieces.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match piece {
+                    Some(piece) => Next::Piece(piece),
+                    None => Next::Closed,
+                },
+                _ = async {
+                    match wake {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => Next::Tick,
             };
             match next {
                 Next::Internal(Internal::Panic(message)) => {
@@ -96,13 +149,35 @@ impl Engine {
                     }
                 }
                 Next::Internal(Internal::Drained) => {
-                    if state == MeetingState::Running && meeting.is_some() {
-                        self.emit(UiEvent::SourcesDrained);
+                    if state == MeetingState::Running
+                        && let Some(current) = meeting.as_mut()
+                    {
+                        // Every piece message was queued before the drain
+                        // settled; take them in before judging quietness.
+                        Self::absorb_pieces(current);
+                        current.drained = true;
                     }
                 }
+                Next::Finished(finished) => {
+                    if let Some(current) = meeting.as_mut() {
+                        self.suggestion_finished(current, finished);
+                    }
+                }
+                Next::Piece(piece) => {
+                    if let Some(current) = meeting.as_mut() {
+                        current.policy.piece_done(
+                            piece.speaker,
+                            piece.text.as_deref(),
+                            Instant::now(),
+                        );
+                    }
+                }
+                Next::Tick => {}
                 Next::Command(command) => match command {
                     EngineCommand::StartMeeting if state == MeetingState::Idle => {
-                        state = self.start_meeting(&mut meeting, &internal_tx).await;
+                        state = self
+                            .start_meeting(&mut meeting, &internal_tx, profile)
+                            .await;
                     }
                     EngineCommand::StopMeeting if state == MeetingState::Running => {
                         self.stop_meeting(&mut meeting).await;
@@ -110,7 +185,9 @@ impl Engine {
                     }
                     EngineCommand::ToggleMeeting => match state {
                         MeetingState::Idle => {
-                            state = self.start_meeting(&mut meeting, &internal_tx).await;
+                            state = self
+                                .start_meeting(&mut meeting, &internal_tx, profile)
+                                .await;
                         }
                         MeetingState::Running => {
                             self.stop_meeting(&mut meeting).await;
@@ -121,13 +198,30 @@ impl Engine {
                     EngineCommand::Suggest if state == MeetingState::Running => {
                         if let Some(current) = meeting.as_mut() {
                             next_suggestion_id += 1;
-                            self.run_suggestion(current, next_suggestion_id).await;
+                            self.run_suggestion(
+                                current,
+                                next_suggestion_id,
+                                profile,
+                                Origin::Manual,
+                                &finished_tx,
+                            )
+                            .await;
                         }
                     }
                     EngineCommand::ClearSuggestion if state == MeetingState::Running => {
                         if let Some(current) = meeting.as_mut() {
                             Self::cancel_suggestion(current).await;
+                            current.previous_answer = None;
                             self.emit(UiEvent::ClearSuggestion);
+                        }
+                    }
+                    EngineCommand::CycleProfile => {
+                        let wanted = profile.next();
+                        self.change_profile(&mut profile, wanted, &mut meeting);
+                    }
+                    EngineCommand::SetProfile(wanted) => {
+                        if wanted != profile {
+                            self.change_profile(&mut profile, wanted, &mut meeting);
                         }
                     }
                     EngineCommand::Shutdown => {
@@ -140,13 +234,17 @@ impl Engine {
                         return;
                     }
                     EngineCommand::StartMeeting
-                    | EngineCommand::CycleProfile
-                    | EngineCommand::SetProfile(_)
                     | EngineCommand::StopMeeting
                     | EngineCommand::Suggest
                     | EngineCommand::ClearSuggestion => {}
                 },
                 Next::Closed => break,
+            }
+            if state == MeetingState::Running
+                && let Some(current) = meeting.as_mut()
+            {
+                self.pump(current, &mut next_suggestion_id, profile, &finished_tx)
+                    .await;
             }
         }
         // The command sender went away: shut down like `Shutdown` did.
@@ -155,12 +253,126 @@ impl Engine {
         }
     }
 
+    /// Switch the active profile and tell the UI; a running meeting's policy
+    /// drops its waiting trigger.
+    fn change_profile(
+        &self,
+        profile: &mut AssistProfile,
+        wanted: AssistProfile,
+        meeting: &mut Option<Meeting>,
+    ) {
+        *profile = wanted;
+        if let Some(current) = meeting.as_mut() {
+            current.policy.set_profile(wanted);
+        }
+        self.emit(UiEvent::Profile(wanted));
+    }
+
+    /// Feed every queued piece report to the policy.
+    fn absorb_pieces(meeting: &mut Meeting) {
+        while let Ok(piece) = meeting.pieces.try_recv() {
+            meeting
+                .policy
+                .piece_done(piece.speaker, piece.text.as_deref(), Instant::now());
+        }
+    }
+
+    /// Ask the policy what to do now: start an automatic request, set the
+    /// wake-up time, and release `SourcesDrained` once nothing is running or
+    /// waiting.
+    async fn pump(
+        &self,
+        meeting: &mut Meeting,
+        next_suggestion_id: &mut u64,
+        profile: AssistProfile,
+        finished_tx: &mpsc::UnboundedSender<suggest::Finished>,
+    ) {
+        let busy =
+            assist::trigger(profile).is_some_and(|trigger| meeting.pipeline.busy(trigger.speaker));
+        meeting.wake_at = None;
+        match meeting.policy.poll(Instant::now(), busy) {
+            Decision::Idle => meeting.was_waiting = false,
+            Decision::WaitUntil(at) => {
+                if !meeting.was_waiting {
+                    tracing::info!(assist_profile = profile.key(), assist_outcome = "waiting");
+                    meeting.was_waiting = true;
+                }
+                meeting.wake_at = Some(tokio::time::Instant::from_std(at));
+            }
+            Decision::Fire => {
+                meeting.was_waiting = false;
+                tracing::info!(assist_profile = profile.key(), assist_outcome = "fired");
+                *next_suggestion_id += 1;
+                self.run_suggestion(
+                    meeting,
+                    *next_suggestion_id,
+                    profile,
+                    Origin::Auto,
+                    finished_tx,
+                )
+                .await;
+            }
+        }
+        if meeting.drained && !meeting.drained_emitted && meeting.policy.is_quiet() {
+            meeting.drained_emitted = true;
+            self.emit(UiEvent::SourcesDrained);
+        }
+    }
+
+    /// A suggestion run reported its end: if it is the open request, close it,
+    /// tell the policy, remember the answer and update the LLM status.
+    fn suggestion_finished(&self, meeting: &mut Meeting, finished: suggest::Finished) {
+        if meeting
+            .suggestion
+            .as_ref()
+            .is_none_or(|running| running.id != finished.id)
+        {
+            return;
+        }
+        meeting.suggestion = None;
+        let outcome = match finished.end {
+            SuggestionEnd::Done => Outcome::Ok,
+            SuggestionEnd::Failed(_) | SuggestionEnd::Interrupted => Outcome::Failed,
+            SuggestionEnd::Cancelled => Outcome::Cancelled,
+        };
+        meeting.policy.request_finished(outcome, Instant::now());
+        match finished.end {
+            SuggestionEnd::Done => {
+                if !finished.shown.is_empty() {
+                    meeting.previous_answer = Some(finished.shown);
+                }
+                if meeting.llm_failed {
+                    meeting.llm_failed = false;
+                    self.emit(health::llm_reachable(meeting.llm.model()));
+                }
+            }
+            SuggestionEnd::Failed(reason) => {
+                meeting.llm_failed = true;
+                self.llm_status(reason);
+            }
+            SuggestionEnd::Interrupted => {
+                meeting.llm_failed = true;
+                self.llm_status("LLM answer interrupted".to_owned());
+            }
+            SuggestionEnd::Cancelled => {}
+        }
+    }
+
+    fn llm_status(&self, text: String) {
+        self.emit(UiEvent::Status {
+            source: StatusSource::Llm,
+            level: StatusLevel::Error,
+            text,
+        });
+    }
+
     /// The full start sequence; returns the state reached (`Running`, or
     /// `Idle` when no source could be opened).
     async fn start_meeting(
         &self,
         meeting: &mut Option<Meeting>,
         internal_tx: &mpsc::UnboundedSender<Internal>,
+        profile: AssistProfile,
     ) -> MeetingState {
         self.emit(UiEvent::MeetingState(MeetingState::Starting));
         let timings = self.deps.timings;
@@ -214,6 +426,9 @@ impl Engine {
             cancel.clone(),
         );
 
+        let pieces = pipeline
+            .pieces()
+            .expect("a fresh pipeline hands out its pieces receiver once");
         let panic_task = pipeline.panics().map(|mut panic_rx| {
             let tx = internal_tx.clone();
             tokio::spawn(async move {
@@ -257,6 +472,22 @@ impl Engine {
             panic_task,
             suggestion: None,
             last_trigger_line_id: 0,
+            pieces,
+            policy: AutoPolicy::new(
+                profile,
+                PolicyTimings {
+                    turn_settle: timings.turn_settle,
+                    turn_max_wait: timings.turn_max_wait,
+                    min_gap: timings.auto_min_gap,
+                    failure_pause: timings.auto_failure_pause,
+                },
+            ),
+            previous_answer: None,
+            drained: false,
+            drained_emitted: false,
+            llm_failed: false,
+            wake_at: None,
+            was_waiting: false,
         });
         self.emit(UiEvent::MeetingState(MeetingState::Running));
         MeetingState::Running
@@ -286,45 +517,68 @@ impl Engine {
     }
 
     /// Cancel the running suggestion (its task reports `Cancelled`) and
-    /// wait for that end event so later engine events follow it.
+    /// wait for that end event so later engine events follow it. The policy
+    /// hears about the cancellation here, because the run's own report is
+    /// ignored once the request is no longer the open one.
     async fn cancel_suggestion(meeting: &mut Meeting) {
-        if let Some((mut task, cancel)) = meeting.suggestion.take() {
-            suggest::cancel_and_wait(&mut task, &cancel).await;
+        if let Some(mut running) = meeting.suggestion.take() {
+            suggest::cancel_and_wait(&mut running.task, &running.cancel).await;
+            meeting
+                .policy
+                .request_finished(Outcome::Cancelled, Instant::now());
         }
     }
 
     /// Build the prompt from the store plus in-progress text and stream
-    /// one new suggestion; at most one suggestion runs at a time.
-    async fn run_suggestion(&self, meeting: &mut Meeting, id: u64) {
-        Self::cancel_suggestion(meeting).await;
+    /// one new suggestion. A manual request cancels the open one first; an
+    /// automatic one is only started when nothing is open.
+    async fn run_suggestion(
+        &self,
+        meeting: &mut Meeting,
+        id: u64,
+        profile: AssistProfile,
+        origin: Origin,
+        finished_tx: &mpsc::UnboundedSender<suggest::Finished>,
+    ) {
+        if origin == Origin::Manual {
+            Self::cancel_suggestion(meeting).await;
+        }
         self.emit(UiEvent::SuggestionStart { id });
         let in_progress = meeting.pipeline.in_progress();
-        let messages = {
+        let built = {
             let store = meeting.store.lock().expect("store lock");
-            prompt::build(
+            prompt::build_for(
                 &store,
                 meeting.notes.as_deref(),
                 &in_progress,
                 meeting.last_trigger_line_id,
+                &Ask {
+                    profile,
+                    origin,
+                    previous_answer: meeting.previous_answer.as_deref(),
+                },
             )
         };
-        meeting.last_trigger_line_id = meeting.store.lock().expect("store lock").last_line_id();
+        meeting.last_trigger_line_id = built.last_line_id;
         let request = ChatRequest::new(
             meeting.llm.model(),
-            suggest::to_llm_messages(messages),
+            suggest::to_llm_messages(built.messages),
             self.config.llm.max_tokens,
             self.config.llm.temperature as f64,
             self.config.llm.enable_thinking,
         );
         let cancel = CancellationToken::new();
+        meeting.policy.request_started(origin, Instant::now());
         let task = tokio::spawn(suggest::run(
             id,
             meeting.llm.clone(),
             request,
             cancel.clone(),
             self.deps.ui.clone(),
+            origin == Origin::Auto,
+            finished_tx.clone(),
         ));
-        meeting.suggestion = Some((task, cancel));
+        meeting.suggestion = Some(RunningSuggestion { id, task, cancel });
     }
 
     /// The notes file is read once per meeting; a missing file is a
