@@ -1,8 +1,8 @@
 # Architecture
 
-Purpose: clueless is a macOS meeting copilot for one user on one Mac. During a meeting it records the microphone ("Me") and the system audio ("Them") as two streams, cuts each into utterances, transcribes each utterance on a speech-to-text server over HTTP, and shows a rolling transcript in a floating overlay panel. On a hotkey it asks an LLM server over HTTP what to say next and streams the answer into the panel. Audio flows capture -> ring buffer -> engine stream thread (resample, voice detection, segmenter) -> ASR worker -> transcript store -> UI event -> overlay; a suggestion flows hotkey -> engine command -> prompt builder -> LLM stream -> overlay.
+Purpose: clueless is a macOS meeting copilot for one user on one Mac. During a meeting it records the microphone ("Me") and the system audio ("Them") as two streams, cuts each into utterances, transcribes each utterance on a speech-to-text server over HTTP, and shows a rolling transcript in a standard window or a hidden overlay panel. On a hotkey it asks an LLM server over HTTP what to say next and streams the answer into whichever window is on screen. Audio flows capture -> ring buffer -> engine stream thread (resample, voice detection, segmenter) -> ASR worker -> transcript store -> UI event -> overlay; a suggestion flows hotkey -> engine command -> prompt builder -> LLM stream -> overlay.
 
-Recorded 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.env`.
+Captured: 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.env` and the switchable window modes were added.
 
 ## Components
 
@@ -15,7 +15,7 @@ Recorded 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.env
 | context | transcript store, prompt builder, echo test, token estimate | `crates/context/` | types |
 | engine | threads, queues, meeting state, suggestions, replay | `crates/engine/` | types, segmenter, asr, llm, context |
 | capture | microphone and system-audio sources | `crates/capture/` | types |
-| overlay | panel, views, hotkeys, menu-bar item | `crates/overlay/` | types |
+| overlay | standard window, hidden overlay panel, mode switch, views, hotkeys, menu-bar item | `crates/overlay/` | types |
 | app | binary: wiring, command line, logging | `crates/app/` | all of the above |
 | xtask | bundle, sign, run | `xtask/` | nothing |
 
@@ -40,6 +40,11 @@ Recorded 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.env
 1. A hotkey or menu-bar click sends `StartMeeting` (`crates/overlay/`).
 2. The engine checks both servers, reads the profile file, opens each speaker the factory lists and starts one thread per source (`crates/engine/`, `crates/capture/`).
 3. `StopMeeting` flushes both segmenters, releases echo holds, waits for queued finals, cancels in-flight requests and joins the threads (`crates/engine/`).
+
+### Mode switch
+
+1. The `toggle_mode` hotkey (default `cmd+shift+Backslash`) or the status icon menu item routes through `handle_action` in the overlay (`crates/overlay/`).
+2. The overlay orders out the window on screen, fits the other one to the standard window's content area, and shows it; AppKit frame autosave (`CluelessMainWindow`) remembers the frame in the user defaults of the bundle id (`crates/overlay/`).
 
 ### Replay
 

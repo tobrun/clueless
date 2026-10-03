@@ -13,7 +13,7 @@ Run from the repo root after `cargo xtask bundle` (assembles `target/debug/cluel
 
 ## GUI lifecycle
 
-- [ ] Launch `open target/debug/clueless.app` (or the binary directly): the overlay panel appears, click-through by default, and the menu bar shows the clueless icon.
+- [ ] Launch `open target/debug/clueless.app` (or the binary directly): the standard window appears with a title bar, the overlay panel is not on screen, and the menu bar shows the clueless icon.
 - [ ] The icon menu shows "LIVE"/"offline" server health within ~2 s of launch.
 - [ ] Start a meeting from the icon menu: the panel header turns green and transcripts appear as you speak.
 - [ ] A second launch fails with a message naming `~/Library/Application Support/clueless/lock` and exits 2.
@@ -35,9 +35,31 @@ Run from the repo root after `cargo xtask bundle` (assembles `target/debug/cluel
 
 ## Overlay panel
 
-- [ ] Move the panel with the hotkeys (or drag); it stays where left and survives overlay toggles.
-- [ ] The panel does not appear in screen-share or screenshot captures (`hide_from_capture = true`).
+- [ ] Move the panel with the move hotkeys during a meeting; it stays where left and survives show/hide.
+- [ ] The panel does not appear in screen-share or screenshot captures (`hide_from_capture = true`, best effort on macOS 15.4+, see the Window modes block).
 - [ ] Click-through on: clicks pass to the app beneath; toggle click-through off and the panel accepts text selection.
+
+## Window modes
+
+- [ ] With fresh user defaults, launch: the standard window appears with a title bar at top centre, content 560 by 320, the overlay is not on screen, and the status icon menu reads "Hide Window" and "Switch to Hidden Overlay".
+- [ ] Drag and resize the window, press `cmd+shift+Backslash`: the window is gone, the overlay covers exactly the old content area, and clicks pass through it.
+- [ ] In hidden mode, type in the app that was in front before the switch: the keystrokes reach that app without clicking it first.
+- [ ] Press `cmd+shift+Backslash` again: the standard window is back at the same frame and in front.
+- [ ] The menu item "Switch to Standard Window" / "Switch to Hidden Overlay" gives the same result as the hotkey.
+- [ ] Resize the window to its smallest: it stops at 320 by 200 content and no views overlap.
+- [ ] Resize wide while a suggestion is shown: the text re-wraps to the new width in both modes.
+- [ ] Click the red close button: the window hides, the app is still in the menu bar, and the menu reads "Show Window".
+- [ ] `cmd+W` with the window key: same as the close button.
+- [ ] Select suggestion text and press `cmd+C`: the text is on the clipboard.
+- [ ] `cmd+Q` with the window key: the app quits through the normal quit path.
+- [ ] Hide with `cmd+Backslash` in hidden mode, then switch mode: the standard window shows.
+- [ ] Move, resize, quit, relaunch: the window opens at the saved frame in standard mode.
+- [ ] During a meeting in hidden mode press a move key, switch to standard: the window sits at the moved position.
+- [ ] Outside a meeting press `cmd+shift+ArrowRight` in a text editor: the editor extends its selection and the window does not move.
+- [ ] The click-through hotkey in standard mode: nothing changes.
+- [ ] Switch to standard mode from a different Space than the one the window was last on: the window appears on the current Space.
+- [ ] Save a frame on an external display, unplug it, launch and switch to hidden: the overlay is fully on the remaining screen.
+- [ ] Screenshot with `screencapture` in each mode: the standard window is in the image; the overlay is not (macOS below 15.4) or is noted as visible (15.4 and later).
 
 ## Failure modes
 

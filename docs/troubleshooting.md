@@ -33,7 +33,7 @@ macOS sometimes asks to re-approve this grant after updates; the same restart ap
 ## Hotkeys do nothing
 
 The suggest, clear and move keys are registered only while a meeting is running, so they are silent outside a meeting.
-`cmd+shift+KeyR`, `cmd+Backslash` and `cmd+shift+KeyM` are always on, which also takes those combinations from every other app; remap them in `[hotkeys]` if they collide with something you need.
+`cmd+shift+KeyR`, `cmd+Backslash`, `cmd+shift+KeyM` and `cmd+shift+Backslash` (the mode switch) are always on, which also takes those combinations from every other app; remap them in `[hotkeys]` if they collide with something you need.
 
 ## The app does not launch from the terminal or Finder
 
@@ -48,5 +48,6 @@ Each transcribed utterance logs its latency fields, which usually tells you whet
 
 ## The overlay is visible in a screen share
 
-`hide_from_capture = true` is best effort: macOS 15.4 and later ignore it for full-screen shares ([system-audio.md](system-audio.md) has the details).
+The standard window is always captured; only the hidden overlay panel can be hidden from capture, so switch to hidden mode with `cmd+shift+Backslash` before sharing.
+`hide_from_capture = true` is best effort: macOS 15.4 and later ignore the panel's sharing type for full-screen shares ([system-audio.md](system-audio.md) has the details), so hidden mode can still show up when a whole screen is shared.
 Hide the overlay with `cmd+Backslash` before sharing, or move it off the part of the screen you will share.
