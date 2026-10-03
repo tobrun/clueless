@@ -159,8 +159,8 @@ impl WorkerCtx {
     }
 
     /// Common teardown for one final: leave the pending set, clear text in
-    /// progress for this utterance, update the busy record, report the
-    /// finished piece, and only then decrement the drain counter - so the
+    /// progress for this utterance, report the finished piece, drop the busy
+    /// record, and only then decrement the drain counter - so the
     /// engine has every piece message queued before it hears "drained".
     fn release(&self, segment: &Segment, text: Option<String>) {
         if self.speaker == Speaker::Them {
@@ -176,11 +176,14 @@ impl WorkerCtx {
             progress.remove(&self.speaker);
         }
         drop(progress);
-        self.activity.unresolved.fetch_sub(1, Ordering::AcqRel);
+        // Report the piece while the speaker still counts as busy: a policy
+        // poll in between then waits one more settle time instead of seeing
+        // an idle speaker without having heard about this piece yet.
         let _ = self.pieces.send(PieceDone {
             speaker: self.speaker,
             text,
         });
+        self.activity.unresolved.fetch_sub(1, Ordering::AcqRel);
         self.drain.dec();
     }
 }

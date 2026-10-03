@@ -348,8 +348,12 @@ impl Engine {
             }
             Decision::Fire => {
                 meeting.was_waiting = false;
-                tracing::info!(assist_profile = profile.key(), assist_outcome = "fired");
                 *next_suggestion_id += 1;
+                tracing::info!(
+                    assist_profile = profile.key(),
+                    assist_outcome = "fired",
+                    suggestion = *next_suggestion_id,
+                );
                 self.run_suggestion(
                     meeting,
                     *next_suggestion_id,
@@ -389,6 +393,17 @@ impl Engine {
         self.apply_end(meeting, finished);
     }
 
+    /// Automatic requests pause after a failed or interrupted request; say so.
+    fn log_pause(&self, suggestion: u64, reason: &str) {
+        tracing::warn!(
+            suggestion,
+            reason,
+            pause_secs = self.deps.timings.auto_failure_pause.as_secs_f64(),
+            assist_outcome = "paused",
+            "suggestion failed, automatic requests pause"
+        );
+    }
+
     /// Remember the answer and update the LLM status for how the run ended.
     fn apply_end(&self, meeting: &mut Meeting, finished: suggest::Finished) {
         match finished.end {
@@ -402,10 +417,12 @@ impl Engine {
                 }
             }
             SuggestionEnd::Failed(reason) => {
+                self.log_pause(finished.id, &reason);
                 meeting.llm_failed = true;
                 self.llm_status(reason);
             }
             SuggestionEnd::Interrupted => {
+                self.log_pause(finished.id, "interrupted");
                 meeting.llm_failed = true;
                 self.llm_status("LLM answer interrupted".to_owned());
             }
