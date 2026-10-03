@@ -57,6 +57,15 @@ pub struct SeenRequest {
     pub file_name: Option<String>,
     pub file_content_type: Option<String>,
     pub file_len: usize,
+    /// The `Authorization` header, if one arrived.
+    pub authorization: Option<String>,
+}
+
+fn authorization(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 #[derive(Clone)]
@@ -69,6 +78,8 @@ struct Inner {
     fallback: Reply,
     models_body: String,
     requests: Vec<SeenRequest>,
+    /// `Authorization` headers seen on `GET /v1/models`.
+    model_authorizations: Vec<Option<String>>,
 }
 
 /// Handle to a running mock server; the server lives until the test runtime
@@ -88,6 +99,7 @@ impl MockAsr {
                 fallback: Reply::body(r#"{"text":"ok"}"#),
                 models_body: r#"{"object":"list","data":[]}"#.to_owned(),
                 requests: Vec::new(),
+                model_authorizations: Vec::new(),
             })),
         };
         let app = axum::Router::new()
@@ -130,6 +142,11 @@ impl MockAsr {
         self.lock().requests.last().cloned()
     }
 
+    /// The `Authorization` headers of every `GET /v1/models`, in order.
+    pub fn model_authorizations(&self) -> Vec<Option<String>> {
+        self.lock().model_authorizations.clone()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.state
             .inner
@@ -138,13 +155,18 @@ impl MockAsr {
     }
 }
 
-async fn transcribe(State(state): State<MockState>, mut mp: Multipart) -> Response {
+async fn transcribe(
+    State(state): State<MockState>,
+    headers: axum::http::HeaderMap,
+    mut mp: Multipart,
+) -> Response {
     let mut seen = SeenRequest {
         text_fields: Vec::new(),
         file_field: None,
         file_name: None,
         file_content_type: None,
         file_len: 0,
+        authorization: authorization(&headers),
     };
     while let Some(field) = mp.next_field().await.expect("multipart parses") {
         let name = field.name().unwrap_or_default().to_owned();
@@ -181,13 +203,12 @@ async fn transcribe(State(state): State<MockState>, mut mp: Multipart) -> Respon
     response
 }
 
-async fn models(State(state): State<MockState>) -> Response {
-    let body = state
-        .inner
-        .lock()
-        .expect("mock lock is never poisoned")
-        .models_body
-        .clone();
+async fn models(State(state): State<MockState>, headers: axum::http::HeaderMap) -> Response {
+    let body = {
+        let mut inner = state.inner.lock().expect("mock lock is never poisoned");
+        inner.model_authorizations.push(authorization(&headers));
+        inner.models_body.clone()
+    };
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,

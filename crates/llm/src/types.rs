@@ -33,7 +33,8 @@ impl Message {
     }
 }
 
-/// vLLM-specific template options; thinking is always off on the live path (D-thinking).
+/// vLLM-specific template options, sent only when `LLM_ENABLE_THINKING`
+/// is set (D-thinking).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ChatTemplateKwargs {
     pub enable_thinking: bool,
@@ -47,16 +48,21 @@ pub struct ChatRequest {
     pub stream: bool,
     pub max_tokens: u32,
     pub temperature: f64,
-    pub chat_template_kwargs: ChatTemplateKwargs,
+    /// `None` omits the field entirely so generic OpenAI servers never see
+    /// a vLLM-specific kwarg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
 impl ChatRequest {
-    /// A streaming request with thinking off, as every live request uses (D-thinking).
+    /// A streaming request; `enable_thinking` comes from `LLM_ENABLE_THINKING`
+    /// (D-thinking): `None` omits the field, `Some(false)` sends thinking off.
     pub fn new(
         model: impl Into<String>,
         messages: Vec<Message>,
         max_tokens: u32,
         temperature: f64,
+        enable_thinking: Option<bool>,
     ) -> Self {
         Self {
             model: model.into(),
@@ -64,9 +70,8 @@ impl ChatRequest {
             stream: true,
             max_tokens,
             temperature,
-            chat_template_kwargs: ChatTemplateKwargs {
-                enable_thinking: false,
-            },
+            chat_template_kwargs: enable_thinking
+                .map(|enable_thinking| ChatTemplateKwargs { enable_thinking }),
         }
     }
 }
@@ -117,30 +122,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat_request_serializes_chat_template_kwargs_with_thinking_off() {
-        let req = ChatRequest::new(
-            "your-model-id",
-            vec![Message::system("rules"), Message::user("hello")],
-            220,
-            0.4,
+    fn chat_request_serializes_chat_template_kwargs_when_thinking_is_set() {
+        let base = |thinking| {
+            ChatRequest::new(
+                "mock-model",
+                vec![Message::system("rules"), Message::user("hello")],
+                220,
+                0.4,
+                thinking,
+            )
+        };
+        let with = serde_json::to_string(&base(Some(false))).unwrap();
+        // The exact bytes a thinking-off request must carry, from probe 2026-10-02.
+        assert!(
+            with.contains(r#""chat_template_kwargs":{"enable_thinking":false}"#),
+            "{with}"
         );
-        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
-        assert_eq!(
-            value["chat_template_kwargs"],
-            serde_json::json!({"enable_thinking": false})
+        let without = serde_json::to_string(&base(None)).unwrap();
+        assert!(
+            !without.contains("chat_template_kwargs"),
+            "unset thinking must omit the field: {without}"
         );
+        let value: serde_json::Value = serde_json::to_value(base(Some(false))).unwrap();
         assert_eq!(value["stream"], serde_json::json!(true));
-        assert_eq!(value["model"], serde_json::json!("your-model-id"));
+        assert_eq!(value["model"], serde_json::json!("mock-model"));
         assert_eq!(value["max_tokens"], serde_json::json!(220));
         assert_eq!(value["temperature"], serde_json::json!(0.4));
         assert_eq!(value["messages"][0]["role"], serde_json::json!("system"));
         assert_eq!(value["messages"][1]["role"], serde_json::json!("user"));
-        // The exact bytes a thinking-off request must carry, from probe 2026-10-02.
-        let text = serde_json::to_string(&req).unwrap();
-        assert!(
-            text.contains(r#""chat_template_kwargs":{"enable_thinking":false}"#),
-            "{text}"
-        );
     }
 
     #[test]
@@ -150,7 +159,7 @@ mod tests {
             "id": "cmpl-a1b2c3",
             "object": "chat.completion.chunk",
             "created": 1759400000,
-            "model": "your-model-id",
+            "model": "mock-model",
             "system_fingerprint": null,
             "usage": null,
             "choices": [{

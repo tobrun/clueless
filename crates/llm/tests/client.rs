@@ -14,11 +14,23 @@ use tokio_util::sync::CancellationToken;
 const CONNECT: Duration = Duration::from_secs(2);
 
 fn client_for(base_url: &str) -> LlmClient {
-    LlmClient::new(base_url, "mock-model", CONNECT, Duration::from_secs(10))
+    LlmClient::new(
+        base_url,
+        "mock-model",
+        None,
+        CONNECT,
+        Duration::from_secs(10),
+    )
 }
 
 fn request() -> ChatRequest {
-    ChatRequest::new("mock-model", vec![Message::user("hi")], 220, 0.4)
+    ChatRequest::new(
+        "mock-model",
+        vec![Message::user("hi")],
+        220,
+        0.4,
+        Some(false),
+    )
 }
 
 /// Drain a suggestion stream into its content items and the error that ended it, if any.
@@ -55,6 +67,51 @@ async fn stream_yields_non_empty_content_deltas_and_ends_at_done() {
         "{}",
         bodies[0]
     );
+}
+
+#[tokio::test]
+async fn unset_enable_thinking_omits_chat_template_kwargs_from_the_body() {
+    let mock = Mock::start(Reply::contents(&["ok"])).await;
+    let client = client_for(&mock.base_url);
+    let request = ChatRequest::new("mock-model", vec![Message::user("hi")], 220, 0.4, None);
+    let _ = drain(Box::pin(client.stream(request, CancellationToken::new()))).await;
+    let bodies = mock.bodies();
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        !bodies[0].contains("chat_template_kwargs"),
+        "generic servers must not see the kwarg: {}",
+        bodies[0]
+    );
+}
+
+#[tokio::test]
+async fn an_api_key_becomes_a_bearer_header_on_both_endpoints() {
+    let mock = Mock::start(Reply::contents(&["ok"])).await;
+    let client = LlmClient::new(
+        &mock.base_url,
+        "mock-model",
+        Some("sk-test-key".to_string()),
+        CONNECT,
+        Duration::from_secs(10),
+    );
+    let _ = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
+    client.models().await.expect("models request");
+    assert_eq!(
+        mock.authorizations(),
+        vec![
+            Some("Bearer sk-test-key".to_string()),
+            Some("Bearer sk-test-key".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn no_api_key_sends_no_authorization_header() {
+    let mock = Mock::start(Reply::contents(&["ok"])).await;
+    let client = client_for(&mock.base_url);
+    let _ = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
+    client.models().await.expect("models request");
+    assert_eq!(mock.authorizations(), vec![None, None]);
 }
 
 #[tokio::test]
@@ -100,6 +157,7 @@ async fn silent_connection_past_the_stall_timeout_ends_as_stalled() {
     let client = LlmClient::new(
         &mock.base_url,
         "mock-model",
+        None,
         CONNECT,
         Duration::from_millis(200),
     );

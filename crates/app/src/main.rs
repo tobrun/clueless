@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clueless::cli::{self, Replay};
-use clueless::{lock, logging};
+use clueless::{envfile, lock, logging};
 use clueless_types::audio::SourceFactory;
 use clueless_types::config::Config;
 use clueless_types::events::{
@@ -42,7 +42,24 @@ fn main() -> ExitCode {
         .config
         .clone()
         .unwrap_or_else(|| cli::home().join(".config/clueless/config.toml"));
-    let config = match Config::load(&config_path) {
+    let env_vars = match envfile::load(parsed.env_file.as_deref()) {
+        Ok(vars) => vars,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    // Process environment first, then the .env file, then defaults inside
+    // the config builders.
+    let lookup = envfile::overlay(|name| std::env::var(name).ok(), &env_vars);
+    // The default config path being absent is normal (config.toml is
+    // optional); an explicit --config that does not exist is an error.
+    let config_file = match &parsed.config {
+        Some(path) => Some(path.as_path()),
+        None if config_path.is_file() => Some(config_path.as_path()),
+        None => None,
+    };
+    let config = match Config::load(config_file, &lookup) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("{error}");

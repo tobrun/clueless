@@ -1,3 +1,8 @@
 /target
 /config.toml
+.env
+.env.*
+!.env.example
+.claude/
+.dev/
 .DS_Store

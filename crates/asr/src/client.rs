@@ -60,24 +60,39 @@ pub struct AsrClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    language: Option<String>,
     timeout: Duration,
     backoff: Vec<Duration>,
 }
 
 impl AsrClient {
     /// `base_url` is like `http://localhost:8097` (a trailing slash is
-    /// ignored). Build it inside a tokio runtime.
+    /// ignored). With an `api_key` every request carries
+    /// `Authorization: Bearer <key>`; `language` is sent with each
+    /// transcription when set (the server detects it otherwise).
+    /// Build it inside a tokio runtime.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
+        api_key: Option<String>,
+        language: Option<String>,
         timeout: Duration,
         backoff: impl IntoIterator<Item = Duration>,
     ) -> Self {
+        let mut builder = reqwest::Client::builder();
+        if let Some(key) = api_key {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                .expect("api keys with visible ascii work here; invalid ones fail the request");
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
         let base_url = base_url.into();
         Self {
-            http: reqwest::Client::new(),
+            http: builder.build().expect("reqwest client builds"),
             base_url: base_url.trim_end_matches('/').to_owned(),
             model: model.into(),
+            language,
             timeout,
             backoff: backoff.into_iter().collect(),
         }
@@ -119,10 +134,13 @@ impl AsrClient {
             .file_name("seg.wav")
             .mime_str("audio/wav")
             .expect("audio/wav is a valid mime type");
-        let form = multipart::Form::new()
+        let mut form = multipart::Form::new()
             .part("file", file)
             .text("model", self.model.clone())
             .text("response_format", "json");
+        if let Some(language) = &self.language {
+            form = form.text("language", language.clone());
+        }
         let request = self
             .http
             .post(format!("{}/v1/audio/transcriptions", self.base_url))

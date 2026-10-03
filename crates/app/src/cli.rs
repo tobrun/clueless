@@ -19,6 +19,8 @@ pub struct Replay {
 pub struct Cli {
     /// `None` means `~/.config/clueless/config.toml` (D-config).
     pub config: Option<PathBuf>,
+    /// `None` means `./.env`, then `~/.config/clueless/.env`.
+    pub env_file: Option<PathBuf>,
     pub log_file: PathBuf,
     /// `None` means GUI mode.
     pub replay: Option<Replay>,
@@ -38,6 +40,8 @@ usage: clueless [OPTIONS]
 
 Options:
   --config PATH      config file (default ~/.config/clueless/config.toml)
+  --env-file PATH    .env file with LLM_* and ASR_* settings
+                     (default ./.env, then ~/.config/clueless/.env)
   --log-file PATH    log file (default ~/Library/Logs/clueless/clueless.log)
   --replay ME [THEM] replay WAV file(s) through the engine instead of the GUI
   --speed N          replay speed multiplier (default 1)
@@ -65,6 +69,7 @@ pub fn home() -> PathBuf {
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut args: VecDeque<String> = args.into_iter().collect();
     let mut config: Option<PathBuf> = None;
+    let mut env_file: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut replay_files: Option<Vec<PathBuf>> = None;
     let mut speed: Option<f64> = None;
@@ -75,6 +80,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--config" => {
                 config = Some(PathBuf::from(take_value(&mut args, &arg)?));
+            }
+            "--env-file" => {
+                env_file = Some(PathBuf::from(take_value(&mut args, &arg)?));
             }
             "--log-file" => {
                 log_file = Some(PathBuf::from(take_value(&mut args, &arg)?));
@@ -118,6 +126,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     });
     Ok(Parsed::Cli(Cli {
         config,
+        env_file,
         log_file: log_file.unwrap_or_else(default_log_file),
         replay,
     }))
@@ -142,8 +151,18 @@ mod tests {
             panic!("expected a parsed cli");
         };
         assert_eq!(cli.config, None);
+        assert_eq!(cli.env_file, None);
         assert_eq!(cli.replay, None);
         assert!(cli.log_file.ends_with("Library/Logs/clueless/clueless.log"));
+    }
+
+    #[test]
+    fn env_file_is_a_path_flag() {
+        let Parsed::Cli(cli) = parse_line("--env-file /tmp/clueless.env").unwrap() else {
+            panic!("expected a parsed cli");
+        };
+        assert_eq!(cli.env_file, Some(PathBuf::from("/tmp/clueless.env")));
+        assert!(parse_line("--env-file").is_err());
     }
 
     #[test]

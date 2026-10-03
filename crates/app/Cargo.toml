@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 clueless-types.workspace = true
+dotenvy.workspace = true
 engine.workspace = true
 capture.workspace = true
 overlay.workspace = true

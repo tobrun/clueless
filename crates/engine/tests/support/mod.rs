@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use asr::client::AsrClient;
 use clueless_types::UtteranceId;
 use clueless_types::audio::{SampleSource, SourceError, SourceFactory, SourceRead};
-use clueless_types::config::{Config, LlmConfig, ServerConfig, VadConfig};
+use clueless_types::config::{AsrConfig, Config, LlmConfig, VadConfig};
 use clueless_types::events::{
     EngineCommand, MeetingState, Speaker, StatusLevel, StatusSink, StatusSource, UiEvent, Utterance,
 };
@@ -533,6 +533,8 @@ pub fn start(specs: Vec<StreamSpec>, mock: &MockAsr, opts: Opts) -> Harness {
     let asr = Arc::new(AsrClient::new(
         mock.base_url.clone(),
         "mock-model",
+        None,
+        None,
         opts.timings.asr_timeout,
         opts.timings.asr_backoff,
     ));
@@ -1111,16 +1113,6 @@ impl MeetingHarness {
             });
         });
         let config = Config {
-            server: ServerConfig {
-                host: "127.0.0.1".into(),
-                llm_port: opts.llm_port.unwrap_or(llm.port),
-                asr_port: asr.port,
-                llm_model: "mock-model".into(),
-                asr_model: opts
-                    .asr_model
-                    .clone()
-                    .unwrap_or_else(|| "mock-model".into()),
-            },
             vad: VadConfig {
                 start_threshold: opts.machine.start_threshold,
                 end_threshold: opts.machine.end_threshold,
@@ -1128,7 +1120,19 @@ impl MeetingHarness {
                 max_segment_ms: opts.machine.max_segment_ms,
             },
             llm: LlmConfig {
+                base_url: format!("http://127.0.0.1:{}", opts.llm_port.unwrap_or(llm.port)),
+                model: "mock-model".into(),
                 profile_path: opts.profile_path.clone(),
+                // what the app sends when LLM_ENABLE_THINKING is unset
+                enable_thinking: Some(false),
+                ..Default::default()
+            },
+            asr: AsrConfig {
+                base_url: format!("http://127.0.0.1:{}", asr.port),
+                model: opts
+                    .asr_model
+                    .clone()
+                    .unwrap_or_else(|| "mock-model".into()),
                 ..Default::default()
             },
             ..Default::default()

@@ -29,6 +29,7 @@ pub async fn run(
     threshold: usize,
     retry: Duration,
     temperature: f64,
+    enable_thinking: Option<bool>,
     mut commits: watch::Receiver<u64>,
     ui: StatusSink,
     cancel: CancellationToken,
@@ -57,6 +58,7 @@ pub async fn run(
                 to_llm_messages(messages),
                 SUMMARY_MAX_TOKENS,
                 temperature,
+                enable_thinking,
             );
             let outcome = tokio::select! {
                 biased;

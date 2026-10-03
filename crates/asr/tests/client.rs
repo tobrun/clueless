@@ -13,7 +13,14 @@ fn ms(millis: u64) -> Duration {
 }
 
 fn client_at(base_url: &str) -> AsrClient {
-    AsrClient::new(base_url, "test-model", ms(2_000), [ms(20), ms(20)])
+    AsrClient::new(
+        base_url,
+        "test-model",
+        None,
+        None,
+        ms(2_000),
+        [ms(20), ms(20)],
+    )
 }
 
 fn silence(n: usize) -> Vec<f32> {
@@ -109,7 +116,14 @@ async fn a_client_error_fails_at_once_without_retrying() {
 async fn a_server_answer_slowed_past_the_attempt_timeout_is_a_timeout() {
     let mock = MockAsr::start().await;
     mock.enqueue(Reply::body(r#"{"text":"late"}"#).delayed(ms(600)));
-    let client = AsrClient::new(&mock.base_url, "test-model", ms(200), [ms(20), ms(20)]);
+    let client = AsrClient::new(
+        &mock.base_url,
+        "test-model",
+        None,
+        None,
+        ms(200),
+        [ms(20), ms(20)],
+    );
 
     let result = client.transcribe(&silence(1_600), 1).await;
 

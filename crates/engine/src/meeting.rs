@@ -163,30 +163,21 @@ impl Engine {
         self.emit(UiEvent::MeetingState(MeetingState::Starting));
         let timings = self.deps.timings;
         let asr = Arc::new(AsrClient::new(
-            format!(
-                "http://{}:{}",
-                self.config.server.host, self.config.server.asr_port
-            ),
-            &self.config.server.asr_model,
+            &self.config.asr.base_url,
+            &self.config.asr.model,
+            self.config.asr.api_key.clone(),
+            self.config.asr.language.clone(),
             timings.asr_timeout,
             timings.asr_backoff,
         ));
         let llm = Arc::new(LlmClient::new(
-            format!(
-                "http://{}:{}",
-                self.config.server.host, self.config.server.llm_port
-            ),
-            &self.config.server.llm_model,
+            &self.config.llm.base_url,
+            &self.config.llm.model,
+            self.config.llm.api_key.clone(),
             timings.llm_connect,
             timings.llm_stall,
         ));
-        for event in health::check(
-            &asr,
-            &self.config.server.asr_model,
-            &llm,
-            timings.health_timeout,
-        )
-        .await
+        for event in health::check(&asr, &self.config.asr.model, &llm, timings.health_timeout).await
         {
             self.emit(event);
         }
@@ -246,6 +237,7 @@ impl Engine {
             self.deps.compress_threshold_tokens,
             timings.compress_retry,
             self.config.llm.temperature as f64,
+            self.config.llm.enable_thinking,
             pipeline.commits(),
             self.deps.ui.clone(),
             compress_cancel.clone(),
@@ -320,6 +312,7 @@ impl Engine {
             suggest::to_llm_messages(messages),
             self.config.llm.max_tokens,
             self.config.llm.temperature as f64,
+            self.config.llm.enable_thinking,
         );
         let cancel = CancellationToken::new();
         let task = tokio::spawn(suggest::run(

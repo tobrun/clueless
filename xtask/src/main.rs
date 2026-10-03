@@ -9,7 +9,7 @@
 //! with the self-signed `clueless-dev` identity created once by
 //! `scripts/make-dev-cert.sh`, so macOS permission grants survive rebuilds
 //! (a stable signature is what keeps the grants attached to the app).
-//! `run` bundles, makes sure a root config exists and launches the bundle
+//! `run` bundles, makes sure a root `.env` exists and launches the bundle
 //! with `open`, so the app itself is responsible for its permission prompts.
 //!
 //! One environment variable exists for the integration tests, which must not
@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const DEFAULT_IDENTITY: &str = "clueless-dev";
-const CONFIG_EXAMPLE: &str = "config.example.toml";
-const CONFIG_FILE: &str = "config.toml";
+const ENV_EXAMPLE: &str = ".env.example";
+const ENV_FILE: &str = ".env";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -88,29 +88,35 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
     cmd_bundle(&[])?;
     let root = workspace_root()?;
-    let config = root.join(CONFIG_FILE);
-    if !config.exists() {
-        let example = root.join(CONFIG_EXAMPLE);
-        fs::copy(&example, &config).map_err(|error| {
+    let env_file = root.join(ENV_FILE);
+    if !env_file.exists() {
+        let example = root.join(ENV_EXAMPLE);
+        fs::copy(&example, &env_file).map_err(|error| {
             format!(
                 "could not copy {} to {}: {error}",
                 example.display(),
-                config.display()
+                env_file.display()
             )
         })?;
-        println!("copied {CONFIG_EXAMPLE} to {CONFIG_FILE}");
+        println!("copied {ENV_EXAMPLE} to {ENV_FILE}; edit it to point at your servers");
     }
-    let bundle = target_debug_dir()?.join("clueless.app");
-    let status = Command::new("open")
-        .arg("-W")
-        .arg(&bundle)
+    // An app launched with `open` inherits neither the shell's cwd nor its
+    // environment, so point it at this workspace's files explicitly.
+    let config = root.join("config.toml");
+    let mut open = Command::new("open");
+    open.arg("-W")
+        .arg(target_debug_dir()?.join("clueless.app"))
         .arg("--args")
-        .arg("--config")
-        .arg(&config)
+        .arg("--env-file")
+        .arg(&env_file);
+    if config.is_file() {
+        open.arg("--config").arg(&config);
+    }
+    let status = open
         .status()
         .map_err(|error| format!("could not run open: {error}"))?;
     if !status.success() {
-        return Err(format!("open -W {} exited with {status}", bundle.display()));
+        return Err(format!("open -W clueless.app exited with {status}"));
     }
     println!("log file: {}", log_file_path().display());
     Ok(())
@@ -305,10 +311,11 @@ fn target_debug_dir() -> Result<PathBuf, String> {
 
 /// Where the app writes its log file (the default the app itself uses).
 fn log_file_path() -> PathBuf {
-    let state_dir = env::var_os("XDG_STATE_HOME")
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| home_dir().join(".local").join("state"), PathBuf::from);
-    state_dir.join("clueless").join("clueless.log")
+    home_dir()
+        .join("Library")
+        .join("Logs")
+        .join("clueless")
+        .join("clueless.log")
 }
 
 fn home_dir() -> PathBuf {

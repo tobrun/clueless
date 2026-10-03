@@ -3,5 +3,6 @@
 //! directly; `main.rs` wires them into the two run modes.
 
 pub mod cli;
+pub mod envfile;
 pub mod lock;
 pub mod logging;

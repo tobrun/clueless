@@ -57,19 +57,29 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
+    /// With an `api_key` every request (both endpoints) carries
+    /// `Authorization: Bearer <key>`; the key never appears in `Debug`.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
+        api_key: Option<String>,
         connect_timeout: Duration,
         stall_timeout: Duration,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
+        let mut builder = reqwest::Client::builder().connect_timeout(connect_timeout);
+        if let Some(key) = api_key {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                .expect("api keys with visible ascii work here; invalid ones fail the request");
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+        let http = builder
             .build()
-            .expect("reqwest client builds without tls");
+            .expect("reqwest client builds with the rustls backend");
         Self {
             http,
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
             stall_timeout,
         }

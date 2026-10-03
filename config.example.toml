@@ -1,13 +1,10 @@
-# clueless config. Every key is optional; a missing key takes the default
-# shown here. An unknown key is an error. Copy this file to
+# clueless config for app behavior. This file is optional: a missing file
+# means all defaults. Every key is optional too; a missing key takes the
+# default shown here. An unknown key is an error. Copy this file to
 # ~/.config/clueless/config.toml (or pass --config) and edit.
-
-[server]
-host = "localhost"        # both servers live here
-llm_port = 8000               # OpenAI-compatible chat server
-asr_port = 8097               # OpenAI-compatible transcription server
-llm_model = "your-model-id"
-asr_model = "istupakov/parakeet-tdt-0.6b-v3-onnx" # always sent explicitly
+#
+# The LLM and ASR servers are NOT configured here; they come from the
+# environment, see .env.example.
 
 [audio]
 system_audio_backend = "sck"  # "sck" | "cpal_loopback" | "device:<name>"
@@ -20,11 +17,6 @@ start_threshold = 0.5         # speech probability to start an utterance
 end_threshold = 0.35          # below this counts as silence
 end_silence_frames = 19       # 19 frames of 32 ms = 608 ms of silence ends an utterance
 max_segment_ms = 15000        # forced cut length
-
-[llm]
-max_tokens = 220
-temperature = 0.4
-# profile_path = "~/.config/clueless/profile.txt" # text placed in the system message
 
 [overlay]
 hide_from_capture = true      # sets the panel's sharingType to none

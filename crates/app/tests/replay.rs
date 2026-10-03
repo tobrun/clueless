@@ -56,54 +56,105 @@ impl Drop for TempDir {
     }
 }
 
-/// A config pointing both servers at `127.0.0.1` ports, with one shared
+/// An env file pointing both servers at `127.0.0.1` ports, with one shared
 /// model id the mocks list.
-fn write_mock_config(dir: &TempDir, llm_port: u16, asr_port: u16) -> PathBuf {
-    let path = dir.join("config.toml");
+fn write_mock_env(dir: &TempDir, llm_port: u16, asr_port: u16) -> PathBuf {
+    let path = dir.join(".env");
     std::fs::write(
         &path,
         format!(
-            "[server]\nhost = \"127.0.0.1\"\nllm_port = {llm_port}\nasr_port = {asr_port}\n\
-             llm_model = \"test-model\"\nasr_model = \"test-model\"\n"
+            "LLM_BASE_URL=http://127.0.0.1:{llm_port}\nLLM_MODEL=test-model\n\
+             ASR_BASE_URL=http://127.0.0.1:{asr_port}\nASR_MODEL=test-model\n"
         ),
     )
-    .expect("config written");
+    .expect("env file written");
     path
 }
 
-/// A config with the production LAN defaults (the e2e suite).
-fn write_live_config(dir: &TempDir) -> PathBuf {
-    let path = dir.join("config.toml");
-    std::fs::write(
-        &path,
-        "[server]\nhost = \"localhost\"\nllm_port = 8000\nasr_port = 8097\n\
-         llm_model = \"your-model-id\"\n\
-         asr_model = \"istupakov/parakeet-tdt-0.6b-v3-onnx\"\n",
-    )
-    .expect("config written");
+/// An env file for the production servers, assembled from the test process's
+/// own `LLM_*`/`ASR_*` environment (only reached under `LIVE_SERVER=1`).
+fn write_live_env(dir: &TempDir) -> PathBuf {
+    let mut text = String::new();
+    for name in [
+        "LLM_BASE_URL",
+        "LLM_MODEL",
+        "LLM_API_KEY",
+        "LLM_PROFILE_PATH",
+        "LLM_ENABLE_THINKING",
+        "ASR_BASE_URL",
+        "ASR_MODEL",
+        "ASR_API_KEY",
+        "ASR_LANGUAGE",
+    ] {
+        if let Ok(value) = dotenvy::var(name) {
+            text.push_str(&format!("{name}={value}\n"));
+        }
+    }
+    for name in ["LLM_BASE_URL", "LLM_MODEL", "ASR_BASE_URL", "ASR_MODEL"] {
+        assert!(
+            text.contains(&format!("{name}=")),
+            "{name} must be set in the environment or the repo .env for live tests"
+        );
+    }
+    let path = dir.join(".env");
+    std::fs::write(&path, text).expect("env file written");
     path
 }
 
 /// Run the binary with a throwaway log file; never blocks forever. The
 /// child runs on a blocking thread so mock servers keep moving.
 async fn run(args: &[&Path], limit: std::time::Duration) -> std::process::Output {
+    run_from(workspace_root().as_path(), args, limit).await
+}
+
+/// The workspace root: the child resolves its relative model paths from it.
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("crates/app lives in the workspace")
+        .to_path_buf()
+}
+
+/// Same, from a specific working directory (the repo root keeps relative
+/// model paths resolvable for the child).
+async fn run_from(cwd: &Path, args: &[&Path], limit: std::time::Duration) -> std::process::Output {
+    let cwd = cwd.to_path_buf();
     let dir = std::env::temp_dir().join(format!(
         "clueless-app-log-{}-{}.log",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let out = run_with_log(args, &dir, limit).await;
+    let out = run_with_log(&cwd, args, &dir, limit).await;
     let _ = std::fs::remove_file(&dir);
     out
 }
 
 async fn run_with_log(
+    cwd: &Path,
     args: &[&Path],
     log: &Path,
     limit: std::time::Duration,
 ) -> std::process::Output {
     let mut command = std::process::Command::new(BIN);
-    command.arg("--log-file").arg(log).args(args);
+    command
+        // Mock tests run from the crate directory; relative paths inside the
+        // config (the bundled VAD model) resolve from the repo root.
+        .current_dir(cwd)
+        .arg("--log-file")
+        .arg(log)
+        // The repo's own .env (or a stray shell export) must not leak into
+        // tests that pass their own --env-file or expect env errors.
+        .env_remove("LLM_BASE_URL")
+        .env_remove("LLM_MODEL")
+        .env_remove("LLM_API_KEY")
+        .env_remove("LLM_PROFILE_PATH")
+        .env_remove("LLM_ENABLE_THINKING")
+        .env_remove("ASR_BASE_URL")
+        .env_remove("ASR_MODEL")
+        .env_remove("ASR_API_KEY")
+        .env_remove("ASR_LANGUAGE")
+        .args(args);
     let joined = tokio::task::spawn_blocking(move || command.output());
     tokio::time::timeout(limit, joined)
         .await
@@ -260,10 +311,10 @@ fn config_pointing_at_a_missing_file_exits_2_naming_the_path() {
 #[tokio::test]
 async fn replay_with_a_missing_wav_exits_2_naming_the_file() {
     let dir = TempDir::new("wav-missing");
-    let config = write_mock_config(&dir, 1, 1);
+    let config = write_mock_env(&dir, 1, 1);
     let out = run(
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &dir.join("missing.wav"),
@@ -305,10 +356,10 @@ fn the_lock_helper_rejects_a_second_holder_naming_the_path() {
 #[tokio::test]
 async fn replay_with_only_a_me_file_never_mentions_system_audio() {
     let dir = TempDir::new("me-only");
-    let config = write_mock_config(&dir, 1, closed_port().await);
+    let config = write_mock_env(&dir, 1, closed_port().await);
     let out = run(
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &fixture("conv_me.wav"),
@@ -331,10 +382,10 @@ async fn replay_of_the_conversation_prints_only_transcript_lines() {
     let dir = TempDir::new("conv");
     let asr = spawn_asr_mock("mock words").await;
     let llm = spawn_llm_mock(&["unused"]).await;
-    let config = write_mock_config(&dir, llm, asr);
+    let config = write_mock_env(&dir, llm, asr);
     let out = run(
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &fixture("conv_me.wav"),
@@ -349,7 +400,8 @@ async fn replay_of_the_conversation_prints_only_transcript_lines() {
     let lines = stdout_lines(&out);
     assert!(
         !lines.is_empty(),
-        "the conversation yields transcript lines"
+        "the conversation yields transcript lines; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     for line in &lines {
         assert!(is_transcript_line(line), "unexpected stdout line: {line:?}");
@@ -364,10 +416,10 @@ async fn ask_appends_the_mock_suggestion_after_its_header() {
     let dir = TempDir::new("ask");
     let asr = spawn_asr_mock("mock words").await;
     let llm = spawn_llm_mock(&["mock ", "answer"]).await;
-    let config = write_mock_config(&dir, llm, asr);
+    let config = write_mock_env(&dir, llm, asr);
     let out = run(
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &fixture("conv_me.wav"),
@@ -390,10 +442,10 @@ async fn ask_appends_the_mock_suggestion_after_its_header() {
 async fn replay_with_the_asr_server_down_exits_zero_with_an_offline_status() {
     let dir = TempDir::new("asr-down");
     let llm = spawn_llm_mock(&["unused"]).await;
-    let config = write_mock_config(&dir, llm, closed_port().await);
+    let config = write_mock_env(&dir, llm, closed_port().await);
     let out = run(
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &fixture("conv_me.wav"),
@@ -456,10 +508,10 @@ async fn live_replay_reproduces_every_expected_conversation_line() {
         return;
     }
     let dir = TempDir::new("e2e-conv");
-    let config = write_live_config(&dir);
+    let config = write_live_env(&dir);
     let out = run(
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &fixture("conv_me.wav"),
@@ -498,10 +550,10 @@ async fn live_monologue_yields_finals_without_repeated_joins() {
         return;
     }
     let dir = TempDir::new("e2e-mono");
-    let config = write_live_config(&dir);
+    let config = write_live_env(&dir);
     let out = run(
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &fixture("monologue_40s.wav"),
@@ -539,10 +591,10 @@ async fn live_echo_of_them_never_transcribes_as_me() {
         return;
     }
     let dir = TempDir::new("e2e-echo");
-    let config = write_live_config(&dir);
+    let config = write_live_env(&dir);
     let out = run(
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &fixture("echo_me.wav"),
@@ -570,11 +622,12 @@ async fn live_ask_on_french_answers_and_logs_the_first_delta() {
         return;
     }
     let dir = TempDir::new("e2e-fr");
-    let config = write_live_config(&dir);
+    let config = write_live_env(&dir);
     let log = dir.join("clueless.log");
     let out = run_with_log(
+        &workspace_root(),
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &fixture("fr_question.wav"),
@@ -611,11 +664,12 @@ async fn live_silence_yields_no_lines_and_no_asr_request() {
         return;
     }
     let dir = TempDir::new("e2e-silence");
-    let config = write_live_config(&dir);
+    let config = write_live_env(&dir);
     let log = dir.join("clueless.log");
     let out = run_with_log(
+        &workspace_root(),
         &[
-            std::path::Path::new("--config"),
+            std::path::Path::new("--env-file"),
             &config,
             std::path::Path::new("--replay"),
             &fixture("silence_5s.wav"),

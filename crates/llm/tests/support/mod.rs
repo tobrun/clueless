@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header;
+use axum::http::header::{self, HeaderMap};
 use axum::response::Response;
 use axum::routing::post;
 use serde_json::json;
@@ -75,6 +75,7 @@ impl Reply {
 pub struct Mock {
     pub base_url: String,
     bodies: Arc<std::sync::Mutex<Vec<String>>>,
+    auths: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     disconnected: Arc<AtomicBool>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -84,6 +85,7 @@ impl Mock {
         let state = MockState {
             reply,
             bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+            auths: Arc::new(std::sync::Mutex::new(Vec::new())),
             disconnected: Arc::new(AtomicBool::new(false)),
         };
         let app = axum::Router::new()
@@ -98,6 +100,7 @@ impl Mock {
         Self {
             base_url: format!("http://127.0.0.1:{port}"),
             bodies: state.bodies,
+            auths: state.auths,
             disconnected: state.disconnected,
             server,
         }
@@ -106,6 +109,12 @@ impl Mock {
     /// Bodies of chat requests the mock received, in arrival order.
     pub fn bodies(&self) -> Vec<String> {
         self.bodies.lock().expect("mock bodies lock").clone()
+    }
+
+    /// The `Authorization` header of every request the mock saw (chat and
+    /// models), in arrival order.
+    pub fn authorizations(&self) -> Vec<Option<String>> {
+        self.auths.lock().expect("mock auths lock").clone()
     }
 
     /// Whether the mock noticed the client close the response connection,
@@ -134,10 +143,20 @@ impl Drop for Mock {
 struct MockState {
     reply: Reply,
     bodies: Arc<std::sync::Mutex<Vec<String>>>,
+    auths: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     disconnected: Arc<AtomicBool>,
 }
 
-async fn handle(State(state): State<MockState>, body: String) -> Response {
+fn record_auth(auths: &std::sync::Mutex<Vec<Option<String>>>, headers: &HeaderMap) {
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    auths.lock().expect("mock auths lock").push(value);
+}
+
+async fn handle(State(state): State<MockState>, headers: HeaderMap, body: String) -> Response {
+    record_auth(&state.auths, &headers);
     state.bodies.lock().expect("mock bodies lock").push(body);
     match &state.reply {
         Reply::Status(code, text) => axum::http::Response::builder()
@@ -159,7 +178,8 @@ async fn handle(State(state): State<MockState>, body: String) -> Response {
     }
 }
 
-async fn handle_models() -> Response {
+async fn handle_models(State(state): State<MockState>, headers: HeaderMap) -> Response {
+    record_auth(&state.auths, &headers);
     axum::http::Response::builder()
         .status(200)
         .header(header::CONTENT_TYPE, "application/json")

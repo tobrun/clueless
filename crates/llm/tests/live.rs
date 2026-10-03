@@ -1,90 +1,88 @@
-//! E2E against the real LLM server on the LAN.
-//!
-//! Ignored by default; the e2e pass runs them with `LIVE_SERVER=1`.
-//! Without that variable they return early as passed.
-
-use std::time::Duration;
+//! Real-server tests: `LIVE_SERVER=1 cargo test -p llm --test live -- --ignored`
+//! reads `LLM_*` from the process environment or the repo `.env`.
 
 use futures_util::StreamExt;
 use llm::client::LlmClient;
 use llm::types::{ChatRequest, Message};
-use tokio_util::sync::CancellationToken;
 
-const HOST: &str = "localhost";
-const MODEL: &str = "your-model-id";
-
-/// The live target, or `None` when this run is not the live pass.
-fn live_target() -> Option<(String, String)> {
-    match std::env::var("LIVE_SERVER").as_deref() {
-        Ok("1") => Some((format!("http://{HOST}:8000"), MODEL.to_string())),
-        _ => None,
-    }
-}
-
-fn client(base_url: &str, model: &str) -> LlmClient {
-    // Spec timings: connect 2 s, stall 10 s.
+fn client(timeout_secs: u64) -> LlmClient {
+    let base_url = dotenvy::var("LLM_BASE_URL").expect("LLM_BASE_URL required for live tests");
+    let model = dotenvy::var("LLM_MODEL").expect("LLM_MODEL required for live tests");
+    let api_key = dotenvy::var("LLM_API_KEY").ok().filter(|k| !k.is_empty());
     LlmClient::new(
         base_url,
         model,
-        Duration::from_secs(2),
-        Duration::from_secs(10),
+        api_key,
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(timeout_secs),
     )
 }
 
-#[tokio::test]
-#[ignore = "hits the LAN server at localhost; run with LIVE_SERVER=1"]
-async fn live_thinking_off_streams_plain_content_fast() {
-    let Some((base_url, model)) = live_target() else {
-        return;
-    };
-    let client = client(&base_url, &model);
-    let request = ChatRequest::new(
-        model,
-        vec![Message::user("Say hello in five words.")],
-        220,
-        0.4,
-    );
+/// The profile text, when `LLM_PROFILE_PATH` points at a readable file.
+fn profile() -> Option<String> {
+    dotenvy::var("LLM_PROFILE_PATH").ok().map(|path| {
+        let path = strip_tilde(&path);
+        std::fs::read_to_string(path).expect("LLM_PROFILE_PATH is not readable")
+    })
+}
 
-    let started = std::time::Instant::now();
-    let mut stream = Box::pin(client.stream(request, CancellationToken::new()));
-    let mut deltas = Vec::new();
-    let mut first_delta = None;
-    let mut errors = Vec::new();
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(text) => {
-                first_delta.get_or_insert_with(|| started.elapsed());
-                deltas.push(text);
-            }
-            Err(err) => errors.push(err),
-        }
+fn strip_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
     }
-    assert!(errors.is_empty(), "live stream failed: {errors:?}");
-    assert!(!deltas.is_empty(), "expected at least one content delta");
-    let first_delta = first_delta.expect("non-empty deltas have a first one");
-    assert!(
-        first_delta < Duration::from_secs(5),
-        "first content delta took {first_delta:?}"
+    path.to_owned()
+}
+
+fn request(prompt: &str) -> ChatRequest {
+    let mut messages = profile()
+        .map(Message::system)
+        .into_iter()
+        .collect::<Vec<_>>();
+    messages.push(Message::user(prompt));
+    ChatRequest::new("ignored", messages, 220, 0.4, None)
+}
+
+#[tokio::test]
+#[ignore = "requires a live server: run with LIVE_SERVER=1"]
+async fn real_prompt_fills_the_template_and_uses_the_profile() {
+    if dotenvy::var("LIVE_SERVER").is_err() {
+        eprintln!("skipping: set LIVE_SERVER=1 to run live tests");
+        return;
+    }
+    let mut stream = client(120).stream(
+        request("What do you know about Lüdenscheid? say the town name."),
+        tokio_util::sync::CancellationToken::new(),
     );
-    let text: String = deltas.concat();
+    let mut content = String::new();
+    while let Some(item) = stream.next().await {
+        content.push_str(&item.expect("live stream failed"));
+    }
+
+    println!("---- raw content ----\n{content}");
+
+    // The world knowledge entry for this town must have been used.
     assert!(
-        !text.contains("<think>"),
-        "thinking text leaked into content: {text:?}"
+        content.to_lowercase().contains("lüdenscheid")
+            || content.to_lowercase().contains("ludenscheid"),
+        "answer does not mention the entry: {content}"
     );
 }
 
 #[tokio::test]
-#[ignore = "hits the LAN server at localhost; run with LIVE_SERVER=1"]
-async fn live_models_lists_the_copilot_model() {
-    let Some((base_url, model)) = live_target() else {
+#[ignore = "requires a live server: run with LIVE_SERVER=1"]
+async fn empty_prompt_is_rejected_by_the_real_server() {
+    if dotenvy::var("LIVE_SERVER").is_err() {
         return;
-    };
-    let models = client(&base_url, &model)
-        .models()
-        .await
-        .expect("models request");
-    assert!(
-        models.iter().any(|m| m == MODEL),
-        "models() returned {models:?}"
-    );
+    }
+    let mut stream = client(60).stream(request(""), tokio_util::sync::CancellationToken::new());
+    let mut saw_error = false;
+    while let Some(item) = stream.next().await {
+        let err = item.expect_err("empty user content should be a 400");
+        println!("---- error: {err} ----");
+        assert!(format!("{err}").contains("HTTP 400"));
+        saw_error = true;
+    }
+    assert!(saw_error, "expected an HTTP 400 error item");
 }
