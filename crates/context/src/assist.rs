@@ -75,6 +75,14 @@ pub fn enough_text(text: &str) -> bool {
     text.contains(['?', '？']) || text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_CHARS
 }
 
+/// Fire when `ready` is absent or reached; otherwise wait until it.
+fn fire_or_wait(now: Instant, ready: Option<Instant>) -> Decision {
+    match ready {
+        Some(at) if now < at => Decision::WaitUntil(at),
+        _ => Decision::Fire,
+    }
+}
+
 /// The trigger state of one engine.
 #[derive(Debug)]
 pub struct AutoPolicy {
@@ -121,18 +129,22 @@ impl AutoPolicy {
             return;
         }
         if let Some(text) = text {
-            if !self.collected.is_empty() {
-                self.collected.push(' ');
-            }
-            self.collected.push_str(text);
-            if !self.waiting && enough_text(&self.collected) {
-                self.waiting = true;
-                self.hard_deadline =
-                    Some(now + self.timings.turn_settle + self.timings.turn_max_wait);
-            }
+            self.collect_text(text, now);
         }
         if self.waiting {
             self.settle_deadline = Some(now + self.timings.turn_settle);
+        }
+    }
+
+    /// Append committed text; start waiting once there is enough of it.
+    fn collect_text(&mut self, text: &str, now: Instant) {
+        if !self.collected.is_empty() {
+            self.collected.push(' ');
+        }
+        self.collected.push_str(text);
+        if !self.waiting && enough_text(&self.collected) {
+            self.waiting = true;
+            self.hard_deadline = Some(now + self.timings.turn_settle + self.timings.turn_max_wait);
         }
     }
 
@@ -167,16 +179,26 @@ impl AutoPolicy {
         if !self.waiting || self.running {
             return Decision::Idle;
         }
-        let gate = self
-            .last_auto_start
-            .map(|start| start + self.timings.min_gap * trigger.gap_factor);
-        let fire_or_wait = |ready: Option<Instant>| match ready {
-            Some(at) if now < at => Decision::WaitUntil(at),
-            _ => Decision::Fire,
-        };
+        let gate = self.gate_time(&trigger);
         if !trigger.wait_for_turn_end {
-            return fire_or_wait(gate);
+            return fire_or_wait(now, gate);
         }
+        self.turn_end_decision(now, gate, trigger_speaker_busy)
+    }
+
+    /// The earliest time the gap since the last automatic start allows.
+    fn gate_time(&self, trigger: &Trigger) -> Option<Instant> {
+        self.last_auto_start
+            .map(|start| start + self.timings.min_gap * trigger.gap_factor)
+    }
+
+    /// The decision for a trigger that waits for the end of the turn.
+    fn turn_end_decision(
+        &self,
+        now: Instant,
+        gate: Option<Instant>,
+        trigger_speaker_busy: bool,
+    ) -> Decision {
         let hard = self.hard_deadline.unwrap_or(now);
         if trigger_speaker_busy && now < hard {
             return Decision::WaitUntil((now + self.timings.turn_settle).min(hard));
@@ -186,7 +208,7 @@ impl AutoPolicy {
         } else {
             self.settle_deadline
         };
-        fire_or_wait(settle.into_iter().chain(gate).max())
+        fire_or_wait(now, settle.into_iter().chain(gate).max())
     }
 
     /// True when nothing runs and nothing waits.

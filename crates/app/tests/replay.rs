@@ -350,6 +350,22 @@ fn an_unknown_flag_exits_2_and_prints_usage() {
     assert!(stderr.contains("usage:"), "stderr: {stderr}");
 }
 
+/// Another test thread may be between fork and exec of a child process:
+/// the child still shares the open file description (and so the flock)
+/// until it execs, so the release can lag by a few milliseconds.
+fn acquire_within_two_seconds(path: &std::path::Path) -> clueless::lock::Lock {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match clueless::lock::acquire(path) {
+            Ok(lock) => break lock,
+            Err(error) if std::time::Instant::now() >= deadline => {
+                panic!("the lock is free again after release: {error}")
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+}
+
 #[test]
 fn the_lock_helper_rejects_a_second_holder_naming_the_path() {
     let dir = TempDir::new("lock");
@@ -362,19 +378,7 @@ fn the_lock_helper_rejects_a_second_holder_naming_the_path() {
     };
     assert!(error.contains(&path.display().to_string()), "{error}");
     drop(first);
-    // Another test thread may be between fork and exec of a child process:
-    // the child still shares the open file description (and so the flock)
-    // until it execs, so the release can lag by a few milliseconds.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let again = loop {
-        match clueless::lock::acquire(&path) {
-            Ok(lock) => break lock,
-            Err(error) if std::time::Instant::now() >= deadline => {
-                panic!("the lock is free again after release: {error}")
-            }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    };
+    let again = acquire_within_two_seconds(&path);
     drop(again);
 }
 

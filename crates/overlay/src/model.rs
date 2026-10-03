@@ -120,6 +120,55 @@ impl Default for UiModel {
 }
 
 impl UiModel {
+    fn apply_suggestion_delta(&mut self, id: u64, text: String) -> Changes {
+        if self.suggestion_id != Some(id) {
+            return Changes::NONE;
+        }
+        match self.feed.iter_mut().find(|(entry, _)| *entry == id) {
+            Some((_, entry)) => entry.push_str(&text),
+            None => {
+                self.feed.push((id, text));
+                if self.feed.len() > FEED_KEEP {
+                    let excess = self.feed.len() - FEED_KEEP;
+                    self.feed.drain(..excess);
+                }
+            }
+        }
+        Changes {
+            suggestion: true,
+            ..Changes::NONE
+        }
+    }
+
+    fn apply_suggestion_end(&mut self, id: u64, end: clueless_types::SuggestionEnd) -> Changes {
+        if self.suggestion_id != Some(id) {
+            return Changes::NONE;
+        }
+        self.suggestion_id = None;
+        let mut suggestion = false;
+        match end {
+            clueless_types::SuggestionEnd::Done => {}
+            clueless_types::SuggestionEnd::Cancelled => {
+                let before = self.feed.len();
+                self.feed.retain(|(entry, _)| *entry != id);
+                suggestion = self.feed.len() != before;
+            }
+            clueless_types::SuggestionEnd::Interrupted => {
+                if let Some((_, entry)) = self.feed.iter_mut().find(|(e, _)| *e == id) {
+                    entry.push_str("\n[interrupted]");
+                    suggestion = true;
+                }
+            }
+            // The reason goes to the status line, not into the feed.
+            clueless_types::SuggestionEnd::Failed(_) => {}
+        }
+        Changes {
+            status: true,
+            suggestion,
+            ..Changes::NONE
+        }
+    }
+
     /// Apply one engine event; report which UI parts changed. Events that
     /// contradict the current state (old suggestion ids, dropped ids that
     /// were never shown) are ignored, never a panic.
@@ -174,53 +223,8 @@ impl UiModel {
                     ..Changes::NONE
                 }
             }
-            UiEvent::SuggestionDelta { id, text } => {
-                if self.suggestion_id != Some(id) {
-                    return Changes::NONE;
-                }
-                match self.feed.iter_mut().find(|(entry, _)| *entry == id) {
-                    Some((_, entry)) => entry.push_str(&text),
-                    None => {
-                        self.feed.push((id, text));
-                        if self.feed.len() > FEED_KEEP {
-                            let excess = self.feed.len() - FEED_KEEP;
-                            self.feed.drain(..excess);
-                        }
-                    }
-                }
-                Changes {
-                    suggestion: true,
-                    ..Changes::NONE
-                }
-            }
-            UiEvent::SuggestionEnd { id, end } => {
-                if self.suggestion_id != Some(id) {
-                    return Changes::NONE;
-                }
-                self.suggestion_id = None;
-                let mut suggestion = false;
-                match end {
-                    clueless_types::SuggestionEnd::Done => {}
-                    clueless_types::SuggestionEnd::Cancelled => {
-                        let before = self.feed.len();
-                        self.feed.retain(|(entry, _)| *entry != id);
-                        suggestion = self.feed.len() != before;
-                    }
-                    clueless_types::SuggestionEnd::Interrupted => {
-                        if let Some((_, entry)) = self.feed.iter_mut().find(|(e, _)| *e == id) {
-                            entry.push_str("\n[interrupted]");
-                            suggestion = true;
-                        }
-                    }
-                    // The reason goes to the status line, not into the feed.
-                    clueless_types::SuggestionEnd::Failed(_) => {}
-                }
-                Changes {
-                    status: true,
-                    suggestion,
-                    ..Changes::NONE
-                }
-            }
+            UiEvent::SuggestionDelta { id, text } => self.apply_suggestion_delta(id, text),
+            UiEvent::SuggestionEnd { id, end } => self.apply_suggestion_end(id, end),
             UiEvent::ClearSuggestion => {
                 let was_active = self.suggestion_id.take().is_some();
                 self.feed.clear();

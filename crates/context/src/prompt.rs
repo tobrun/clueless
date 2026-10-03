@@ -178,6 +178,8 @@ fn instruction(
     }
 }
 
+const QUOTE_MAX_CHARS: usize = 600;
+
 /// The Them text since the last trigger (finals, then in-progress), joined
 /// and cut to its last 600 characters; `None` when Them said nothing.
 fn them_quote(
@@ -185,27 +187,35 @@ fn them_quote(
     in_progress: &[InProgressText],
     last_trigger_line_id: u64,
 ) -> Option<String> {
-    let mut them_texts: Vec<&str> = Vec::new();
-    for utterance in store.utterances_after(last_trigger_line_id) {
-        if utterance.id.speaker == Speaker::Them && !utterance.text.is_empty() {
-            them_texts.push(&utterance.text);
-        }
-    }
-    for entry in in_progress {
-        if entry.speaker == Speaker::Them && !entry.text.is_empty() {
-            them_texts.push(&entry.text);
-        }
-    }
+    let them_texts = collect_them_texts(store, in_progress, last_trigger_line_id);
     if them_texts.is_empty() {
         return None;
     }
-    let joined = them_texts.join(" ");
-    let char_count = joined.chars().count();
-    Some(if char_count > 600 {
-        joined.chars().skip(char_count - 600).collect()
-    } else {
-        joined
-    })
+    Some(last_chars(&them_texts.join(" "), QUOTE_MAX_CHARS))
+}
+
+/// The non-empty Them texts since the last trigger: finals, then in-progress.
+fn collect_them_texts<'a>(
+    store: &'a TranscriptStore,
+    in_progress: &'a [InProgressText],
+    last_trigger_line_id: u64,
+) -> Vec<&'a str> {
+    let finals = store
+        .utterances_after(last_trigger_line_id)
+        .into_iter()
+        .filter(|u| u.id.speaker == Speaker::Them)
+        .map(|u| u.text.as_str());
+    let partials = in_progress
+        .iter()
+        .filter(|e| e.speaker == Speaker::Them)
+        .map(|e| e.text.as_str());
+    finals.chain(partials).filter(|t| !t.is_empty()).collect()
+}
+
+/// The last `max` characters of `text`, or all of it when it is shorter.
+fn last_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    text.chars().skip(count.saturating_sub(max)).collect()
 }
 
 /// The task sentence: the Them text since the last trigger, quoted, when
@@ -226,6 +236,13 @@ fn task_sentence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_chars_keeps_the_tail() {
+        assert_eq!(last_chars("abcdef", 3), "def");
+        assert_eq!(last_chars("abc", 3), "abc");
+        assert_eq!(last_chars("ab", 3), "ab");
+    }
     use clueless_types::Utterance;
     use clueless_types::UtteranceId;
 
