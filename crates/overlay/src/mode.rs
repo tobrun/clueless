@@ -3,6 +3,8 @@
 //! they share. No AppKit types here - this is the unit-testable seam the
 //! window layer drives.
 
+use clueless_types::profile::AssistProfile;
+
 use crate::model::clamp_origin;
 
 /// The two UI modes. Exactly one window is on screen at a time.
@@ -121,6 +123,16 @@ pub fn menu_titles(running: bool, p: Presentation) -> (&'static str, &'static st
         visibility_title(p),
         mode_switch_title(p.mode),
     )
+}
+
+/// The three profile menu titles in `AssistProfile::ALL` order: the active
+/// profile is prefixed with a check mark and a space, the others with two
+/// spaces so the names stay aligned.
+pub fn profile_titles(active: AssistProfile) -> [String; 3] {
+    AssistProfile::ALL.map(|profile| {
+        let mark = if profile == active { "\u{2713} " } else { "  " };
+        format!("{mark}{}", profile.name())
+    })
 }
 
 /// The meeting toggle item's title for the current meeting state.
@@ -291,5 +303,17 @@ mod tests {
         let moved: Frame = (120.0, 80.0, 640.0, 400.0);
         assert_eq!(mirrored_move_target(UiMode::Hidden, moved), Some(moved));
         assert_eq!(mirrored_move_target(UiMode::Standard, moved), None);
+    }
+
+    #[test]
+    fn profile_titles_mark_only_the_active_profile() {
+        assert_eq!(
+            profile_titles(AssistProfile::Interview),
+            ["  Manual", "\u{2713} Interview", "  Brainstorm"]
+        );
+        assert_eq!(
+            profile_titles(AssistProfile::Manual),
+            ["\u{2713} Manual", "  Interview", "  Brainstorm"]
+        );
     }
 }

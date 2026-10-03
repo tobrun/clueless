@@ -11,6 +11,7 @@ use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
 
 use block2::RcBlock;
+use clueless_types::profile::AssistProfile;
 use clueless_types::{
     CommandSink, Config, EngineCommand, MeetingState, StatusLevel, StatusSource, UiEvent,
 };
@@ -26,7 +27,7 @@ use crate::hotkeys::{self, HotkeyAction, ParsedHotkey, register_always_on, sync_
 use crate::mode::{self, Presentation, UiMode};
 use crate::model::{Changes, UiModel};
 use crate::panel::{self, OverlayPanel};
-use crate::status_item::StatusItemController;
+use crate::status_item::{MenuCallbacks, StatusItemController};
 use crate::views::{self, OverlayViews, ViewStyle};
 use crate::window::StandardWindow;
 
@@ -101,7 +102,9 @@ fn actions() -> &'static Mutex<HashMap<u32, HotkeyAction>> {
 /// [`mode::menu_titles`] (spec D-mode-menu).
 fn refresh_menu(ui: &Ui, mtm: MainThreadMarker) {
     let running = ui.model.meeting() == MeetingState::Running;
-    ui.status_item.rebuild_menu(running, ui.presentation, mtm);
+    let profile = ui.model.profile().unwrap_or_default();
+    ui.status_item
+        .rebuild_menu(running, ui.presentation, profile, mtm);
 }
 
 /// Bring this app to the front for the standard window. Hotkey presses
@@ -199,7 +202,10 @@ fn handle_action(action: HotkeyAction) {
 /// [`handle_action`] sends them out through the sink first.
 fn apply_local_action(ui: &mut Ui, action: HotkeyAction, mtm: MainThreadMarker) {
     match action {
-        HotkeyAction::Suggest | HotkeyAction::ClearSuggestion | HotkeyAction::ToggleMeeting => {
+        HotkeyAction::Suggest
+        | HotkeyAction::ClearSuggestion
+        | HotkeyAction::ToggleMeeting
+        | HotkeyAction::CycleProfile => {
             unreachable!("engine commands exit through the sink above")
         }
         HotkeyAction::ToggleOverlay => {
@@ -297,6 +303,8 @@ fn update_meeting_indicator(ui: &Ui, changes: &Changes, mtm: MainThreadMarker) {
     if changes.meeting {
         ui.status_item
             .set_meeting_running(ui.model.meeting() == MeetingState::Running, mtm);
+        refresh_menu(ui, mtm);
+    } else if changes.profile {
         refresh_menu(ui, mtm);
     }
 }
@@ -410,18 +418,23 @@ fn on_main_window_close() {
     });
 }
 
-/// Build the menu-bar item with its four callbacks. The meeting toggle goes
+/// Build the menu-bar item with its five callbacks. The meeting toggle goes
 /// straight to the sink; the other three run on the main thread, where the
 /// [`Ui`] lives.
 fn install_status_item(mtm: MainThreadMarker, commands: CommandSink) -> StatusItemController {
+    let toggle_commands = commands.clone();
     StatusItemController::new(
         mtm,
         false,
         Presentation::launch(),
-        move || commands(EngineCommand::ToggleMeeting),
-        post_toggle_overlay,
-        post_toggle_mode,
-        quit_from_menu,
+        AssistProfile::default(),
+        MenuCallbacks {
+            toggle_meeting: Box::new(move || toggle_commands(EngineCommand::ToggleMeeting)),
+            toggle_overlay: Box::new(post_toggle_overlay),
+            toggle_mode: Box::new(post_toggle_mode),
+            set_profile: Box::new(move |profile| commands(EngineCommand::SetProfile(profile))),
+            quit: Box::new(quit_from_menu),
+        },
     )
 }
 
@@ -583,7 +596,7 @@ mod tests {
     #[test]
     fn parse_hotkeys_returns_the_parsed_list_or_none_for_a_bad_config() {
         let parsed = parse_hotkeys(&Config::default()).expect("default hotkeys must parse");
-        assert_eq!(parsed.len(), 10, "every hotkeys table entry is parsed");
+        assert_eq!(parsed.len(), 11, "every hotkeys table entry is parsed");
 
         let mut broken = Config::default();
         broken.hotkeys.toggle_overlay = "cmd+Nope".into();

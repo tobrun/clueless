@@ -1,6 +1,6 @@
 //! The menu-bar item: a circle that fills while a meeting runs, a menu with
 //! Start/Stop Meeting, Show/Hide (window kind follows the active mode), the
-//! mode switch and Quit, and the quit path that waits for the engine's
+//! mode switch, the three profiles and Quit, and the quit path that waits for the engine's
 //! `MeetingState(Idle)` (with a 6 s deadline) so capture streams close
 //! before exit (the rationale is in `docs/decisions.md`).
 
@@ -9,16 +9,21 @@ use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_se
 use objc2_app_kit::{NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 
+use clueless_types::profile::AssistProfile;
+
 use crate::mode::{self, Presentation};
 
 /// A menu callback kept in the handler's ivars.
-type Action = Box<dyn Fn()>;
+pub type Action = Box<dyn Fn()>;
+/// The profile menu callback: receives the picked profile.
+pub type ProfileAction = Box<dyn Fn(AssistProfile)>;
 
 #[derive(Default)]
 pub(crate) struct HandlerIvars {
     on_toggle_meeting: Option<Action>,
     on_toggle_overlay: Option<Action>,
     on_toggle_mode: Option<Action>,
+    on_set_profile: Option<ProfileAction>,
     on_quit: Option<Action>,
 }
 
@@ -59,6 +64,21 @@ define_class!(
             }
         }
 
+        #[unsafe(method(setProfileManual:))]
+        fn set_profile_manual(&self, _sender: Option<&objc2_app_kit::NSMenuItem>) {
+            self.pick_profile(AssistProfile::Manual);
+        }
+
+        #[unsafe(method(setProfileInterview:))]
+        fn set_profile_interview(&self, _sender: Option<&objc2_app_kit::NSMenuItem>) {
+            self.pick_profile(AssistProfile::Interview);
+        }
+
+        #[unsafe(method(setProfileBrainstorm:))]
+        fn set_profile_brainstorm(&self, _sender: Option<&objc2_app_kit::NSMenuItem>) {
+            self.pick_profile(AssistProfile::Brainstorm);
+        }
+
         #[unsafe(method(quitApp:))]
         fn quit_app(&self, _sender: Option<&objc2_app_kit::NSMenuItem>) {
             if let Some(action) = &self.ivars().on_quit {
@@ -69,22 +89,32 @@ define_class!(
 );
 
 impl MenuHandler {
-    fn new(
-        mtm: MainThreadMarker,
-        on_toggle_meeting: impl Fn() + 'static,
-        on_toggle_overlay: impl Fn() + 'static,
-        on_toggle_mode: impl Fn() + 'static,
-        on_quit: impl Fn() + 'static,
-    ) -> Retained<Self> {
+    fn pick_profile(&self, profile: AssistProfile) {
+        if let Some(action) = &self.ivars().on_set_profile {
+            action(profile);
+        }
+    }
+
+    fn new(mtm: MainThreadMarker, callbacks: MenuCallbacks) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(HandlerIvars {
-            on_toggle_meeting: Some(Box::new(on_toggle_meeting)),
-            on_toggle_overlay: Some(Box::new(on_toggle_overlay)),
-            on_toggle_mode: Some(Box::new(on_toggle_mode)),
-            on_quit: Some(Box::new(on_quit)),
+            on_toggle_meeting: Some(callbacks.toggle_meeting),
+            on_toggle_overlay: Some(callbacks.toggle_overlay),
+            on_toggle_mode: Some(callbacks.toggle_mode),
+            on_set_profile: Some(callbacks.set_profile),
+            on_quit: Some(callbacks.quit),
         });
         // SAFETY: NSObject's init signature.
         unsafe { msg_send![super(this), init] }
     }
+}
+
+/// The five menu callbacks the status item wires to its handler.
+pub struct MenuCallbacks {
+    pub toggle_meeting: Action,
+    pub toggle_overlay: Action,
+    pub toggle_mode: Action,
+    pub set_profile: ProfileAction,
+    pub quit: Action,
 }
 
 const MEETING_RUNNING_TITLE: &str = "●";
@@ -98,27 +128,19 @@ pub struct StatusItemController {
 }
 
 impl StatusItemController {
-    /// Create the item and wire the four callbacks.
+    /// Create the item and wire the five callbacks.
     pub fn new(
         mtm: MainThreadMarker,
         meeting_running: bool,
         presentation: Presentation,
-        on_toggle_meeting: impl Fn() + 'static,
-        on_toggle_overlay: impl Fn() + 'static,
-        on_toggle_mode: impl Fn() + 'static,
-        on_quit: impl Fn() + 'static,
+        profile: AssistProfile,
+        callbacks: MenuCallbacks,
     ) -> Self {
         let bar = NSStatusBar::systemStatusBar();
         let item = bar.statusItemWithLength(NSVariableStatusItemLength);
-        let handler = MenuHandler::new(
-            mtm,
-            on_toggle_meeting,
-            on_toggle_overlay,
-            on_toggle_mode,
-            on_quit,
-        );
+        let handler = MenuHandler::new(mtm, callbacks);
         let controller = Self { item, handler };
-        controller.rebuild_menu(meeting_running, presentation, mtm);
+        controller.rebuild_menu(meeting_running, presentation, profile, mtm);
         controller.set_meeting_running(meeting_running, mtm);
         controller
     }
@@ -146,7 +168,13 @@ impl StatusItemController {
     /// Rebuild the menu after a meeting-state or presentation change so the
     /// item titles stay truthful (spec D-mode-menu: titles come from
     /// [`mode::menu_titles`]).
-    pub fn rebuild_menu(&self, running: bool, p: Presentation, mtm: MainThreadMarker) {
+    pub fn rebuild_menu(
+        &self,
+        running: bool,
+        p: Presentation,
+        profile: AssistProfile,
+        mtm: MainThreadMarker,
+    ) {
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
         let handler = &*self.handler;
@@ -174,6 +202,23 @@ impl StatusItemController {
             )
         };
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let selectors = [
+            sel!(setProfileManual:),
+            sel!(setProfileInterview:),
+            sel!(setProfileBrainstorm:),
+        ];
+        let profile_items: Vec<_> = mode::profile_titles(profile)
+            .iter()
+            .zip(selectors)
+            .map(|(title, selector)| unsafe {
+                menu.addItemWithTitle_action_keyEquivalent(
+                    &NSString::from_str(title),
+                    Some(selector),
+                    &NSString::from_str(""),
+                )
+            })
+            .collect();
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
         let quit_item = unsafe {
             menu.addItemWithTitle_action_keyEquivalent(
                 &NSString::from_str("Quit"),
@@ -187,6 +232,9 @@ impl StatusItemController {
             meeting_item.setTarget(Some(handler));
             overlay_item.setTarget(Some(handler));
             mode_item.setTarget(Some(handler));
+            for item in &profile_items {
+                item.setTarget(Some(handler));
+            }
             quit_item.setTarget(Some(handler));
         }
         self.item.setMenu(Some(&menu));

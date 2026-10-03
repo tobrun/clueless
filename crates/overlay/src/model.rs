@@ -2,6 +2,7 @@
 //! panel placement math. No AppKit types here - this is the unit-testable
 //! seam between the engine event stream and the views rendered on screen.
 
+use clueless_types::profile::AssistProfile;
 use clueless_types::{
     MeetingState, Speaker, StatusLevel, StatusSource, UiEvent, Utterance, UtteranceId,
 };
@@ -38,6 +39,7 @@ pub struct Changes {
     pub meeting: bool,
     pub terminate: bool,
     pub hotkeys: bool,
+    pub profile: bool,
 }
 
 impl Changes {
@@ -48,6 +50,7 @@ impl Changes {
         meeting: false,
         terminate: false,
         hotkeys: false,
+        profile: false,
     };
 
     pub fn merge(&mut self, other: Changes) {
@@ -57,6 +60,7 @@ impl Changes {
         self.meeting |= other.meeting;
         self.terminate |= other.terminate;
         self.hotkeys |= other.hotkeys;
+        self.profile |= other.profile;
     }
 
     /// Whether any rendered text part changed: only these three force a
@@ -77,11 +81,15 @@ pub struct TickerLine {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiModel {
     meeting: MeetingState,
-    suggestion_text: String,
+    /// The feed: one `(suggestion id, text)` entry per answer that showed
+    /// text, oldest first, at most [`FEED_KEEP`] entries.
+    feed: Vec<(u64, String)>,
     /// Id of the latest `SuggestionStart`; deltas and ends for any other id
     /// are ignored (spec invariant C-suggestion-id). `None` after an end or
     /// `ClearSuggestion`, so late deltas of a finished suggestion drop.
     suggestion_id: Option<u64>,
+    /// The active assist profile; `None` until the engine reports one.
+    profile: Option<AssistProfile>,
     ticker: Vec<TickerLine>,
     /// Latest status per source, in first-seen order. `Error` and `Warn`
     /// stay until a newer status for the same source replaces them.
@@ -92,6 +100,8 @@ pub struct UiModel {
 /// Ticker lines kept (the view shows the last three; keep a little more so
 /// the cap itself is invisible).
 const TICKER_KEEP: usize = 12;
+/// Feed entries kept; older answers drop so the whole-text repaint stays cheap.
+pub const FEED_KEEP: usize = 30;
 /// Lines the ticker view shows.
 pub const TICKER_LINES: usize = 3;
 
@@ -99,8 +109,9 @@ impl Default for UiModel {
     fn default() -> Self {
         Self {
             meeting: MeetingState::Idle,
-            suggestion_text: String::new(),
+            feed: Vec::new(),
             suggestion_id: None,
+            profile: None,
             ticker: Vec::new(),
             status: Vec::new(),
             quit_requested: false,
@@ -126,6 +137,10 @@ impl UiModel {
                 }
                 if self.terminate_now() {
                     changes.terminate = true;
+                }
+                if state == MeetingState::Starting && !self.feed.is_empty() {
+                    self.feed.clear();
+                    changes.suggestion = true;
                 }
                 changes
             }
@@ -153,9 +168,9 @@ impl UiModel {
             }
             UiEvent::SuggestionStart { id } => {
                 self.suggestion_id = Some(id);
-                self.suggestion_text.clear();
+                // Nothing on screen changes; the status line gains " ...".
                 Changes {
-                    suggestion: true,
+                    status: true,
                     ..Changes::NONE
                 }
             }
@@ -163,7 +178,16 @@ impl UiModel {
                 if self.suggestion_id != Some(id) {
                     return Changes::NONE;
                 }
-                self.suggestion_text.push_str(&text);
+                match self.feed.iter_mut().find(|(entry, _)| *entry == id) {
+                    Some((_, entry)) => entry.push_str(&text),
+                    None => {
+                        self.feed.push((id, text));
+                        if self.feed.len() > FEED_KEEP {
+                            let excess = self.feed.len() - FEED_KEEP;
+                            self.feed.drain(..excess);
+                        }
+                    }
+                }
                 Changes {
                     suggestion: true,
                     ..Changes::NONE
@@ -174,33 +198,34 @@ impl UiModel {
                     return Changes::NONE;
                 }
                 self.suggestion_id = None;
+                let mut suggestion = false;
                 match end {
                     clueless_types::SuggestionEnd::Done => {}
-                    clueless_types::SuggestionEnd::Cancelled => {}
+                    clueless_types::SuggestionEnd::Cancelled => {
+                        let before = self.feed.len();
+                        self.feed.retain(|(entry, _)| *entry != id);
+                        suggestion = self.feed.len() != before;
+                    }
                     clueless_types::SuggestionEnd::Interrupted => {
-                        if !self.suggestion_text.ends_with("[interrupted]") {
-                            if !self.suggestion_text.is_empty() {
-                                self.suggestion_text.push('\n');
-                            }
-                            self.suggestion_text.push_str("[interrupted]");
+                        if let Some((_, entry)) = self.feed.iter_mut().find(|(e, _)| *e == id) {
+                            entry.push_str("\n[interrupted]");
+                            suggestion = true;
                         }
                     }
-                    clueless_types::SuggestionEnd::Failed(err) => {
-                        if !self.suggestion_text.is_empty() {
-                            self.suggestion_text.push('\n');
-                        }
-                        self.suggestion_text.push_str(&err);
-                    }
+                    // The reason goes to the status line, not into the feed.
+                    clueless_types::SuggestionEnd::Failed(_) => {}
                 }
                 Changes {
-                    suggestion: true,
+                    status: true,
+                    suggestion,
                     ..Changes::NONE
                 }
             }
             UiEvent::ClearSuggestion => {
-                self.suggestion_id = None;
-                self.suggestion_text.clear();
+                let was_active = self.suggestion_id.take().is_some();
+                self.feed.clear();
                 Changes {
+                    status: was_active,
                     suggestion: true,
                     ..Changes::NONE
                 }
@@ -224,7 +249,14 @@ impl UiModel {
                     ..Changes::NONE
                 }
             }
-            UiEvent::Profile(_) => Changes::NONE,
+            UiEvent::Profile(profile) => {
+                self.profile = Some(profile);
+                Changes {
+                    status: true,
+                    profile: true,
+                    ..Changes::NONE
+                }
+            }
             UiEvent::SourcesDrained => Changes::NONE,
         }
     }
@@ -245,9 +277,23 @@ impl UiModel {
         self.quit_requested && self.meeting == MeetingState::Idle
     }
 
-    /// Suggestion text to render.
-    pub fn suggestion_text(&self) -> &str {
-        &self.suggestion_text
+    /// The feed text to render: entries joined by one blank line.
+    pub fn suggestion_text(&self) -> String {
+        self.feed
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Number of entries in the feed.
+    pub fn feed_len(&self) -> usize {
+        self.feed.len()
+    }
+
+    /// The active assist profile, once the engine has reported one.
+    pub fn profile(&self) -> Option<AssistProfile> {
+        self.profile
     }
 
     /// Ticker lines, oldest first; the view shows the last [`TICKER_LINES`].
@@ -266,13 +312,20 @@ impl UiModel {
         &self.status
     }
 
-    /// The status line: all per-source texts joined.
+    /// The status line: the profile name (with " ..." while a request is
+    /// running), then all per-source texts, joined by the separator.
     pub fn status_line(&self) -> String {
-        self.status
-            .iter()
-            .map(|(_, _, text)| text.as_str())
-            .collect::<Vec<_>>()
-            .join("  |  ")
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(profile) = self.profile {
+            let working = if self.suggestion_id.is_some() {
+                " ..."
+            } else {
+                ""
+            };
+            parts.push(format!("{}{working}", profile.name()));
+        }
+        parts.extend(self.status.iter().map(|(_, _, text)| text.clone()));
+        parts.join("  |  ")
     }
 
     /// The worst level currently shown, for status line coloring.
@@ -366,16 +419,83 @@ mod tests {
         assert_eq!(m.suggestion_text(), "");
     }
 
+    fn answer(m: &mut UiModel, id: u64, text: &str) {
+        m.apply(UiEvent::SuggestionStart { id });
+        m.apply(UiEvent::SuggestionDelta {
+            id,
+            text: text.into(),
+        });
+        m.apply(UiEvent::SuggestionEnd {
+            id,
+            end: SuggestionEnd::Done,
+        });
+    }
+
     #[test]
-    fn a_new_suggestion_clears_the_previous_text() {
+    fn a_new_suggestion_keeps_the_previous_answer_in_the_feed() {
+        let mut m = UiModel::default();
+        answer(&mut m, 1, "a");
+        m.apply(UiEvent::SuggestionStart { id: 2 });
+        assert_eq!(m.suggestion_text(), "a", "start changes nothing on screen");
+        m.apply(UiEvent::SuggestionDelta {
+            id: 2,
+            text: "b".into(),
+        });
+        assert_eq!(m.suggestion_text(), "a\n\nb");
+    }
+
+    #[test]
+    fn an_answer_without_text_leaves_no_entry() {
+        let mut m = UiModel::default();
+        m.apply(UiEvent::SuggestionStart { id: 1 });
+        m.apply(UiEvent::SuggestionEnd {
+            id: 1,
+            end: SuggestionEnd::Done,
+        });
+        assert_eq!(m.feed_len(), 0);
+        assert_eq!(m.suggestion_text(), "");
+    }
+
+    #[test]
+    fn cancelled_removes_the_entry() {
         let mut m = UiModel::default();
         m.apply(UiEvent::SuggestionStart { id: 1 });
         m.apply(UiEvent::SuggestionDelta {
             id: 1,
-            text: "hello".into(),
+            text: "a".into(),
         });
-        assert_eq!(m.suggestion_text(), "hello");
+        m.apply(UiEvent::SuggestionEnd {
+            id: 1,
+            end: SuggestionEnd::Cancelled,
+        });
+        assert_eq!(m.feed_len(), 0);
+    }
+
+    #[test]
+    fn cancelled_removes_only_its_own_entry() {
+        let mut m = UiModel::default();
+        answer(&mut m, 1, "a");
         m.apply(UiEvent::SuggestionStart { id: 2 });
+        m.apply(UiEvent::SuggestionDelta {
+            id: 2,
+            text: "b".into(),
+        });
+        m.apply(UiEvent::SuggestionEnd {
+            id: 2,
+            end: SuggestionEnd::Cancelled,
+        });
+        assert_eq!(m.suggestion_text(), "a");
+    }
+
+    #[test]
+    fn interrupted_with_no_text_adds_nothing() {
+        let mut m = UiModel::default();
+        m.apply(UiEvent::SuggestionStart { id: 1 });
+        m.apply(UiEvent::SuggestionEnd {
+            id: 1,
+            end: SuggestionEnd::Interrupted,
+        });
+        assert_eq!(m.feed_len(), 0);
         assert_eq!(m.suggestion_text(), "");
     }
 
@@ -385,39 +505,62 @@ mod tests {
         m.apply(UiEvent::SuggestionStart { id: 1 });
         m.apply(UiEvent::SuggestionDelta {
             id: 1,
-            text: "the answer is".into(),
+            text: "a".into(),
         });
         m.apply(UiEvent::SuggestionEnd {
             id: 1,
             end: SuggestionEnd::Interrupted,
         });
-        let text = m.suggestion_text();
-        assert!(text.starts_with("the answer is"));
-        assert!(
-            text.lines().last() == Some("[interrupted]"),
-            "text ends with the interrupted line: {text:?}"
-        );
+        assert_eq!(m.suggestion_text(), "a\n[interrupted]");
     }
 
     #[test]
-    fn failed_shows_the_error_message() {
+    fn failed_adds_nothing_to_the_feed() {
         let mut m = UiModel::default();
         m.apply(UiEvent::SuggestionStart { id: 1 });
         m.apply(UiEvent::SuggestionEnd {
             id: 1,
             end: SuggestionEnd::Failed("LLM offline".into()),
         });
-        assert_eq!(m.suggestion_text(), "LLM offline");
+        assert_eq!(m.feed_len(), 0);
+        assert_eq!(m.suggestion_text(), "");
     }
 
     #[test]
-    fn clear_empties_the_text_and_drops_late_deltas() {
+    fn a_delta_for_an_id_that_is_not_active_is_ignored() {
         let mut m = UiModel::default();
+        m.apply(UiEvent::SuggestionStart { id: 1 });
+        let changes = m.apply(UiEvent::SuggestionDelta {
+            id: 9,
+            text: "x".into(),
+        });
+        assert_eq!(changes, Changes::NONE);
+        assert_eq!(m.feed_len(), 0);
+    }
+
+    #[test]
+    fn the_feed_keeps_the_newest_thirty_entries() {
+        let mut m = UiModel::default();
+        for id in 1..=31 {
+            answer(&mut m, id, &format!("answer {id}"));
+        }
+        assert_eq!(m.feed_len(), 30);
+        let text = m.suggestion_text();
+        assert!(text.starts_with("answer 2\n\nanswer 3"), "{text:?}");
+        assert!(text.ends_with("answer 31"));
+    }
+
+    #[test]
+    fn clear_empties_the_feed_and_drops_late_deltas() {
+        let mut m = UiModel::default();
+        answer(&mut m, 1, "a");
+        answer(&mut m, 2, "b");
         m.apply(UiEvent::SuggestionStart { id: 7 });
         m.apply(UiEvent::SuggestionDelta {
             id: 7,
             text: "partial".into(),
         });
+        assert_eq!(m.feed_len(), 3);
         m.apply(UiEvent::ClearSuggestion);
         assert_eq!(m.suggestion_text(), "");
         m.apply(UiEvent::SuggestionDelta {
@@ -425,6 +568,52 @@ mod tests {
             text: "late".into(),
         });
         assert_eq!(m.suggestion_text(), "");
+    }
+
+    #[test]
+    fn a_meeting_start_empties_the_feed() {
+        let mut m = UiModel::default();
+        answer(&mut m, 1, "a");
+        answer(&mut m, 2, "b");
+        answer(&mut m, 3, "c");
+        let changes = m.apply(UiEvent::MeetingState(MeetingState::Starting));
+        assert_eq!(m.feed_len(), 0);
+        assert!(changes.suggestion);
+    }
+
+    // --- profile in the status line ---
+
+    #[test]
+    fn the_status_line_starts_with_the_profile_name() {
+        let mut m = UiModel::default();
+        let changes = m.apply(UiEvent::Profile(AssistProfile::Interview));
+        assert_eq!(m.status_line(), "Interview");
+        assert!(changes.profile && changes.status);
+    }
+
+    #[test]
+    fn the_status_line_shows_dots_while_a_request_runs() {
+        let mut m = UiModel::default();
+        m.apply(UiEvent::Profile(AssistProfile::Interview));
+        m.apply(UiEvent::SuggestionStart { id: 1 });
+        assert_eq!(m.status_line(), "Interview ...");
+        m.apply(UiEvent::SuggestionEnd {
+            id: 1,
+            end: SuggestionEnd::Done,
+        });
+        assert_eq!(m.status_line(), "Interview");
+    }
+
+    #[test]
+    fn the_profile_name_comes_before_the_source_statuses() {
+        let mut m = UiModel::default();
+        m.apply(UiEvent::Profile(AssistProfile::Brainstorm));
+        m.apply(UiEvent::Status {
+            source: StatusSource::Llm,
+            level: StatusLevel::Info,
+            text: "LLM ready".into(),
+        });
+        assert_eq!(m.status_line(), "Brainstorm  |  LLM ready");
     }
 
     // --- ticker ---
@@ -606,20 +795,31 @@ mod tests {
         report(c, false, true, false, false, false);
 
         m.apply(UiEvent::SuggestionStart { id: 1 });
+        // Start marks the status (" ..." appears) but not the feed.
         let c = m.apply(UiEvent::SuggestionStart { id: 2 });
-        report(c, false, false, true, false, false);
+        report(c, true, false, false, false, false);
         let c = m.apply(UiEvent::SuggestionDelta {
             id: 2,
             text: "try".into(),
         });
         report(c, false, false, true, false, false);
+        // End marks the status and, when the cancel removed an entry, the feed.
         let c = m.apply(UiEvent::SuggestionEnd {
             id: 2,
             end: SuggestionEnd::Cancelled,
         });
-        report(c, false, false, true, false, false);
+        report(c, true, false, true, false, false);
+        let c = m.apply(UiEvent::SuggestionEnd {
+            id: 2,
+            end: SuggestionEnd::Cancelled,
+        });
+        report(c, false, false, false, false, false);
         let c = m.apply(UiEvent::ClearSuggestion);
         report(c, false, false, true, false, false);
+
+        let c = m.apply(UiEvent::Profile(AssistProfile::Brainstorm));
+        report(c, true, false, false, false, false);
+        assert!(c.profile);
 
         // Running registers the meeting keys, so the switch reports both;
         // a repeated Running changes nothing but `meeting` itself.

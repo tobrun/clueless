@@ -319,9 +319,9 @@ impl OverlayViews {
     fn render_suggestion(&mut self, model: &UiModel, scroll_to_end: bool) {
         let suggestion = model.suggestion_text();
         if self.last_suggestion != suggestion {
-            self.last_suggestion = suggestion.to_string();
-            self.text.setString(&NSString::from_str(suggestion));
+            self.text.setString(&NSString::from_str(&suggestion));
             Self::follow_suggestion_tail(&self.text, scroll_to_end, suggestion.len());
+            self.last_suggestion = suggestion;
         }
     }
 
