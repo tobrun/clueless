@@ -60,7 +60,7 @@ KIND_RE = re.compile(
     r"^(?P<kind>fn|const|static(?:\s+mut)?|struct|enum)\s+(?P<name>[A-Za-z_]\w*)\b"
 )
 MOD_RE = re.compile(r"^(?:pub(?:\s*\([^()]*\))?\s+)?mod\s+([A-Za-z_]\w*)")
-ATTR_TEST_RE = re.compile(r"^#\[\s*(?:(?:\w+)::)*(?:test|bench)\s*\]")
+ATTR_TEST_RE = re.compile(r"^#\[\s*(?:(?:\w+)::)*(?:test|bench)\s*(?:\([^\]]*\)\s*)?\]")
 ATTR_TEST_GEN_RE = re.compile(r"^#\[\s*(?:(?:\w+)::)*(?:rstest|test_case)\b")
 ATTR_ALLOW_DEAD_RE = re.compile(r"allow\s*\([^)]*\bdead_code\b")
 ATTR_SKIP_RE = re.compile(r"^#\[\s*(?:no_mangle|proc_macro\w*|global_allocator)\b")
