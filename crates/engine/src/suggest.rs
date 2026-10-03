@@ -80,6 +80,29 @@ pub struct Finished {
     pub shown: String,
 }
 
+/// Pass one streamed chunk through the optional hold-back filter. Without a
+/// filter the chunk is shown as is; with one, the held text is released once
+/// the answer can no longer be `PASS`, and the filter is dropped from then on.
+fn release_chunk(filter: &mut Option<PassFilter>, text: String) -> Option<String> {
+    let Some(held) = filter.as_mut() else {
+        return Some(text);
+    };
+    let released = held.push(&text);
+    if released.is_some() {
+        *filter = None;
+    }
+    released
+}
+
+/// The outcome when the stream closes without an error.
+fn stream_closed_end(cancel: &CancellationToken) -> SuggestionEnd {
+    if cancel.is_cancelled() {
+        SuggestionEnd::Cancelled
+    } else {
+        SuggestionEnd::Done
+    }
+}
+
 /// Stream one suggestion until it ends and report the outcome. `cancel`
 /// is this suggestion's own token: when it fires the run reports
 /// `Cancelled` whatever else was in flight. With `hold_pass` the start of
@@ -113,29 +136,14 @@ pub async fn run(
                 if cancel.is_cancelled() {
                     break SuggestionEnd::Cancelled;
                 }
-                let text = match filter.as_mut() {
-                    None => Some(text),
-                    Some(held) => {
-                        let released = held.push(&text);
-                        if released.is_some() {
-                            filter = None;
-                        }
-                        released
-                    }
-                };
+                let text = release_chunk(&mut filter, text);
                 if let Some(text) = text {
                     shown.push_str(&text);
                     ui(UiEvent::SuggestionDelta { id, text });
                 }
             }
             Some(Err(error)) => break map_llm_error(&error),
-            None => {
-                break if cancel.is_cancelled() {
-                    SuggestionEnd::Cancelled
-                } else {
-                    SuggestionEnd::Done
-                };
-            }
+            None => break stream_closed_end(&cancel),
         }
     };
     ui(UiEvent::SuggestionEnd {
@@ -158,7 +166,9 @@ pub async fn cancel_and_wait(task: &mut tokio::task::JoinHandle<()>, cancel: &Ca
 
 #[cfg(test)]
 mod tests {
-    use super::PassFilter;
+    use clueless_types::events::SuggestionEnd;
+
+    use super::{PassFilter, release_chunk, stream_closed_end};
 
     fn feed(chunks: &[&str]) -> Vec<Option<String>> {
         let mut filter = PassFilter::new();
@@ -200,5 +210,35 @@ mod tests {
             feed(&["  ", "Sure thing"]),
             vec![None, Some("  Sure thing".to_owned())]
         );
+    }
+
+    #[test]
+    fn release_chunk_passes_text_through_without_a_filter() {
+        let mut filter = None;
+        assert_eq!(
+            release_chunk(&mut filter, "hi".to_owned()),
+            Some("hi".to_owned())
+        );
+        assert!(filter.is_none());
+    }
+
+    #[test]
+    fn release_chunk_drops_the_filter_once_text_is_released() {
+        let mut filter = Some(PassFilter::new());
+        assert_eq!(release_chunk(&mut filter, "PA".to_owned()), None);
+        assert!(filter.is_some());
+        assert_eq!(
+            release_chunk(&mut filter, "SSY".to_owned()),
+            Some("PASSY".to_owned())
+        );
+        assert!(filter.is_none());
+    }
+
+    #[test]
+    fn a_closed_stream_is_done_unless_cancelled() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert_eq!(stream_closed_end(&cancel), SuggestionEnd::Done);
+        cancel.cancel();
+        assert_eq!(stream_closed_end(&cancel), SuggestionEnd::Cancelled);
     }
 }

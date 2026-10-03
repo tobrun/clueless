@@ -96,55 +96,75 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 log_file = Some(PathBuf::from(take_value(&mut args, &arg)?));
             }
             "--replay" => {
-                if replay_files.is_some() {
-                    return Err("--replay given twice".to_string());
-                }
-                let mut files = Vec::new();
-                while files.len() < 2 {
-                    match args.front() {
-                        Some(next) if next.starts_with('-') => break,
-                        Some(_) => files.push(PathBuf::from(args.pop_front().expect("checked"))),
-                        None => break,
-                    }
-                }
-                if files.is_empty() {
-                    return Err("--replay needs at least a Me WAV file".to_string());
-                }
-                replay_files = Some(files);
+                replay_files = Some(take_replay_files(&mut args, replay_files.is_some())?)
             }
-            "--speed" => {
-                let value = take_value(&mut args, &arg)?;
-                let parsed: f64 = value
-                    .parse()
-                    .map_err(|_| format!("--speed needs a number, got {value}"))?;
-                if !parsed.is_finite() || parsed <= 0.0 {
-                    return Err(format!("--speed must be a positive number, got {value}"));
-                }
-                speed = Some(parsed);
-            }
+            "--speed" => speed = Some(parse_speed(&take_value(&mut args, &arg)?)?),
             "--ask" => ask = true,
-            "--profile" => {
-                let value = take_value(&mut args, &arg)?;
-                profile = Some(value.parse::<AssistProfile>()?);
-            }
+            "--profile" => profile = Some(take_value(&mut args, &arg)?.parse::<AssistProfile>()?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
 
-    if profile.is_some() && replay_files.is_none() {
-        return Err("--profile only applies to --replay".to_string());
-    }
-    let replay = replay_files.map(|files| Replay {
-        files,
-        speed: speed.unwrap_or(1.0),
-        ask,
-        profile,
-    });
+    let replay = assemble_replay(replay_files, speed, ask, profile)?;
     Ok(Parsed::Cli(Cli {
         config,
         env_file,
         log_file: log_file.unwrap_or_else(default_log_file),
         replay,
+    }))
+}
+
+/// The one or two WAV paths after `--replay`.
+fn take_replay_files(
+    args: &mut VecDeque<String>,
+    already_given: bool,
+) -> Result<Vec<PathBuf>, String> {
+    if already_given {
+        return Err("--replay given twice".to_string());
+    }
+    let files = take_wav_paths(args);
+    if files.is_empty() {
+        return Err("--replay needs at least a Me WAV file".to_string());
+    }
+    Ok(files)
+}
+
+/// Up to two leading arguments that are not flags.
+fn take_wav_paths(args: &mut VecDeque<String>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    while files.len() < 2 && args.front().is_some_and(|next| !next.starts_with('-')) {
+        if let Some(next) = args.pop_front() {
+            files.push(PathBuf::from(next));
+        }
+    }
+    files
+}
+
+fn parse_speed(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|_| format!("--speed needs a number, got {value}"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!("--speed must be a positive number, got {value}"));
+    }
+    Ok(parsed)
+}
+
+/// Combine the replay flags; `--profile` is only valid with `--replay`.
+fn assemble_replay(
+    files: Option<Vec<PathBuf>>,
+    speed: Option<f64>,
+    ask: bool,
+    profile: Option<AssistProfile>,
+) -> Result<Option<Replay>, String> {
+    if profile.is_some() && files.is_none() {
+        return Err("--profile only applies to --replay".to_string());
+    }
+    Ok(files.map(|files| Replay {
+        files,
+        speed: speed.unwrap_or(1.0),
+        ask,
+        profile,
     }))
 }
 

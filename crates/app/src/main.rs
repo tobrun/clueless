@@ -125,8 +125,7 @@ async fn replay_loop(
 
     let outcome = tokio::time::timeout(REPLAY_LIMIT, async {
         let mut asked = false;
-        // The id of the answer whose "--- suggestion ---" header is out.
-        let mut header_for: Option<u64> = None;
+        let mut printer = SuggestionPrinter::default();
         while let Some(event) = events_rx.recv().await {
             match event {
                 UiEvent::TranscriptFinal(final_) => {
@@ -143,20 +142,12 @@ async fn replay_loop(
                     text,
                 } => eprintln!("{source:?} {level:?}: {text}"),
                 UiEvent::SuggestionDelta { id, text } => {
-                    if header_for != Some(id) {
-                        println!("--- suggestion ---");
-                        header_for = Some(id);
-                    }
-                    print!("{text}");
-                    let _ = std::io::stdout().flush();
+                    let mut out = std::io::stdout();
+                    printer.delta(id, &text, &mut out);
+                    let _ = out.flush();
                 }
                 UiEvent::SuggestionEnd { id, end } => {
-                    if header_for == Some(id) {
-                        println!();
-                    }
-                    if let SuggestionEnd::Failed(reason) = end {
-                        eprintln!("suggestion failed: {reason}");
-                    }
+                    printer.end(id, &end, &mut std::io::stdout(), &mut std::io::stderr());
                     // `SourcesDrained` only arrives once nothing is running
                     // or waiting, so after the asked request was sent this
                     // is its end.
@@ -218,6 +209,39 @@ fn run_gui(config: Config) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Prints suggestion deltas and ends, with the "--- suggestion ---" header
+/// once per answer.
+#[derive(Default)]
+struct SuggestionPrinter {
+    /// The id of the answer whose header is out.
+    header_for: Option<u64>,
+}
+
+impl SuggestionPrinter {
+    fn delta(&mut self, id: u64, text: &str, out: &mut impl std::io::Write) {
+        if self.header_for != Some(id) {
+            let _ = writeln!(out, "--- suggestion ---");
+            self.header_for = Some(id);
+        }
+        let _ = write!(out, "{text}");
+    }
+
+    fn end(
+        &self,
+        id: u64,
+        end: &SuggestionEnd,
+        out: &mut impl std::io::Write,
+        err: &mut impl std::io::Write,
+    ) {
+        if self.header_for == Some(id) {
+            let _ = writeln!(out);
+        }
+        if let SuggestionEnd::Failed(reason) = end {
+            let _ = writeln!(err, "suggestion failed: {reason}");
+        }
+    }
+}
+
 fn speaker_label(speaker: Speaker) -> &'static str {
     match speaker {
         Speaker::Me => "Me",
@@ -230,4 +254,41 @@ fn clock_label(t0_ms: u64) -> String {
     let total_seconds = t0_ms / 1000;
     let minutes = (total_seconds / 60).min(99);
     format!("[{minutes:02}:{:02}]", total_seconds % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(buffer: Vec<u8>) -> String {
+        String::from_utf8(buffer).expect("utf-8")
+    }
+
+    #[test]
+    fn the_header_is_printed_once_per_answer_and_the_end_closes_the_line() {
+        let mut printer = SuggestionPrinter::default();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        printer.delta(1, "a", &mut out);
+        printer.delta(1, "b", &mut out);
+        printer.end(1, &SuggestionEnd::Done, &mut out, &mut err);
+        printer.delta(2, "c", &mut out);
+        assert_eq!(text(out), "--- suggestion ---\nab\n--- suggestion ---\nc");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn a_failed_end_is_reported_on_stderr_and_an_unseen_id_prints_no_newline() {
+        let printer = SuggestionPrinter::default();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        printer.end(
+            7,
+            &SuggestionEnd::Failed("boom".to_string()),
+            &mut out,
+            &mut err,
+        );
+        assert!(out.is_empty());
+        assert_eq!(text(err), "suggestion failed: boom\n");
+    }
 }

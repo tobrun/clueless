@@ -303,10 +303,19 @@ fn update_meeting_indicator(ui: &Ui, changes: &Changes, mtm: MainThreadMarker) {
     if changes.meeting {
         ui.status_item
             .set_meeting_running(ui.model.meeting() == MeetingState::Running, mtm);
-        refresh_menu(ui, mtm);
-    } else if changes.profile {
+    }
+    refresh_menu_if_needed(ui, changes, mtm);
+}
+
+fn refresh_menu_if_needed(ui: &Ui, changes: &Changes, mtm: MainThreadMarker) {
+    if menu_needs_refresh(changes) {
         refresh_menu(ui, mtm);
     }
+}
+
+/// The menu titles depend on the meeting state and on the profile.
+fn menu_needs_refresh(changes: &Changes) -> bool {
+    changes.meeting || changes.profile
 }
 
 /// Re-register the meeting-only hotkeys when the model says the wanted set
@@ -554,6 +563,24 @@ pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn menu_refreshes_on_meeting_or_profile_changes_only() {
+        let none = Changes::NONE;
+        assert!(!menu_needs_refresh(&none));
+        assert!(menu_needs_refresh(&Changes {
+            meeting: true,
+            ..Changes::NONE
+        }));
+        assert!(menu_needs_refresh(&Changes {
+            profile: true,
+            ..Changes::NONE
+        }));
+        assert!(!menu_needs_refresh(&Changes {
+            status: true,
+            ..Changes::NONE
+        }));
+    }
+
     use super::*;
     use crate::model::Changes;
     use clueless_types::{SuggestionEnd, Utterance, UtteranceId};
