@@ -237,6 +237,15 @@ mod tests {
     }
 
     #[test]
+    fn replay_takes_at_most_two_files() {
+        let error = parse_line("--replay a.wav b.wav c.wav").unwrap_err();
+        assert!(
+            error.contains("unknown argument c.wav"),
+            "error was: {error}"
+        );
+    }
+
+    #[test]
     fn profile_without_replay_is_an_error() {
         let error = parse_line("--profile interview").unwrap_err();
         assert!(error.contains("--replay"), "error was: {error}");

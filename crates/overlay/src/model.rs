@@ -585,6 +585,62 @@ mod tests {
         assert!(changes.suggestion);
     }
 
+    #[test]
+    fn a_running_meeting_state_keeps_the_feed() {
+        let mut m = UiModel::default();
+        answer(&mut m, 1, "a");
+        let changes = m.apply(UiEvent::MeetingState(MeetingState::Running));
+        assert_eq!(m.feed_len(), 1);
+        assert!(!changes.suggestion);
+    }
+
+    #[test]
+    fn a_meeting_start_with_an_empty_feed_reports_no_suggestion_change() {
+        let mut m = UiModel::default();
+        let changes = m.apply(UiEvent::MeetingState(MeetingState::Starting));
+        assert!(!changes.suggestion);
+    }
+
+    #[test]
+    fn merging_changes_keeps_every_flag_either_side_set() {
+        let mut left = Changes {
+            status: true,
+            ..Changes::NONE
+        };
+        left.merge(Changes {
+            ticker: true,
+            suggestion: true,
+            meeting: true,
+            terminate: true,
+            hotkeys: true,
+            profile: true,
+            ..Changes::NONE
+        });
+        assert!(left.status && left.ticker && left.suggestion);
+        assert!(left.meeting && left.terminate && left.hotkeys && left.profile);
+        let mut none = Changes::NONE;
+        none.merge(Changes::NONE);
+        assert!(!none.status && !none.suggestion && !none.profile);
+    }
+
+    #[test]
+    fn clearing_while_an_answer_streams_reports_a_status_change() {
+        let mut m = UiModel::default();
+        m.apply(UiEvent::SuggestionStart { id: 1 });
+        let changes = m.apply(UiEvent::ClearSuggestion);
+        assert!(changes.status, "the dots in the status line go away");
+        let again = m.apply(UiEvent::ClearSuggestion);
+        assert!(!again.status, "nothing was running the second time");
+    }
+
+    #[test]
+    fn the_model_reports_the_profile_the_engine_announced() {
+        let mut m = UiModel::default();
+        assert_eq!(m.profile(), None);
+        m.apply(UiEvent::Profile(AssistProfile::Interview));
+        assert_eq!(m.profile(), Some(AssistProfile::Interview));
+    }
+
     // --- profile in the status line ---
 
     #[test]
