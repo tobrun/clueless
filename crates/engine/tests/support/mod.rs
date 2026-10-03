@@ -1299,15 +1299,3 @@ pub async fn closed_port() -> u16 {
     drop(listener);
     port
 }
-
-/// Build `(frames, probs)` runs into one concatenated source script:
-/// consecutive `(frames, prob)` runs of a pattern.
-pub fn concat_utterances(parts: &[(usize, Vec<f32>)]) -> (usize, Vec<f32>) {
-    let mut frames = 0usize;
-    let mut probs = Vec::new();
-    for (count, run) in parts {
-        frames += count;
-        probs.extend(run.iter().copied());
-    }
-    (frames, probs)
-}
