@@ -1,6 +1,6 @@
 //! The main menu: invisible under the Accessory activation policy, but the
 //! only place AppKit reads `cmd` key equivalents from, so `cmd+C`, `cmd+A`,
-//! `cmd+W` and `cmd+Q` need items here (spec D-close, D-app-menu). Copy and
+//! `cmd+W` and `cmd+Q` need items here (spec D-close, D-key-equivalents). Copy and
 //! Select All target `nil` and travel the responder chain to the focused
 //! text view; Close targets `performClose:` on the key window, which the
 //! standard window turns into a hide; Quit targets the status item's handler
@@ -66,13 +66,11 @@ fn add_item(
     let item = unsafe {
         menu.addItemWithTitle_action_keyEquivalent(&NSString::from_str(title), Some(action), key)
     };
+    let target: Option<&objc2::runtime::AnyObject> = target.map(|t| &****t);
     // SAFETY: plain setter; AppKit menu targets are weak and the one passed
     // here is retained by the status item controller for the process
     // lifetime.
     unsafe {
-        match target {
-            Some(t) => item.setTarget(Some(&**t)),
-            None => item.setTarget(None),
-        }
+        item.setTarget(target);
     }
 }
