@@ -100,7 +100,7 @@ Lookup order: the path given by `--config`, else `~/.config/clueless/config.toml
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `hide_from_capture` | true | Sets the panel's sharing type to none; best effort on macOS 15.4+ |
+| `hide_from_capture` | true | Sets the hidden overlay panel's sharing type to none; the standard window is never hidden from capture; best effort on macOS 15.4+ |
 
 ### `[hotkeys]`
 
@@ -114,8 +114,21 @@ All keys are global while their registration window is active; the syntax is `cm
 | `toggle_meeting` | `cmd+shift+KeyR` | always |
 | `toggle_overlay` | `cmd+Backslash` | always |
 | `toggle_click_through` | `cmd+shift+KeyM` | always |
+| `toggle_mode` | `cmd+shift+Backslash` | always |
+
+## Window modes
+
+The app has two windows and shows at most one at a time: a standard window with a title bar that can be dragged and resized, and a borderless overlay panel that is click-through.
+Every launch starts in standard mode; `hotkeys.toggle_mode` (default `cmd+shift+Backslash`) or the status icon menu switches between the two, and the overlay then covers exactly the standard window's content area.
+The show/hide menu item names the active window ("Show Window"/"Hide Window" in standard mode, "Show Overlay"/"Hide Overlay" in hidden mode) and the mode item names the destination ("Switch to Hidden Overlay"/"Switch to Standard Window").
+The close button and `cmd+W` hide the window and the app keeps running in the menu bar; `cmd+Q` quits.
+The four move keys act on whichever window is on screen; dragging and resizing only exist in standard mode.
+Screen capture always sees the standard window; `overlay.hide_from_capture` applies to the overlay panel only, and it is best effort: on macOS 15.4 and later ScreenCaptureKit ignores the panel's sharing type, so hidden mode can still show up when a whole screen is shared.
+The standard window's position and size are remembered across launches in the user defaults of the app's bundle id (AppKit frame autosave `CluelessMainWindow`); the overlay derives its frame from it.
+The bundled app and a bare `cargo run` binary have different bundle ids, so they remember different frames.
 
 ## Other inputs
 
 - `LLM_PROFILE_PATH` points at a plain text file with your name, role and anything the answers should know; it is read at meeting start and placed in the system message.
 - Transcripts and suggestions are never written to disk; the only files the app writes are its log (`~/Library/Logs/clueless/clueless.log`) and a single-instance lock (`~/Library/Application Support/clueless/lock`).
+- The one piece of state that survives a launch is the standard window's frame, kept by AppKit in the user defaults; the app owns no file for it.

@@ -1,9 +1,9 @@
 # clueless
 
 A meeting copilot for macOS that runs entirely on your own infrastructure.
-It transcribes your meetings live in a floating overlay - your microphone as `Me`, the computer's audio as `Them` - and on a hotkey asks a language model what you could say next, streaming the answer into the panel.
+It transcribes your meetings live - your microphone as `Me`, the computer's audio as `Them` - and on a hotkey asks a language model what you could say next, streaming the answer into the window.
 No account, no telemetry, nothing written to disk: the transcript lives in memory and dies with the app.
-A floating panel shows both transcript streams as they finalize, with suggestions streaming in beneath them.
+The window shows both transcript streams as they finalize, with suggestions streaming in beneath them.
 
 You bring two OpenAI-compatible servers (a chat model and a speech-to-text model, local or hosted) and clueless pipes everything through them.
 
@@ -19,6 +19,11 @@ hotkey ─► prompt builder (transcript + profile) ─► LLM server (streaming
 
 Speech detection and utterance cutting run on your Mac; only audio segments and prompt text leave it, straight to the servers you configured.
 The full design is in [docs/architecture.md](docs/architecture.md).
+
+## Window modes
+
+The app shows one of two windows: a standard window with a title bar that you can drag and resize and that appears in screen shares, or a borderless overlay panel that is click-through and that screen capture tries not to see.
+Every launch starts in the standard window; `Cmd+Shift+\` or the menu bar icon switches modes, and the overlay takes the position and size of the window's content area, which the app remembers across launches.
 
 ## Requirements
 
@@ -57,10 +62,11 @@ Everything lives in two small files, both documented in [docs/configuration.md](
 | --- | --- | --- |
 | `Cmd+Enter` | ask for a suggestion | during a meeting |
 | `Cmd+Shift+X` | clear the panel | during a meeting |
-| `Cmd+Shift+Arrow` | move the panel | during a meeting |
+| `Cmd+Shift+Arrow` | move the window on screen | during a meeting |
 | `Cmd+Shift+R` | start or stop the meeting | always |
-| `Cmd+\` | show or hide the overlay | always |
+| `Cmd+\` | show or hide the window on screen | always |
 | `Cmd+Shift+M` | toggle click-through | always |
+| `Cmd+Shift+\` | switch between the standard window and the hidden overlay | always |
 
 All of them are remappable, and meeting-only keys are unregistered outside meetings so they do not steal combinations from other apps all day.
 
