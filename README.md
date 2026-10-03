@@ -14,11 +14,21 @@ microphone ──┐                                  ┌─► transcript store
              ├─► ring buffer ─► VAD + segmenter ─┤
 system audio ┘        │           (per stream)   └─► ASR server (OpenAI-compatible)
                       │
-hotkey ─► prompt builder (transcript + profile) ─► LLM server (streaming) ─► overlay panel
+hotkey or turn end ─► prompt builder (transcript + notes + profile) ─► LLM server (streaming) ─► overlay panel
 ```
 
 Speech detection and utterance cutting run on your Mac; only audio segments and prompt text leave it, straight to the servers you configured.
 The full design is in [docs/architecture.md](docs/architecture.md).
+
+## Assist profiles
+
+Three built-in profiles decide when the model helps.
+Manual, the default, asks only when you press `Cmd+Enter`.
+Interview asks at the end of a turn of the other side and helps you answer what they raised.
+Brainstorm asks at every finished piece of your own speech and offers ideas while you talk.
+The model answers PASS when it has nothing to say and the app shows nothing then.
+Answers collect in a feed with the newest at the bottom.
+Switch with `Ctrl+Alt+P` or the menu bar icon, and pick the start profile with `[assist] start_profile` in the config; see [Profiles in docs/configuration.md](docs/configuration.md#profiles).
 
 ## Window modes
 
@@ -67,6 +77,7 @@ Everything lives in two small files, both documented in [docs/configuration.md](
 | `Cmd+\` | show or hide the window on screen | always |
 | `Cmd+Shift+M` | toggle click-through | always |
 | `Cmd+Shift+\` | switch between the standard window and the hidden overlay | always |
+| `Ctrl+Alt+P` | cycle the assist profile | always |
 
 All of them are remappable, and meeting-only keys are unregistered outside meetings so they do not steal combinations from other apps all day.
 
@@ -79,6 +90,11 @@ cargo run -p clueless -- --replay fixtures/conv_me.wav fixtures/conv_them.wav --
 ```
 
 It prints each transcribed utterance as it finalizes and, with `--ask`, a streamed suggestion at the end.
+Replay stays hotkey-only unless you pass `--profile`:
+
+```sh
+cargo run -p clueless -- --replay fixtures/conv_me.wav fixtures/conv_them.wav --speed 4 --profile interview
+```
 
 ## Permissions
 

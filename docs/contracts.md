@@ -17,8 +17,8 @@ C-audio-callback-realtime: the microphone callback does not allocate, lock or lo
 
 ## Context
 
-C-prompt-prefix-stable: between two compressions, the user message built after N+1 committed lines starts with the exact bytes of the transcript part built after N lines
-  guaranteed by: context prompt builder (append-only store, tail always last) verified 2026-10-02 (context/src/prompt.rs::transcript_prefix_is_stable_when_a_line_is_committed)
+C-prompt-prefix-stable: between two compressions, the user message built after N+1 committed lines starts with the exact bytes of the transcript part built after N lines; the system message does not depend on the active profile
+  guaranteed by: context prompt builder (append-only store, tail always last) verified 2026-10-02 (context/src/prompt.rs::transcript_prefix_is_stable_when_a_line_is_committed; context/src/prompt.rs::system_message_and_transcript_part_are_identical_across_profiles)
   relied on by: LLM server prefix cache, latency budget
   (2026-10-02)
 
@@ -34,7 +34,7 @@ C-suggestion-id: every SuggestionDelta and SuggestionEnd carries the id of the S
   relied on by: overlay (drops events with an old id)
   (2026-10-02)
 
-C-server-read-only: the app sends only GET /v1/models, POST /v1/audio/transcriptions and POST /v1/chat/completions, and never more than one final plus one interim transcription per stream at a time
-  guaranteed by: asr and llm clients, engine workers verified 2026-10-02 (clients hit only those routes; mock servers in engine/tests/support/mod.rs serve nothing else and every suite passes through them; engine/tests/transcribe.rs::slow_first_final_keeps_order_and_single_flight; engine/tests/meeting.rs::compression_fires_once_and_summary_leads_the_transcript)
+C-server-read-only: the app sends only GET /v1/models, POST /v1/audio/transcriptions and POST /v1/chat/completions, never more than one final plus one interim transcription per stream at a time; never more than one open suggestion request plus one open compression request; and suggestion requests the app starts by itself begin at least auto_min_gap (2 s) apart
+  guaranteed by: asr and llm clients, engine workers (asr_worker, Engine::run, context::assist policy) verified 2026-10-02 (clients hit only those routes; mock servers in engine/tests/support/mod.rs serve nothing else and every suite passes through them; engine/tests/transcribe.rs::slow_first_final_keeps_order_and_single_flight; engine/tests/meeting.rs::compression_fires_once_and_summary_leads_the_transcript) ? verify: the one-open-suggestion-request and the auto_min_gap parts, which the automatic-request tests in engine/tests/assist.rs are to assert once those requests exist
   relied on by: the shared inference server (other users of it)
   (2026-10-02)
