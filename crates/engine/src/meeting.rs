@@ -84,6 +84,51 @@ pub struct Engine {
     deps: EngineDeps,
 }
 
+enum Next {
+    Command(EngineCommand),
+    Internal(Internal),
+    Finished(suggest::Finished),
+    Piece(PieceDone),
+    Tick,
+    Closed,
+}
+
+/// How the policy sees a run that ended this way.
+fn end_outcome(end: &SuggestionEnd) -> Outcome {
+    match end {
+        SuggestionEnd::Done => Outcome::Ok,
+        SuggestionEnd::Failed(_) | SuggestionEnd::Interrupted => Outcome::Failed,
+        SuggestionEnd::Cancelled => Outcome::Cancelled,
+    }
+}
+
+/// Wait for the next thing the engine loop has to react to.
+async fn next_event(
+    internal_rx: &mut mpsc::UnboundedReceiver<Internal>,
+    commands: &mut mpsc::UnboundedReceiver<EngineCommand>,
+    finished_rx: &mut mpsc::UnboundedReceiver<suggest::Finished>,
+    meeting: &mut Option<Meeting>,
+) -> Next {
+    let wake = meeting.as_ref().and_then(|current| current.wake_at);
+    tokio::select! { biased;
+        message = internal_rx.recv() => message.map_or(Next::Closed, Next::Internal),
+        command = commands.recv() => command.map_or(Next::Closed, Next::Command),
+        finished = finished_rx.recv() => finished.map_or(Next::Closed, Next::Finished),
+        piece = async {
+            match meeting.as_mut() {
+                Some(current) => current.pieces.recv().await,
+                None => std::future::pending().await,
+            }
+        } => piece.map_or(Next::Closed, Next::Piece),
+        _ = async {
+            match wake {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        } => Next::Tick,
+    }
+}
+
 impl Engine {
     pub fn new(config: Config, deps: EngineDeps) -> Self {
         Self { config, deps }
@@ -101,44 +146,13 @@ impl Engine {
         self.emit(UiEvent::Profile(profile));
 
         loop {
-            enum Next {
-                Command(EngineCommand),
-                Internal(Internal),
-                Finished(suggest::Finished),
-                Piece(PieceDone),
-                Tick,
-                Closed,
-            }
-            let wake = meeting.as_ref().and_then(|current| current.wake_at);
-            let next = tokio::select! { biased;
-                message = internal_rx.recv() => match message {
-                    Some(message) => Next::Internal(message),
-                    None => Next::Closed,
-                },
-                command = commands.recv() => match command {
-                    Some(command) => Next::Command(command),
-                    None => Next::Closed,
-                },
-                finished = finished_rx.recv() => match finished {
-                    Some(finished) => Next::Finished(finished),
-                    None => Next::Closed,
-                },
-                piece = async {
-                    match meeting.as_mut() {
-                        Some(current) => current.pieces.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => match piece {
-                    Some(piece) => Next::Piece(piece),
-                    None => Next::Closed,
-                },
-                _ = async {
-                    match wake {
-                        Some(at) => tokio::time::sleep_until(at).await,
-                        None => std::future::pending().await,
-                    }
-                } => Next::Tick,
-            };
+            let next = next_event(
+                &mut internal_rx,
+                &mut commands,
+                &mut finished_rx,
+                &mut meeting,
+            )
+            .await;
             match next {
                 Next::Internal(Internal::Panic(message)) => {
                     tracing::error!(%message, "engine component panicked");
@@ -158,20 +172,8 @@ impl Engine {
                         current.drained = true;
                     }
                 }
-                Next::Finished(finished) => {
-                    if let Some(current) = meeting.as_mut() {
-                        self.suggestion_finished(current, finished);
-                    }
-                }
-                Next::Piece(piece) => {
-                    if let Some(current) = meeting.as_mut() {
-                        current.policy.piece_done(
-                            piece.speaker,
-                            piece.text.as_deref(),
-                            Instant::now(),
-                        );
-                    }
-                }
+                Next::Finished(finished) => self.on_finished(&mut meeting, finished),
+                Next::Piece(piece) => Self::on_piece(&mut meeting, piece),
                 Next::Tick => {}
                 Next::Command(command) => match command {
                     EngineCommand::StartMeeting if state == MeetingState::Idle => {
@@ -220,9 +222,7 @@ impl Engine {
                         self.change_profile(&mut profile, wanted, &mut meeting);
                     }
                     EngineCommand::SetProfile(wanted) => {
-                        if wanted != profile {
-                            self.change_profile(&mut profile, wanted, &mut meeting);
-                        }
+                        self.set_profile(&mut profile, wanted, &mut meeting);
                     }
                     EngineCommand::Shutdown => {
                         if meeting.is_some() {
@@ -240,16 +240,63 @@ impl Engine {
                 },
                 Next::Closed => break,
             }
-            if state == MeetingState::Running
-                && let Some(current) = meeting.as_mut()
-            {
-                self.pump(current, &mut next_suggestion_id, profile, &finished_tx)
-                    .await;
-            }
+            self.pump_running(
+                state,
+                &mut meeting,
+                &mut next_suggestion_id,
+                profile,
+                &finished_tx,
+            )
+            .await;
         }
         // The command sender went away: shut down like `Shutdown` did.
         if meeting.is_some() {
             self.stop_meeting(&mut meeting).await;
+        }
+    }
+
+    /// A finished answer only matters while a meeting exists.
+    fn on_finished(&self, meeting: &mut Option<Meeting>, finished: suggest::Finished) {
+        if let Some(current) = meeting.as_mut() {
+            self.suggestion_finished(current, finished);
+        }
+    }
+
+    /// A finished piece only matters while a meeting exists.
+    fn on_piece(meeting: &mut Option<Meeting>, piece: PieceDone) {
+        if let Some(current) = meeting.as_mut() {
+            current
+                .policy
+                .piece_done(piece.speaker, piece.text.as_deref(), Instant::now());
+        }
+    }
+
+    /// Switch to `wanted` unless it is already active.
+    fn set_profile(
+        &self,
+        profile: &mut AssistProfile,
+        wanted: AssistProfile,
+        meeting: &mut Option<Meeting>,
+    ) {
+        if wanted != *profile {
+            self.change_profile(profile, wanted, meeting);
+        }
+    }
+
+    /// Run the policy after every wake-up, but only for a running meeting.
+    async fn pump_running(
+        &self,
+        state: MeetingState,
+        meeting: &mut Option<Meeting>,
+        next_suggestion_id: &mut u64,
+        profile: AssistProfile,
+        finished_tx: &mpsc::UnboundedSender<suggest::Finished>,
+    ) {
+        if state == MeetingState::Running
+            && let Some(current) = meeting.as_mut()
+        {
+            self.pump(current, next_suggestion_id, profile, finished_tx)
+                .await;
         }
     }
 
@@ -313,6 +360,12 @@ impl Engine {
                 .await;
             }
         }
+        self.release_drained(meeting);
+    }
+
+    /// Release `SourcesDrained` once, when the sources are drained and the
+    /// policy has nothing running or waiting.
+    fn release_drained(&self, meeting: &mut Meeting) {
         if meeting.drained && !meeting.drained_emitted && meeting.policy.is_quiet() {
             meeting.drained_emitted = true;
             self.emit(UiEvent::SourcesDrained);
@@ -330,12 +383,14 @@ impl Engine {
             return;
         }
         meeting.suggestion = None;
-        let outcome = match finished.end {
-            SuggestionEnd::Done => Outcome::Ok,
-            SuggestionEnd::Failed(_) | SuggestionEnd::Interrupted => Outcome::Failed,
-            SuggestionEnd::Cancelled => Outcome::Cancelled,
-        };
-        meeting.policy.request_finished(outcome, Instant::now());
+        meeting
+            .policy
+            .request_finished(end_outcome(&finished.end), Instant::now());
+        self.apply_end(meeting, finished);
+    }
+
+    /// Remember the answer and update the LLM status for how the run ended.
+    fn apply_end(&self, meeting: &mut Meeting, finished: suggest::Finished) {
         match finished.end {
             SuggestionEnd::Done => {
                 if !finished.shown.is_empty() {

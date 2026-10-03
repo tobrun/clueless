@@ -200,6 +200,30 @@ pub struct LlmConfig {
     pub enable_thinking: Option<bool>,
 }
 
+/// `LLM_PROFILE_PATH` became `LLM_NOTES_PATH`; refuse the old name loudly.
+fn check_renamed_profile_path(lookup: Lookup, problems: &mut Vec<String>) {
+    if lookup_value(lookup, "LLM_PROFILE_PATH").is_some() {
+        problems.push("LLM_PROFILE_PATH was renamed to LLM_NOTES_PATH".to_string());
+    }
+}
+
+/// `Some(parsed)` when valid or unset, `None` after recording a problem.
+fn parse_enable_thinking(lookup: Lookup, problems: &mut Vec<String>) -> Option<Option<bool>> {
+    let Some(raw) = lookup_value(lookup, "LLM_ENABLE_THINKING") else {
+        return Some(None);
+    };
+    match raw.as_str() {
+        "true" => Some(Some(true)),
+        "false" => Some(Some(false)),
+        _ => {
+            problems.push(format!(
+                "LLM_ENABLE_THINKING = \"{raw}\" is not \"true\" or \"false\""
+            ));
+            None
+        }
+    }
+}
+
 impl LlmConfig {
     /// Collects every problem into one `Err(Vec)` so a half-filled `.env`
     /// gets one actionable message, not a one-variable-at-a-time drill.
@@ -216,22 +240,8 @@ impl LlmConfig {
             Some(raw) => parse_number("LLM_TEMPERATURE", &raw, &mut problems),
             None => Some(0.4),
         };
-        if lookup_value(lookup, "LLM_PROFILE_PATH").is_some() {
-            problems.push("LLM_PROFILE_PATH was renamed to LLM_NOTES_PATH".to_string());
-        }
-        let enable_thinking = match lookup_value(lookup, "LLM_ENABLE_THINKING") {
-            Some(raw) => match raw.as_str() {
-                "true" => Some(Some(true)),
-                "false" => Some(Some(false)),
-                _ => {
-                    problems.push(format!(
-                        "LLM_ENABLE_THINKING = \"{raw}\" is not \"true\" or \"false\""
-                    ));
-                    None
-                }
-            },
-            None => Some(None),
-        };
+        check_renamed_profile_path(lookup, &mut problems);
+        let enable_thinking = parse_enable_thinking(lookup, &mut problems);
         if !problems.is_empty() {
             return Err(problems);
         }
