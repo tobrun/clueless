@@ -157,6 +157,11 @@ impl AutoPolicy {
     /// The running request ended.
     pub fn request_finished(&mut self, outcome: Outcome, now: Instant) {
         self.running = false;
+        if self.waiting {
+            // The hard deadline must not run out while a request holds the
+            // trigger back; give the busy speaker a fresh window.
+            self.hard_deadline = Some(now + self.timings.turn_settle + self.timings.turn_max_wait);
+        }
         match outcome {
             Outcome::Ok => self.paused_until = None,
             Outcome::Failed => {
@@ -311,6 +316,22 @@ mod tests {
             Decision::WaitUntil(millis(t0, 4400))
         );
         assert_eq!(p.poll(millis(t0, 4400), true), Decision::Fire);
+    }
+
+    #[test]
+    fn a_request_outlasting_the_hard_deadline_does_not_fire_a_busy_speaker_at_once() {
+        let t0 = Instant::now();
+        let mut p = policy(AssistProfile::Interview);
+        p.request_started(Origin::Manual, t0);
+        p.piece_done(Speaker::Them, Some("how would you scale that?"), t0);
+        // the request runs far past the original hard deadline (t0 + 4400 ms)
+        p.request_finished(Outcome::Ok, secs(t0, 10));
+        assert_eq!(
+            p.poll(secs(t0, 10), true),
+            Decision::WaitUntil(millis(t0, 10_400)),
+            "a busy speaker is waited for again, not answered mid-turn"
+        );
+        assert_eq!(p.poll(millis(t0, 14_400), true), Decision::Fire);
     }
 
     #[test]

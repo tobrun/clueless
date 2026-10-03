@@ -30,7 +30,7 @@ The response is read for its `text` field; word timestamps are not used.
 
 - Streaming works end to end (no proxy that buffers the whole SSE body).
 - The chat model follows a system prompt closely enough to answer in the requested shape and to answer with the single word PASS when it has nothing to say.
-- In Interview and Brainstorm the app sends one chat request per turn, never more than one open suggestion request plus one open compression request, and each carries the whole transcript.
+- In Interview the app sends one chat request per turn of the other side; in Brainstorm it sends one at each finished piece of the user's own speech, at least 8 s apart. Never more than one open suggestion request plus one open compression request, and each carries the whole transcript.
 - The ASR model is accurate at 16 kHz mono speech and finishes an utterance well under its timeout.
 - Responses carry no surprising error shape: non-200 bodies are surfaced (truncated) in the status line, so a readable `{"error": ...}` helps.
 

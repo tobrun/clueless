@@ -37,7 +37,7 @@ The suggest, clear and move keys are registered only while a meeting is running,
 
 ## No automatic answers
 
-Look at the trigger decision lines in the log (profile and outcome, no transcript text), then check in this order.
+The log has an info line with the profile and the outcome when the app decides to ask (`fired`) or to hold a request back (`waiting`), and a warning when a failed request starts the pause; none of them carry transcript text. A turn that is too short leaves no line at all. Check in this order.
 
 - The profile is Manual: the status line starts with the profile name; press `ctrl+alt+KeyP` or pick one from the status icon menu, or set `assist.start_profile`.
 - The turn was too short: turns under 12 characters without a question mark start no request.

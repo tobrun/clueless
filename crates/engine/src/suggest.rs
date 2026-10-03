@@ -8,7 +8,7 @@ use futures_util::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use clueless_types::events::{StatusSink, SuggestionEnd, UiEvent};
-use context::prompt::PromptMessage;
+use context::prompt::{PASS_TOKEN, PromptMessage};
 use llm::client::{LlmClient, LlmError};
 use llm::types::{ChatRequest, Message};
 
@@ -60,10 +60,10 @@ impl PassFilter {
 
     fn could_be_pass(&self) -> bool {
         let upper = self.held.trim_start().to_uppercase();
-        if "PASS".starts_with(&upper) {
+        if PASS_TOKEN.starts_with(&upper) {
             return true;
         }
-        upper.strip_prefix("PASS").is_some_and(|rest| {
+        upper.strip_prefix(PASS_TOKEN).is_some_and(|rest| {
             rest.chars()
                 .all(|c| c == '.' || c == '!' || c.is_whitespace())
         })
@@ -117,6 +117,12 @@ pub async fn run(
     hold_pass: bool,
     finished: tokio::sync::mpsc::UnboundedSender<Finished>,
 ) {
+    let guard = EndGuard {
+        id,
+        ui: ui.clone(),
+        finished,
+        done: false,
+    };
     let mut stream = llm.stream(request, cancel.clone());
     let started = Instant::now();
     let mut first_delta = true;
@@ -146,11 +152,59 @@ pub async fn run(
             None => break stream_closed_end(&cancel),
         }
     };
-    ui(UiEvent::SuggestionEnd {
-        id,
-        end: end.clone(),
-    });
-    let _ = finished.send(Finished { id, end, shown });
+    guard.finish(end, shown);
+}
+
+/// Reports the end of a run exactly once. If the task unwinds (a panic) before
+/// `finish`, dropping the guard reports an interrupted answer, so the engine
+/// never keeps a request open that no task is serving.
+struct EndGuard {
+    id: u64,
+    ui: StatusSink,
+    finished: tokio::sync::mpsc::UnboundedSender<Finished>,
+    done: bool,
+}
+
+impl EndGuard {
+    fn finish(mut self, end: SuggestionEnd, shown: String) {
+        self.done = true;
+        tracing::info!(
+            suggestion = self.id,
+            end = ?end,
+            shown_chars = shown.chars().count(),
+            "suggestion ended"
+        );
+        (self.ui)(UiEvent::SuggestionEnd {
+            id: self.id,
+            end: end.clone(),
+        });
+        let _ = self.finished.send(Finished {
+            id: self.id,
+            end,
+            shown,
+        });
+    }
+}
+
+impl Drop for EndGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        tracing::error!(
+            suggestion = self.id,
+            "suggestion task ended without a report"
+        );
+        (self.ui)(UiEvent::SuggestionEnd {
+            id: self.id,
+            end: SuggestionEnd::Interrupted,
+        });
+        let _ = self.finished.send(Finished {
+            id: self.id,
+            end: SuggestionEnd::Interrupted,
+            shown: String::new(),
+        });
+    }
 }
 
 /// A conservative bound so a suggestion that ignores cancellation can
@@ -168,7 +222,11 @@ pub async fn cancel_and_wait(task: &mut tokio::task::JoinHandle<()>, cancel: &Ca
 mod tests {
     use clueless_types::events::SuggestionEnd;
 
-    use super::{PassFilter, release_chunk, stream_closed_end};
+    use std::sync::{Arc, Mutex};
+
+    use clueless_types::events::UiEvent;
+
+    use super::{EndGuard, Finished, PassFilter, release_chunk, stream_closed_end};
 
     fn feed(chunks: &[&str]) -> Vec<Option<String>> {
         let mut filter = PassFilter::new();
@@ -240,5 +298,47 @@ mod tests {
         assert_eq!(stream_closed_end(&cancel), SuggestionEnd::Done);
         cancel.cancel();
         assert_eq!(stream_closed_end(&cancel), SuggestionEnd::Cancelled);
+    }
+
+    fn guard() -> (
+        EndGuard,
+        Arc<Mutex<Vec<UiEvent>>>,
+        tokio::sync::mpsc::UnboundedReceiver<Finished>,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let guard = EndGuard {
+            id: 7,
+            ui: Arc::new(move |event| sink.lock().unwrap().push(event)),
+            finished: tx,
+            done: false,
+        };
+        (guard, events, rx)
+    }
+
+    #[test]
+    fn a_guard_dropped_without_finishing_reports_an_interrupted_answer() {
+        let (guard, events, mut rx) = guard();
+        drop(guard);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![UiEvent::SuggestionEnd {
+                id: 7,
+                end: SuggestionEnd::Interrupted
+            }]
+        );
+        let finished = rx.try_recv().expect("the engine hears about it");
+        assert_eq!((finished.id, finished.end), (7, SuggestionEnd::Interrupted));
+    }
+
+    #[test]
+    fn a_finished_guard_reports_once_with_the_real_end() {
+        let (guard, events, mut rx) = guard();
+        guard.finish(SuggestionEnd::Done, "text".to_owned());
+        assert_eq!(events.lock().unwrap().len(), 1);
+        let finished = rx.try_recv().expect("one report");
+        assert_eq!(finished.shown, "text");
+        assert!(rx.try_recv().is_err(), "no second report from the drop");
     }
 }

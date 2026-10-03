@@ -18,6 +18,10 @@ pub const BASE_RULES: &str = concat!(
 /// The answer shape sentence that ends the Manual and Interview instructions.
 pub const ANSWER_SHAPE: &str = "Answer with one sentence that is the direct answer, then at most 3 short lines starting with a dash.";
 
+/// The word that means "nothing to add"; the engine hides an answer that is
+/// only this word.
+pub const PASS_TOKEN: &str = "PASS";
+
 /// The silence rule that ends the instruction of every automatic request.
 pub const PASS_RULE: &str = "If there is nothing useful to add, reply with exactly: PASS";
 
@@ -245,6 +249,12 @@ mod tests {
     }
     use clueless_types::Utterance;
     use clueless_types::UtteranceId;
+
+    #[test]
+    fn the_pass_rule_names_the_pass_token() {
+        assert!(PASS_RULE.ends_with(PASS_TOKEN));
+        assert_eq!(PASS_TOKEN, PASS_TOKEN.to_uppercase());
+    }
 
     /// A manual request under the Manual profile with no previous answer.
     fn build(

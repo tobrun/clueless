@@ -18,11 +18,11 @@ fn client(timeout_secs: u64) -> LlmClient {
     )
 }
 
-/// The profile text, when `LLM_PROFILE_PATH` points at a readable file.
-fn profile() -> Option<String> {
-    dotenvy::var("LLM_PROFILE_PATH").ok().map(|path| {
+/// The notes text, when `LLM_NOTES_PATH` points at a readable file.
+fn notes() -> Option<String> {
+    dotenvy::var("LLM_NOTES_PATH").ok().map(|path| {
         let path = strip_tilde(&path);
-        std::fs::read_to_string(path).expect("LLM_PROFILE_PATH is not readable")
+        std::fs::read_to_string(path).expect("LLM_NOTES_PATH is not readable")
     })
 }
 
@@ -36,10 +36,7 @@ fn strip_tilde(path: &str) -> String {
 }
 
 fn request(prompt: &str) -> ChatRequest {
-    let mut messages = profile()
-        .map(Message::system)
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut messages = notes().map(Message::system).into_iter().collect::<Vec<_>>();
     messages.push(Message::user(prompt));
     ChatRequest::new("ignored", messages, 220, 0.4, None)
 }

@@ -853,3 +853,27 @@ async fn starting_a_meeting_that_is_already_running_does_nothing() {
     );
     finish(&mut h).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clearing_the_feed_makes_the_model_forget_the_previous_answer() {
+    let asr = MockAsr::start().await;
+    let llm = MockLlm::start().await;
+    asr.enqueue_final(Respond::text("so how would you scale that?"));
+    asr.enqueue_final(Respond::Delay {
+        ms: 600,
+        then: Box::new(Respond::text("and what about the database layer?")),
+    });
+    llm.enqueue(LlmReply::stream(&["Shard by tenant."]));
+    let mut h = start(&asr, &llm, Speaker::Them, 2, opts(AssistProfile::Interview)).await;
+
+    h.wait_until(WAIT, |events| events.iter().any(is_end)).await;
+    h.cmd(EngineCommand::ClearSuggestion);
+    assert!(llm.wait_bodies(2, WAIT).await, "the second turn asks again");
+
+    let second = user_content(&llm.bodies()[1]);
+    assert!(
+        !second.contains("YOUR PREVIOUS ANSWER"),
+        "a cleared feed leaves nothing to repeat: {second}"
+    );
+    finish(&mut h).await;
+}

@@ -147,7 +147,7 @@ fn stream_loop(
                         send_segment(speaker, segment, pipes);
                     }
                 }
-                sync_them_open_t0(speaker, &machine, pipes);
+                sync_open_state(speaker, &machine, pipes);
             }
             SourceRead::Empty => {
                 clock.follow_wall_clock();
@@ -203,7 +203,7 @@ fn stream_loop(
                 if let Some(segment) = machine.close_segment() {
                     send_segment(speaker, segment, pipes);
                 }
-                sync_them_open_t0(speaker, &machine, pipes);
+                sync_open_state(speaker, &machine, pipes);
                 clock.set_infinite();
                 pipes.drain.source_ended();
                 return;
@@ -216,7 +216,7 @@ fn stream_loop(
     if let Some(segment) = machine.flush() {
         send_segment(speaker, segment, pipes);
     }
-    sync_them_open_t0(speaker, &machine, pipes);
+    sync_open_state(speaker, &machine, pipes);
     clock.set_infinite();
     pipes.drain.source_ended();
 }
@@ -235,17 +235,18 @@ fn close_and_reanchor(
     if let Some(segment) = machine.close_segment() {
         send_segment(speaker, segment, pipes);
     }
-    sync_them_open_t0(speaker, machine, pipes);
+    sync_open_state(speaker, machine, pipes);
     vad.reset();
     resampler.reset();
     clock.anchor_now();
 }
 
-/// Mirror the segmenter's open-segment state for the Me echo hold: the t0 of
-/// Them's open segment, or `u64::MAX` when none is open. Always called after
+/// Mirror the segmenter's open-segment state: whether the speaker has an open
+/// segment (the busy record the automatic-request logic reads), and for the
+/// Me echo hold the t0 of Them's open segment, or `u64::MAX` when none is open. Always called after
 /// any `send_segment` of a close, so a hold that sees the open t0 cleared
 /// already sees the closed final registered in `them_pending`.
-fn sync_them_open_t0(speaker: Speaker, machine: &Machine, pipes: &StreamPipes) {
+fn sync_open_state(speaker: Speaker, machine: &Machine, pipes: &StreamPipes) {
     pipes
         .activity
         .open
