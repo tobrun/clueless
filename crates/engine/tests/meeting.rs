@@ -125,7 +125,7 @@ async fn closed_llm_and_missing_asr_model_report_errors_but_run() {
     let llm = MockLlm::start().await;
     let opts = MeetingOpts {
         llm_port: Some(closed_port().await),
-        asr_model: Some("istupakov/parakeet-tdt-0.6b-v3-onnx".to_owned()),
+        asr_model: Some("model-not-on-the-server".to_owned()),
         ..MeetingOpts::default()
     };
     let mut h = running_me_only(&asr, &llm, opts).await;
@@ -143,7 +143,7 @@ async fn closed_llm_and_missing_asr_model_report_errors_but_run() {
         statuses.iter().any(|(source, level, text)| {
             *source == StatusSource::Asr
                 && *level == StatusLevel::Error
-                && text.contains("parakeet-tdt-0.6b-v3-onnx")
+                && text.contains("model-not-on-the-server")
         }),
         "Asr Error naming the model: {statuses:?}"
     );
