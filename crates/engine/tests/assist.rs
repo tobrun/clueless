@@ -808,3 +808,48 @@ async fn suggestion_ids_increase_across_manual_and_automatic_requests() {
     assert_eq!(starts(&events), vec![1, 2, 3]);
     finish(&mut h).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interview_asks_right_after_the_settle_time_when_them_is_quiet() {
+    let asr = MockAsr::start().await;
+    let llm = MockLlm::start().await;
+    asr.enqueue_final(Respond::text(QUESTION));
+    // A long hard deadline: only a wrongly busy speaker could make the
+    // request wait for it.
+    let timings = EngineTimings {
+        turn_settle: Duration::from_millis(50),
+        turn_max_wait: Duration::from_secs(5),
+        ..fast_timings()
+    };
+    let mut h = start(
+        &asr,
+        &llm,
+        Speaker::Them,
+        1,
+        opts_with(AssistProfile::Interview, timings),
+    )
+    .await;
+
+    assert!(
+        llm.wait_bodies(1, Duration::from_millis(2500)).await,
+        "a quiet speaker is asked about after the settle time, not the hard deadline"
+    );
+    finish(&mut h).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starting_a_meeting_that_is_already_running_does_nothing() {
+    let asr = MockAsr::start().await;
+    let llm = MockLlm::start().await;
+    let mut h = start(&asr, &llm, Speaker::Me, 1, opts(AssistProfile::Manual)).await;
+    assert!(h.wait_state(MeetingState::Running, WAIT).await);
+
+    h.cmd(EngineCommand::StartMeeting);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert_eq!(
+        h.states(),
+        vec![MeetingState::Starting, MeetingState::Running]
+    );
+    finish(&mut h).await;
+}

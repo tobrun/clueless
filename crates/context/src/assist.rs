@@ -138,9 +138,6 @@ impl AutoPolicy {
 
     /// Append committed text; start waiting once there is enough of it.
     fn collect_text(&mut self, text: &str, now: Instant) {
-        if !self.collected.is_empty() {
-            self.collected.push(' ');
-        }
         self.collected.push_str(text);
         if !self.waiting && enough_text(&self.collected) {
             self.waiting = true;
