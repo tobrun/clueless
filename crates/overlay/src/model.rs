@@ -572,42 +572,60 @@ mod tests {
     /// dropping a field from any of `apply`'s literals must fail here.
     #[test]
     fn apply_reports_exactly_the_changed_parts() {
+        // Assert the full report so deleting any field write in `apply`
+        // fails: (status, ticker, suggestion, meeting, hotkeys, repaints).
+        fn report(
+            c: Changes,
+            status: bool,
+            ticker: bool,
+            suggestion: bool,
+            meeting: bool,
+            hotkeys: bool,
+        ) {
+            assert_eq!(c.status, status);
+            assert_eq!(c.ticker, ticker);
+            assert_eq!(c.suggestion, suggestion);
+            assert_eq!(c.meeting, meeting);
+            assert_eq!(c.hotkeys, hotkeys);
+            assert_eq!(c.repaints(), status || ticker || suggestion);
+        }
+
         let mut m = UiModel::default();
         let c = m.apply(UiEvent::Status {
             source: StatusSource::App,
             level: StatusLevel::Info,
             text: "ready".into(),
         });
-        assert!(c.status && !c.ticker && !c.suggestion && !c.meeting && !c.hotkeys);
+        report(c, true, false, false, false, false);
 
         let c = m.apply(UiEvent::TranscriptInterim {
             id: uid(Speaker::Me, 0),
             text: "hello".into(),
         });
-        assert!(c.ticker && !c.status && !c.suggestion);
+        report(c, false, true, false, false, false);
 
         m.apply(UiEvent::SuggestionStart { id: 1 });
         let c = m.apply(UiEvent::SuggestionStart { id: 2 });
-        assert!(c.suggestion && !c.status && !c.ticker);
+        report(c, false, false, true, false, false);
         let c = m.apply(UiEvent::SuggestionDelta {
             id: 2,
             text: "try".into(),
         });
-        assert!(c.suggestion && !c.status && !c.ticker);
+        report(c, false, false, true, false, false);
         let c = m.apply(UiEvent::SuggestionEnd {
             id: 2,
             end: SuggestionEnd::Cancelled,
         });
-        assert!(c.suggestion && !c.status && !c.ticker);
+        report(c, false, false, true, false, false);
         let c = m.apply(UiEvent::ClearSuggestion);
-        assert!(c.suggestion && !c.status && !c.ticker);
+        report(c, false, false, true, false, false);
 
         // Running registers the meeting keys, so the switch reports both;
         // a repeated Running changes nothing but `meeting` itself.
         let c = m.apply(UiEvent::MeetingState(MeetingState::Running));
-        assert!(c.meeting && c.hotkeys && !c.repaints());
+        report(c, false, false, false, true, true);
         let c = m.apply(UiEvent::MeetingState(MeetingState::Running));
-        assert!(c.meeting && !c.hotkeys);
+        report(c, false, false, false, true, false);
 
         // Ignored events report nothing; a drop that actually removes a
         // line reports the ticker.
@@ -618,11 +636,11 @@ mod tests {
         let c = m.apply(UiEvent::TranscriptDropped {
             id: uid(Speaker::Me, 0),
         });
-        assert!(c.ticker && !c.status && !c.suggestion);
+        report(c, false, true, false, false, false);
         let c = m.apply(UiEvent::TranscriptDropped {
             id: uid(Speaker::Them, 99),
         });
-        assert!(!c.status && !c.ticker && !c.suggestion);
+        report(c, false, false, false, false, false);
         assert_eq!(m.apply(UiEvent::SourcesDrained), Changes::NONE);
     }
 
