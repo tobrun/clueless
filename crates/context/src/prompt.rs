@@ -1,19 +1,52 @@
 //! Prompt building: one system and one user message whose transcript part is
 //! append-only, so the server's prefix cache keeps hitting (C-prompt-prefix-stable).
 
-use clueless_types::Speaker;
+use clueless_types::{AssistProfile, Origin, Speaker};
 
 use crate::store::TranscriptStore;
 
-/// The fixed rules of the system message, including the answer shape.
-pub const RULES: &str = concat!(
-    "You are a live meeting assistant. You see the transcript of a meeting in ",
-    "progress and tell the user what to say next.\n",
-    "Answer with one sentence that is the direct answer, then at most 3 short ",
-    "lines starting with a dash.\n",
-    "Use at most 60 words in total. Write plain text, no markdown. ",
+/// The system message shared by every profile (C-prompt-prefix-stable): who
+/// is who, plain text, the length cap and the language rule. The answer shape
+/// lives in the instruction at the end of the user message.
+pub const BASE_RULES: &str = concat!(
+    "You are a live meeting assistant. You see the transcript of a meeting in progress. ",
+    "\"Me\" is the user you help. \"Them\" is the other side.\n",
+    "Write plain text, no markdown. Use at most 60 words. ",
     "Answer in the language of the conversation.",
 );
+
+/// The answer shape sentence that ends the Manual and Interview instructions.
+pub const ANSWER_SHAPE: &str = "Answer with one sentence that is the direct answer, then at most 3 short lines starting with a dash.";
+
+/// The silence rule that ends the instruction of every automatic request.
+pub const PASS_RULE: &str = "If there is nothing useful to add, reply with exactly: PASS";
+
+const INTERVIEW_SENTENCE: &str = "If Them asked a question or raised a point that needs a reply from me, give me the answer to say.";
+
+const BRAINSTORM_SENTENCE: &str = "I am talking. Give me up to 3 short lines starting with a dash: ideas, angles or facts that extend what I am saying and that I have not said yet.";
+
+const PREVIOUS_ANSWER_HEADER: &str = "YOUR PREVIOUS ANSWER (already shown, add only what is new):";
+
+/// How many characters of the previous answer the prompt carries.
+const PREVIOUS_ANSWER_CHARS: usize = 600;
+
+/// What a request asks for: the active profile, whether the user pressed the
+/// key or the app decided, and the last answer shown (if any).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ask<'a> {
+    pub profile: AssistProfile,
+    pub origin: Origin,
+    pub previous_answer: Option<&'a str>,
+}
+
+/// The result of [`build_for`]: the two messages plus the store's
+/// `last_line_id` read under the same borrow, so the caller can store it as
+/// the next `last_trigger_line_id` without a second look at the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Built {
+    pub messages: Vec<PromptMessage>,
+    pub last_line_id: u64,
+}
 
 /// One chat message as the prompt builder produces it. The engine converts
 /// these to the LLM client's message type.
@@ -64,22 +97,41 @@ pub fn transcript_part(store: &TranscriptStore) -> String {
     parts.join("\n")
 }
 
-/// Build the two chat messages: the system message (rules, plus the profile
-/// when one is configured) and the user message (transcript part, a blank
-/// line, then the tail of in-progress text and the task sentence).
-///
-/// `last_trigger_line_id` is the store's `last_line_id` at the previous
-/// trigger (0 before the first one) and decides which Them lines the task
-/// quotes.
+/// Compatibility wrapper for the engine until it switches to [`build_for`]:
+/// a manual request under the Manual profile, no previous answer.
 pub fn build(
     store: &TranscriptStore,
-    profile: Option<&str>,
+    notes: Option<&str>,
     in_progress: &[InProgressText],
     last_trigger_line_id: u64,
 ) -> Vec<PromptMessage> {
-    let system = match profile {
-        Some(text) => format!("{RULES}\n\nPROFILE:\n{text}"),
-        None => RULES.to_string(),
+    let ask = Ask {
+        profile: AssistProfile::Manual,
+        origin: Origin::Manual,
+        previous_answer: None,
+    };
+    build_for(store, notes, in_progress, last_trigger_line_id, &ask).messages
+}
+
+/// Build the two chat messages: the system message (`BASE_RULES`, plus the
+/// notes under `ABOUT THE USER:` when set - identical for every profile) and
+/// the user message (transcript part, a blank line, then the tail: the
+/// in-progress block, the previous answer block and the instruction, separated
+/// by blank lines).
+///
+/// `last_trigger_line_id` is the store's `last_line_id` at the previous
+/// trigger (0 before the first one) and decides which Them lines the
+/// instruction quotes.
+pub fn build_for(
+    store: &TranscriptStore,
+    notes: Option<&str>,
+    in_progress: &[InProgressText],
+    last_trigger_line_id: u64,
+    ask: &Ask,
+) -> Built {
+    let system = match notes {
+        Some(text) => format!("{BASE_RULES}\n\nABOUT THE USER:\n{text}"),
+        None => BASE_RULES.to_string(),
     };
 
     let mut tail_parts = Vec::new();
@@ -91,29 +143,64 @@ pub fn build(
         }
         tail_parts.push(block);
     }
-    tail_parts.push(task_sentence(store, in_progress, last_trigger_line_id));
+    if let Some(previous) = ask.previous_answer {
+        let cut: String = previous.chars().take(PREVIOUS_ANSWER_CHARS).collect();
+        tail_parts.push(format!("{PREVIOUS_ANSWER_HEADER}\n{cut}"));
+    }
+    tail_parts.push(instruction(store, in_progress, last_trigger_line_id, ask));
 
     let user = format!("{}\n\n{}", transcript_part(store), tail_parts.join("\n\n"));
 
-    vec![
-        PromptMessage {
-            role: "system".to_string(),
-            content: system,
-        },
-        PromptMessage {
-            role: "user".to_string(),
-            content: user,
-        },
-    ]
+    Built {
+        messages: vec![
+            PromptMessage {
+                role: "system".to_string(),
+                content: system,
+            },
+            PromptMessage {
+                role: "user".to_string(),
+                content: user,
+            },
+        ],
+        last_line_id: store.last_line_id(),
+    }
 }
 
-/// The task sentence: the Them text since the last trigger, quoted, when
-/// there is one; the generic question otherwise.
-fn task_sentence(
+/// The last block of the user message, by profile and origin. Manual requests
+/// never carry the PASS rule: an explicit request must produce an answer.
+fn instruction(
     store: &TranscriptStore,
     in_progress: &[InProgressText],
     last_trigger_line_id: u64,
+    ask: &Ask,
 ) -> String {
+    let automatic = ask.origin == Origin::Auto;
+    match (ask.profile, automatic) {
+        (AssistProfile::Brainstorm, true) => format!("{BRAINSTORM_SENTENCE}\n{PASS_RULE}"),
+        (AssistProfile::Brainstorm, false) => BRAINSTORM_SENTENCE.to_string(),
+        (AssistProfile::Interview, true) => {
+            let ask_line = match them_quote(store, in_progress, last_trigger_line_id) {
+                Some(quote) => format!("The last thing Them said was: \"{quote}\".\n"),
+                None => String::new(),
+            };
+            format!("{ask_line}{INTERVIEW_SENTENCE} {ANSWER_SHAPE}\n{PASS_RULE}")
+        }
+        (AssistProfile::Manual | AssistProfile::Interview, _) => {
+            format!(
+                "{}\n{ANSWER_SHAPE}",
+                task_sentence(store, in_progress, last_trigger_line_id)
+            )
+        }
+    }
+}
+
+/// The Them text since the last trigger (finals, then in-progress), joined
+/// and cut to its last 600 characters; `None` when Them said nothing.
+fn them_quote(
+    store: &TranscriptStore,
+    in_progress: &[InProgressText],
+    last_trigger_line_id: u64,
+) -> Option<String> {
     let mut them_texts: Vec<&str> = Vec::new();
     for utterance in store.utterances_after(last_trigger_line_id) {
         if utterance.id.speaker == Speaker::Them && !utterance.text.is_empty() {
@@ -126,16 +213,30 @@ fn task_sentence(
         }
     }
     if them_texts.is_empty() {
-        return String::from("Suggest what I should say next.");
+        return None;
     }
     let joined = them_texts.join(" ");
     let char_count = joined.chars().count();
-    let quoted: String = if char_count > 600 {
+    Some(if char_count > 600 {
         joined.chars().skip(char_count - 600).collect()
     } else {
         joined
-    };
-    format!("The last thing Them said was: \"{quoted}\". Tell me what to say now.")
+    })
+}
+
+/// The task sentence: the Them text since the last trigger, quoted, when
+/// there is one; the generic question otherwise.
+fn task_sentence(
+    store: &TranscriptStore,
+    in_progress: &[InProgressText],
+    last_trigger_line_id: u64,
+) -> String {
+    match them_quote(store, in_progress, last_trigger_line_id) {
+        Some(quoted) => {
+            format!("The last thing Them said was: \"{quoted}\". Tell me what to say now.")
+        }
+        None => String::from("Suggest what I should say next."),
+    }
 }
 
 #[cfg(test)]
@@ -182,8 +283,43 @@ mod tests {
         assert!(user_after_four.contains("[00:06] Me: go ahead"));
     }
 
+    fn ask(profile: AssistProfile, origin: Origin) -> Ask<'static> {
+        Ask {
+            profile,
+            origin,
+            previous_answer: None,
+        }
+    }
+
+    const SHAPE: &str = "Answer with one sentence that is the direct answer, then at most 3 short lines starting with a dash.";
+    const PASS: &str = "If there is nothing useful to add, reply with exactly: PASS";
+
     #[test]
-    fn profile_goes_into_the_system_message_and_is_stable() {
+    fn manual_without_notes_has_bare_rules_and_the_task_then_the_answer_shape() {
+        let store = TranscriptStore::new();
+        let built = build_for(
+            &store,
+            None,
+            &[],
+            0,
+            &ask(AssistProfile::Manual, Origin::Manual),
+        );
+        assert_eq!(
+            built.messages[0].content,
+            "You are a live meeting assistant. You see the transcript of a meeting in progress. \
+             \"Me\" is the user you help. \"Them\" is the other side.\n\
+             Write plain text, no markdown. Use at most 60 words. \
+             Answer in the language of the conversation."
+        );
+        assert_eq!(built.messages[0].content, BASE_RULES);
+        assert_eq!(
+            built.messages[1].content,
+            format!("TRANSCRIPT SO FAR:\n\nSuggest what I should say next.\n{SHAPE}")
+        );
+    }
+
+    #[test]
+    fn notes_end_the_system_message_under_about_the_user() {
         let store = TranscriptStore::new();
         let first = build(&store, Some("Daniel, backend engineer"), &[], 0);
         let second = build(&store, Some("Daniel, backend engineer"), &[], 0);
@@ -191,16 +327,222 @@ mod tests {
         assert_eq!(first[0], second[0]);
         assert_eq!(
             first[0].content,
-            format!("{RULES}\n\nPROFILE:\nDaniel, backend engineer"),
+            format!("{BASE_RULES}\n\nABOUT THE USER:\nDaniel, backend engineer"),
         );
-        assert!(first[0].content.ends_with("Daniel, backend engineer"));
+        assert!(
+            first[0]
+                .content
+                .ends_with("ABOUT THE USER:\nDaniel, backend engineer")
+        );
+        assert!(!first[0].content.contains("PROFILE:"));
     }
 
     #[test]
-    fn system_message_without_profile_is_just_the_rules() {
+    fn interview_automatic_quotes_them_and_ends_with_the_pass_rule() {
+        let mut store = TranscriptStore::new();
+        store.push(utterance(
+            Speaker::Them,
+            0,
+            5000,
+            "can you ship it tomorrow",
+        ));
+        let built = build_for(
+            &store,
+            None,
+            &[],
+            0,
+            &ask(AssistProfile::Interview, Origin::Auto),
+        );
+        let user = &built.messages[1].content;
+        assert!(user.ends_with(&format!(
+            "\n\nThe last thing Them said was: \"can you ship it tomorrow\".\n\
+             If Them asked a question or raised a point that needs a reply from me, \
+             give me the answer to say. {SHAPE}\n{PASS}"
+        )));
+    }
+
+    #[test]
+    fn interview_automatic_without_new_them_text_drops_the_quote_line() {
         let store = TranscriptStore::new();
-        let messages = build(&store, None, &[], 0);
-        assert_eq!(messages[0].content, RULES);
+        let built = build_for(
+            &store,
+            None,
+            &[],
+            0,
+            &ask(AssistProfile::Interview, Origin::Auto),
+        );
+        assert_eq!(
+            built.messages[1].content,
+            format!(
+                "TRANSCRIPT SO FAR:\n\nIf Them asked a question or raised a point that needs \
+                 a reply from me, give me the answer to say. {SHAPE}\n{PASS}"
+            )
+        );
+    }
+
+    #[test]
+    fn interview_manual_is_the_manual_instruction_without_pass() {
+        let mut store = TranscriptStore::new();
+        store.push(utterance(
+            Speaker::Them,
+            0,
+            5000,
+            "can you ship it tomorrow",
+        ));
+        let interview = build_for(
+            &store,
+            None,
+            &[],
+            0,
+            &ask(AssistProfile::Interview, Origin::Manual),
+        );
+        let manual = build_for(
+            &store,
+            None,
+            &[],
+            0,
+            &ask(AssistProfile::Manual, Origin::Manual),
+        );
+        assert_eq!(interview.messages, manual.messages);
+        let user = &interview.messages[1].content;
+        assert!(user.ends_with(&format!(
+            "The last thing Them said was: \"can you ship it tomorrow\". \
+             Tell me what to say now.\n{SHAPE}"
+        )));
+        assert!(!user.contains("PASS"));
+    }
+
+    #[test]
+    fn brainstorm_automatic_ends_with_pass_and_manual_has_none() {
+        let mut store = TranscriptStore::new();
+        store.push(utterance(Speaker::Me, 0, 5000, "we could cache it"));
+        let sentence = "I am talking. Give me up to 3 short lines starting with a dash: \
+                        ideas, angles or facts that extend what I am saying and that I have \
+                        not said yet.";
+        let auto = build_for(
+            &store,
+            None,
+            &[],
+            0,
+            &ask(AssistProfile::Brainstorm, Origin::Auto),
+        );
+        assert!(
+            auto.messages[1]
+                .content
+                .ends_with(&format!("\n\n{sentence}\n{PASS}"))
+        );
+        let manual = build_for(
+            &store,
+            None,
+            &[],
+            0,
+            &ask(AssistProfile::Brainstorm, Origin::Manual),
+        );
+        assert!(
+            manual.messages[1]
+                .content
+                .ends_with(&format!("\n\n{sentence}"))
+        );
+        assert!(!manual.messages[1].content.contains("PASS"));
+    }
+
+    #[test]
+    fn previous_answer_is_cut_to_600_characters_and_sits_before_the_instruction() {
+        let store = TranscriptStore::new();
+        let previous = format!("{}{}", "x".repeat(600), "z".repeat(100));
+        let ask = Ask {
+            profile: AssistProfile::Manual,
+            origin: Origin::Manual,
+            previous_answer: Some(&previous),
+        };
+        let user = build_for(&store, None, &[], 0, &ask).messages[1]
+            .content
+            .clone();
+        assert_eq!(
+            user,
+            format!(
+                "TRANSCRIPT SO FAR:\n\n\
+                 YOUR PREVIOUS ANSWER (already shown, add only what is new):\n{}\n\n\
+                 Suggest what I should say next.\n{SHAPE}",
+                "x".repeat(600)
+            )
+        );
+        assert!(!user.contains('z'));
+    }
+
+    #[test]
+    fn tail_order_is_in_progress_then_previous_answer_then_instruction() {
+        let store = TranscriptStore::new();
+        let in_progress = [InProgressText {
+            speaker: Speaker::Me,
+            t0_ms: 3000,
+            t1_ms: 4000,
+            text: "so I think".to_string(),
+        }];
+        let ask = Ask {
+            profile: AssistProfile::Manual,
+            origin: Origin::Manual,
+            previous_answer: Some("Yes, tomorrow."),
+        };
+        let user = build_for(&store, None, &in_progress, 0, &ask).messages[1]
+            .content
+            .clone();
+        assert_eq!(
+            user,
+            format!(
+                "TRANSCRIPT SO FAR:\n\n\
+                 IN PROGRESS (may be incomplete):\n[00:03] Me: so I think\n\n\
+                 YOUR PREVIOUS ANSWER (already shown, add only what is new):\nYes, tomorrow.\n\n\
+                 Suggest what I should say next.\n{SHAPE}"
+            )
+        );
+    }
+
+    #[test]
+    fn system_message_and_transcript_part_are_identical_across_profiles() {
+        let mut store = TranscriptStore::new();
+        store.push(utterance(Speaker::Them, 0, 1000, "hello there"));
+        store.push(utterance(Speaker::Me, 0, 2500, "hi"));
+        let part = transcript_part(&store);
+        let builds: Vec<Built> = AssistProfile::ALL
+            .iter()
+            .map(|profile| build_for(&store, Some("notes"), &[], 0, &ask(*profile, Origin::Auto)))
+            .collect();
+        for built in &builds {
+            assert_eq!(built.messages[0], builds[0].messages[0]);
+            assert!(
+                built.messages[1]
+                    .content
+                    .starts_with(&format!("{part}\n\n"))
+            );
+        }
+    }
+
+    #[test]
+    fn build_returns_the_stores_last_line_id() {
+        let mut store = TranscriptStore::new();
+        store.push(utterance(Speaker::Them, 0, 1000, "one"));
+        store.push(utterance(Speaker::Me, 0, 2000, "two"));
+        let built = build_for(
+            &store,
+            None,
+            &[],
+            0,
+            &ask(AssistProfile::Manual, Origin::Manual),
+        );
+        assert_eq!(built.last_line_id, store.last_line_id());
+        assert_ne!(built.last_line_id, 0);
+        assert_eq!(
+            build_for(
+                &TranscriptStore::new(),
+                None,
+                &[],
+                0,
+                &ask(AssistProfile::Manual, Origin::Manual)
+            )
+            .last_line_id,
+            0
+        );
     }
 
     #[test]
@@ -216,10 +558,10 @@ mod tests {
         ));
 
         let user = user_message(build(&store, None, &[], trigger));
-        assert!(user.ends_with(
+        assert!(user.ends_with(&format!(
             "The last thing Them said was: \"can you ship it tomorrow\". \
-             Tell me what to say now."
-        ));
+             Tell me what to say now.\n{SHAPE}"
+        )));
     }
 
     #[test]
@@ -236,10 +578,10 @@ mod tests {
         }];
 
         let user = user_message(build(&store, None, &in_progress, trigger));
-        assert!(user.ends_with(
+        assert!(user.ends_with(&format!(
             "The last thing Them said was: \"the release is late and tests fail \
-             so we need more time\". Tell me what to say now."
-        ));
+             so we need more time\". Tell me what to say now.\n{SHAPE}"
+        )));
     }
 
     #[test]
@@ -254,7 +596,7 @@ mod tests {
 
         let user = user_message(build(&store, None, &[], trigger));
         assert!(user.ends_with(&format!(
-            "The last thing Them said was: \"{}\". Tell me what to say now.",
+            "The last thing Them said was: \"{}\". Tell me what to say now.\n{SHAPE}",
             "b".repeat(600)
         )));
     }
@@ -267,7 +609,7 @@ mod tests {
         store.push(utterance(Speaker::Me, 0, 3000, "my answer"));
 
         let user = user_message(build(&store, None, &[], trigger));
-        assert!(user.ends_with("Suggest what I should say next."));
+        assert!(user.ends_with(&format!("Suggest what I should say next.\n{SHAPE}")));
     }
 
     #[test]
@@ -288,10 +630,10 @@ mod tests {
         assert!(transcript_at < in_progress_at);
         assert!(in_progress_at < task_at);
         assert!(user.contains("[00:09] Them: should we merge it"));
-        assert!(user.ends_with(
+        assert!(user.ends_with(&format!(
             "The last thing Them said was: \"should we merge it\". \
-             Tell me what to say now."
-        ));
+             Tell me what to say now.\n{SHAPE}"
+        )));
     }
 
     #[test]
@@ -309,7 +651,7 @@ mod tests {
         let user = user_message(build(&store, None, &[], 0));
         assert_eq!(
             user,
-            "TRANSCRIPT SO FAR:\n\nSuggest what I should say next."
+            format!("TRANSCRIPT SO FAR:\n\nSuggest what I should say next.\n{SHAPE}")
         );
         assert!(!user.contains("\n\n\n"));
         assert!(!user.ends_with('\n'));

@@ -1157,10 +1157,10 @@ async fn notes_land_in_system_message() {
     assert_eq!(messages[0].0, "system");
     assert!(
         messages[0].1.ends_with("Prefers concise bullet answers."),
-        "system message ends with the profile file: {}",
+        "system message ends with the notes file: {}",
         messages[0].1
     );
-    assert!(messages[0].1.contains("PROFILE:"));
+    assert!(messages[0].1.contains("ABOUT THE USER:"));
     finish(&mut h).await;
     let _ = std::fs::remove_file(&path);
 }
