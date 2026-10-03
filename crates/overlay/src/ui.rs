@@ -1,8 +1,9 @@
-//! The wiring: a thread-local [`Ui`] holding the retained views and the pure
-//! [`UiModel`], the any-thread [`post`] entry point, and [`run`], which
-//! builds the panel, status item and hotkeys and enters the AppKit run loop
-//! (spec: AppKit objects live only on the main thread; other threads send
-//! `UiEvent` values through the main dispatch queue).
+//! The wiring: a thread-local [`Ui`] owning both windows (standard window
+//! and hidden overlay panel), their view trees, the pure [`UiModel`] and the
+//! [`Presentation`] that decides which window is on screen; the any-thread
+//! [`post`] entry point; and [`run`], which builds everything and enters the
+//! AppKit run loop (spec: AppKit objects live only on the main thread; other
+//! threads send `UiEvent` values through the main dispatch queue).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,16 +18,19 @@ use dispatch2::DispatchQueue;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSWindow};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 
+use crate::app_menu;
 use crate::hotkeys::{
     self, HotkeyAction, MOVE_STEP, ParsedHotkey, register_always_on, sync_meeting_keys,
 };
+use crate::mode::{self, Presentation, UiMode};
 use crate::model::UiModel;
-use crate::panel::OverlayPanel;
+use crate::panel::{self, OverlayPanel};
 use crate::status_item::StatusItemController;
-use crate::views::{self, OverlayViews};
+use crate::views::{self, OverlayViews, ViewStyle};
+use crate::window::StandardWindow;
 
 /// Quit deadline after `Shutdown` (terminate on `MeetingState(Idle)` or
 /// after 6 s at the latest; the rationale is in `docs/decisions.md`).
@@ -35,15 +39,20 @@ const QUIT_DEADLINE_SECS: f64 = 6.0;
 /// Everything the main thread owns. Reachable only through [`with_ui`].
 struct Ui {
     model: UiModel,
+    /// The hidden-mode panel; ordered in only while [`UiMode::Hidden`].
     panel: Retained<OverlayPanel>,
-    views: OverlayViews,
+    panel_views: OverlayViews,
+    /// The standard-mode window; ordered in only while [`UiMode::Standard`]
+    /// and visible. Owns the saved frame (spec D-frame-store).
+    main: Retained<StandardWindow>,
+    window_views: OverlayViews,
     status_item: StatusItemController,
     commands: CommandSink,
     hotkey_manager: Option<GlobalHotKeyManager>,
     parsed_hotkeys: Vec<ParsedHotkey>,
     /// (id, action) of the hotkeys currently registered.
     registered: Vec<(u32, HotkeyAction)>,
-    overlay_visible: bool,
+    presentation: Presentation,
     quit_timer: Option<Retained<NSTimer>>,
 }
 
@@ -53,6 +62,23 @@ thread_local! {
 
 fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     UI.with(|cell| cell.borrow_mut().as_mut().map(f))
+}
+
+impl Ui {
+    /// One move-key press applied to the window of the active mode. Hidden
+    /// mode mirrors the panel's new frame back into the standard window,
+    /// which saves it (spec D-move-keys + D-frame-store: the frame is the
+    /// single source of truth for where the UI is).
+    fn move_active(&mut self, dx: f64, dy: f64) {
+        match self.presentation.mode {
+            UiMode::Standard => self.main.move_by(dx, dy),
+            UiMode::Hidden => {
+                self.panel.move_by(dx, dy);
+                let frame = self.panel.content_frame();
+                self.main.set_content_frame(frame);
+            }
+        }
+    }
 }
 
 /// Hotkey id -> action for every parsed hotkey; only registered keys fire,
@@ -65,8 +91,62 @@ fn actions() -> &'static Mutex<HashMap<u32, HotkeyAction>> {
     ACTION_BY_ID.get_or_init(Default::default)
 }
 
-/// Apply an action on the main thread; `panel` and `status_item` changes
-/// happen here, engine commands go out through the sink.
+/// Rebuild the status menu from the current model and presentation; every
+/// menu change goes through here so the titles always come from
+/// [`mode::menu_titles`] (spec D-mode-menu).
+fn refresh_menu(ui: &Ui, mtm: MainThreadMarker) {
+    let running = ui.model.meeting() == MeetingState::Running;
+    ui.status_item.rebuild_menu(running, ui.presentation, mtm);
+}
+
+/// Order the active mode's window in and the other one out (spec D-mode-menu
+/// invariants: at most one window on screen; the invisible mode's window is
+/// ordered out).
+fn show_active_window(ui: &Ui, mtm: MainThreadMarker) {
+    match ui.presentation.mode {
+        UiMode::Standard => {
+            ui.panel.orderOut(None);
+            ui.main.makeKeyAndOrderFront(None);
+            NSApplication::sharedApplication(mtm).activate();
+        }
+        UiMode::Hidden => {
+            ui.main.orderOut(None);
+            ui.panel.orderFrontRegardless();
+        }
+    }
+}
+
+/// Switch between the two windows. Into hidden mode: the panel copies the
+/// standard window's content frame, fitted to the screen (spec
+/// D-frame-mapping, D-fit), click-through is off again (spec
+/// D-click-through-standard) and focus returns to the app that had it (spec
+/// D-mode-switch; `deactivate` is verified by the Window modes manual check).
+/// Into standard mode: the window returns at the frame it already owns.
+fn switch_mode(ui: &mut Ui, mtm: MainThreadMarker) {
+    ui.presentation.toggle_mode();
+    let app = NSApplication::sharedApplication(mtm);
+    match ui.presentation.mode {
+        UiMode::Hidden => {
+            ui.main.orderOut(None);
+            ui.panel.set_interactive(false);
+            let frame =
+                mode::fit_frame(ui.main.content_frame(), panel::visible_frame_of(&ui.panel));
+            ui.panel.set_frame(frame);
+            ui.panel.orderFrontRegardless();
+            // The panel is non-activating, so without this the app stays
+            // active with no key window and keystrokes reach nobody.
+            app.deactivate();
+        }
+        UiMode::Standard => {
+            ui.panel.orderOut(None);
+            ui.main.makeKeyAndOrderFront(None);
+            app.activate();
+        }
+    }
+}
+
+/// Apply an action on the main thread; the windows and `status_item` change
+/// here, engine commands go out through the sink.
 fn handle_action(action: HotkeyAction) {
     if let Some(mtm) = MainThreadMarker::new() {
         with_ui(|ui| {
@@ -75,29 +155,40 @@ fn handle_action(action: HotkeyAction) {
                 return;
             }
             match action {
+                HotkeyAction::Suggest
+                | HotkeyAction::ClearSuggestion
+                | HotkeyAction::ToggleMeeting => {
+                    unreachable!("engine commands exit through the sink above")
+                }
                 HotkeyAction::ToggleOverlay => {
-                    ui.overlay_visible = !ui.overlay_visible;
-                    if ui.overlay_visible {
-                        ui.panel.orderFrontRegardless();
+                    ui.presentation.toggle_visible();
+                    if ui.presentation.visible {
+                        show_active_window(ui, mtm);
                     } else {
                         ui.panel.orderOut(None);
+                        ui.main.orderOut(None);
                     }
-                    let running = ui.model.meeting() == MeetingState::Running;
-                    ui.status_item
-                        .rebuild_menu(running, ui.overlay_visible, mtm);
+                    refresh_menu(ui, mtm);
+                }
+                HotkeyAction::ToggleMode => {
+                    switch_mode(ui, mtm);
+                    refresh_menu(ui, mtm);
                 }
                 HotkeyAction::ToggleClickThrough => {
-                    let interactive = !ui.panel.is_interactive();
-                    ui.panel.set_interactive(interactive);
-                    if interactive {
-                        ui.panel.makeKeyAndOrderFront(None);
+                    // An overlay-only feature: the standard window always
+                    // takes its clicks (spec D-click-through-standard).
+                    if ui.presentation.click_through_allowed() {
+                        let interactive = !ui.panel.is_interactive();
+                        ui.panel.set_interactive(interactive);
+                        if interactive {
+                            ui.panel.makeKeyAndOrderFront(None);
+                        }
                     }
                 }
-                HotkeyAction::MoveLeft => ui.panel.move_by(-MOVE_STEP, 0.0),
-                HotkeyAction::MoveRight => ui.panel.move_by(MOVE_STEP, 0.0),
-                HotkeyAction::MoveUp => ui.panel.move_by(0.0, MOVE_STEP),
-                HotkeyAction::MoveDown => ui.panel.move_by(0.0, -MOVE_STEP),
-                _ => {}
+                HotkeyAction::MoveLeft => ui.move_active(-MOVE_STEP, 0.0),
+                HotkeyAction::MoveRight => ui.move_active(MOVE_STEP, 0.0),
+                HotkeyAction::MoveUp => ui.move_active(0.0, MOVE_STEP),
+                HotkeyAction::MoveDown => ui.move_active(0.0, -MOVE_STEP),
             }
         });
     }
@@ -139,13 +230,17 @@ fn apply_event(event: UiEvent) {
         let changes = ui.model.apply(event);
         if changes.status || changes.ticker || changes.suggestion {
             // Spec: deltas scroll to the end unless interactive mode is on.
-            ui.views.render(&ui.model, !ui.panel.is_interactive());
+            // Both windows render: only one is on screen, but the hidden one
+            // must be current when a switch brings it forward. The standard
+            // window is always interactive, so it follows its transcript.
+            let scroll = !ui.panel.is_interactive();
+            ui.panel_views.render(&ui.model, scroll);
+            ui.window_views.render(&ui.model, true);
         }
         if changes.meeting {
-            let running = ui.model.meeting() == MeetingState::Running;
-            ui.status_item.set_meeting_running(running, mtm);
             ui.status_item
-                .rebuild_menu(running, ui.overlay_visible, mtm);
+                .set_meeting_running(ui.model.meeting() == MeetingState::Running, mtm);
+            refresh_menu(ui, mtm);
         }
         if changes.hotkeys
             && let Some(manager) = ui.hotkey_manager.as_ref()
@@ -204,24 +299,51 @@ pub fn run_on_main_thread(config: Config, commands: CommandSink) {
     run(mtm, config, commands);
 }
 
-/// Build the panel, views, status item and hotkeys and run the AppKit
-/// loop. Never returns in a healthy app.
+/// Build both windows, the status item, the main menu and the hotkeys, and
+/// run the AppKit loop. Never returns in a healthy app.
 pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {
     let app = NSApplication::sharedApplication(mtm);
-    // Menu-bar-only app: no Dock icon, no app menu (spec: Accessory policy).
+    // Menu-bar-only app: no Dock icon (spec: Accessory policy). The invisible
+    // main menu installed below still carries the cmd key equivalents.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let panel = OverlayPanel::new(mtm);
-    let window: Retained<NSWindow> = Retained::into_super(Retained::into_super(panel.clone()));
-    let views = views::install(&window, mtm);
+    // The standard window first: its restored (or default) content frame
+    // seeds the panel's frame (spec D-frame-mapping, D-default-frame).
+    let main = StandardWindow::new(mtm);
+    main.set_on_close(|| {
+        // The close button fires on the main run loop.
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        with_ui(|ui| {
+            // Hide instead of close; the app keeps running in the menu bar
+            // (spec D-close).
+            ui.presentation.hide();
+            ui.main.orderOut(None);
+            refresh_menu(ui, mtm);
+        });
+    });
+    let main_size = main.content_frame();
+    let window_views = views::install(&main, (main_size.2, main_size.3), ViewStyle::Window, mtm);
+
+    let panel = OverlayPanel::new(
+        mtm,
+        mode::fit_frame(main.content_frame(), panel::visible_frame_of(&main)),
+    );
+    let panel_frame = panel.content_frame();
+    let panel_views = views::install(&panel, (panel_frame.2, panel_frame.3), ViewStyle::Hud, mtm);
+    // Capture hiding applies to the panel only (spec D-capture-scope).
     panel.apply_capture_policy(config.overlay.hide_from_capture);
-    panel.orderFrontRegardless();
-    panel.place_default();
+
+    // Every launch starts standard and visible (spec D-launch-mode); the
+    // panel waits for the first mode switch.
+    main.makeKeyAndOrderFront(None);
+    app.activate();
 
     let status_item = StatusItemController::new(
         mtm,
         false,
-        true,
+        Presentation::launch(),
         {
             let commands = commands.clone();
             move || commands(EngineCommand::ToggleMeeting)
@@ -232,11 +354,17 @@ pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {
             })
         },
         move || {
+            DispatchQueue::main().exec_async(|| {
+                handle_action(HotkeyAction::ToggleMode);
+            })
+        },
+        move || {
             if MainThreadMarker::new().is_some() {
                 request_quit();
             }
         },
     );
+    app_menu::install(mtm, status_item.handler());
 
     let mut parsed_hotkeys = Vec::new();
     let mut hotkey_manager = None;
@@ -269,13 +397,15 @@ pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {
         *cell.borrow_mut() = Some(Ui {
             model: UiModel::default(),
             panel,
-            views,
+            panel_views,
+            main,
+            window_views,
             status_item,
             commands,
             hotkey_manager,
             parsed_hotkeys,
             registered,
-            overlay_visible: true,
+            presentation: Presentation::launch(),
             quit_timer: None,
         })
     });
