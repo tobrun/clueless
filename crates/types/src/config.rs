@@ -323,6 +323,7 @@ pub struct HotkeysConfig {
     pub move_down: String,
     pub toggle_meeting: String,
     pub toggle_overlay: String,
+    pub toggle_mode: String,
     pub toggle_click_through: String,
 }
 
@@ -337,6 +338,7 @@ impl Default for HotkeysConfig {
             move_down: "cmd+shift+ArrowDown".into(),
             toggle_meeting: "cmd+shift+KeyR".into(),
             toggle_overlay: "cmd+Backslash".into(),
+            toggle_mode: "cmd+shift+Backslash".into(),
             toggle_click_through: "cmd+shift+KeyM".into(),
         }
     }
@@ -396,6 +398,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "move_down",
             "toggle_meeting",
             "toggle_overlay",
+            "toggle_mode",
             "toggle_click_through",
         ],
     ),

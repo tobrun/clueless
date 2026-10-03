@@ -1,8 +1,8 @@
 //! Global hotkeys: config parsing and the command routing the overlay acts
 //! on. One [`global_hotkey::GlobalHotKeyManager`] is created on the main
 //! thread in [`crate::ui::run`] and kept alive there. Always-on keys are
-//! registered at startup; meeting-only keys (suggest, clear) only while a
-//! meeting runs (the rationale is in `docs/decisions.md`).
+//! registered at startup; meeting-only keys (suggest, clear, the four move
+//! keys) only while a meeting runs (the rationale is in `docs/decisions.md`).
 
 use clueless_types::EngineCommand;
 use clueless_types::config::HotkeysConfig;
@@ -18,6 +18,8 @@ pub enum HotkeyAction {
     ToggleMeeting,
     /// Show or hide the panel.
     ToggleOverlay,
+    /// Switch between the standard window and the hidden overlay.
+    ToggleMode,
     /// Turn interactive mode on or off (panel becomes key-able).
     ToggleClickThrough,
     MoveLeft,
@@ -31,9 +33,19 @@ pub const MOVE_STEP: f64 = 40.0;
 
 impl HotkeyAction {
     /// Meeting-only keys are registered on `MeetingState(Running)` and
-    /// unregistered on `Idle`; everything else is always on.
+    /// unregistered on `Idle`; everything else is always on. The move keys
+    /// are meeting-only so `cmd+shift+arrows` stays available to other apps
+    /// outside a meeting (spec D-move-keys).
     pub fn meeting_only(&self) -> bool {
-        matches!(self, Self::Suggest | Self::ClearSuggestion)
+        matches!(
+            self,
+            Self::Suggest
+                | Self::ClearSuggestion
+                | Self::MoveLeft
+                | Self::MoveRight
+                | Self::MoveUp
+                | Self::MoveDown
+        )
     }
 
     /// The engine command this action sends, when it is not local.
@@ -79,7 +91,7 @@ impl std::fmt::Display for HotkeyParseError {
 
 impl std::error::Error for HotkeyParseError {}
 
-fn table(config: &HotkeysConfig) -> [(HotkeyAction, &'static str, &str); 9] {
+fn table(config: &HotkeysConfig) -> [(HotkeyAction, &'static str, &str); 10] {
     [
         (HotkeyAction::Suggest, "suggest", &config.suggest),
         (HotkeyAction::ClearSuggestion, "clear", &config.clear),
@@ -97,6 +109,7 @@ fn table(config: &HotkeysConfig) -> [(HotkeyAction, &'static str, &str); 9] {
             "toggle_overlay",
             &config.toggle_overlay,
         ),
+        (HotkeyAction::ToggleMode, "toggle_mode", &config.toggle_mode),
         (
             HotkeyAction::ToggleClickThrough,
             "toggle_click_through",
@@ -108,7 +121,7 @@ fn table(config: &HotkeysConfig) -> [(HotkeyAction, &'static str, &str); 9] {
 /// Parse every configured hotkey. The first bad string is an error naming
 /// the key and the field; callers show it and keep the rest.
 pub fn parse_all(config: &HotkeysConfig) -> Result<Vec<ParsedHotkey>, HotkeyParseError> {
-    let mut out = Vec::with_capacity(9);
+    let mut out = Vec::with_capacity(10);
     for (action, field, raw) in table(config) {
         match raw.parse::<HotKey>() {
             Ok(hotkey) => out.push(ParsedHotkey {
@@ -199,10 +212,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_nine_default_hotkeys_parse() {
+    fn all_ten_default_hotkeys_parse() {
         let config = HotkeysConfig::default();
         let parsed = parse_all(&config).expect("defaults must parse");
-        assert_eq!(parsed.len(), 9);
+        assert_eq!(parsed.len(), 10);
         // Every action appears exactly once and ids are unique (a duplicate
         // id would misroute presses).
         let mut actions: Vec<HotkeyAction> = parsed.iter().map(|p| p.action).collect();
@@ -230,19 +243,24 @@ mod tests {
     }
 
     #[test]
-    fn meeting_only_set_is_suggest_and_clear() {
-        assert!(HotkeyAction::Suggest.meeting_only());
-        assert!(HotkeyAction::ClearSuggestion.meeting_only());
+    fn meeting_only_set_is_suggest_clear_and_the_four_moves() {
         for action in [
-            HotkeyAction::ToggleMeeting,
-            HotkeyAction::ToggleOverlay,
-            HotkeyAction::ToggleClickThrough,
+            HotkeyAction::Suggest,
+            HotkeyAction::ClearSuggestion,
             HotkeyAction::MoveLeft,
             HotkeyAction::MoveRight,
             HotkeyAction::MoveUp,
             HotkeyAction::MoveDown,
         ] {
-            assert!(!action.meeting_only());
+            assert!(action.meeting_only(), "{action:?} must be meeting-only");
+        }
+        for action in [
+            HotkeyAction::ToggleMeeting,
+            HotkeyAction::ToggleOverlay,
+            HotkeyAction::ToggleMode,
+            HotkeyAction::ToggleClickThrough,
+        ] {
+            assert!(!action.meeting_only(), "{action:?} must be always-on");
         }
     }
 }

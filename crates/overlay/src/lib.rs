@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! mod model;        // pure state machine + clamp_origin        [unit]
+//! mod mode;         // pure UI mode + frame math                [unit]
 //! mod hotkeys;      // parse + register global hotkeys          [unit]
 //! mod panel;        // NSPanel subclass, collection behavior    [e2e]
 //! mod views;        // status line, ticker, suggestion views    [integration]
@@ -14,6 +15,7 @@
 //! ```
 
 pub mod hotkeys;
+pub mod mode;
 pub mod model;
 
 #[cfg(target_os = "macos")]
