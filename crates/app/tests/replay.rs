@@ -1,5 +1,5 @@
 //! Tests for the real `clueless` binary: CLI contract, replay against
-//! local mock servers, and the e2e LAN replay suite (ignored by default;
+//! local mock servers, and the e2e live replay suite (ignored by default;
 //! `LIVE_SERVER=1` opts in, without it each test returns early).
 
 use std::path::{Path, PathBuf};
@@ -502,7 +502,7 @@ fn words(text: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore = "needs the LAN servers; run with LIVE_SERVER=1"]
+#[ignore = "needs reachable servers; run with LIVE_SERVER=1"]
 async fn live_replay_reproduces_every_expected_conversation_line() {
     if !live_enabled() {
         return;
@@ -544,7 +544,7 @@ async fn live_replay_reproduces_every_expected_conversation_line() {
 }
 
 #[tokio::test]
-#[ignore = "needs the LAN servers; run with LIVE_SERVER=1"]
+#[ignore = "needs reachable servers; run with LIVE_SERVER=1"]
 async fn live_monologue_yields_finals_without_repeated_joins() {
     if !live_enabled() {
         return;
@@ -585,7 +585,7 @@ async fn live_monologue_yields_finals_without_repeated_joins() {
 }
 
 #[tokio::test]
-#[ignore = "needs the LAN servers; run with LIVE_SERVER=1"]
+#[ignore = "needs reachable servers; run with LIVE_SERVER=1"]
 async fn live_echo_of_them_never_transcribes_as_me() {
     if !live_enabled() {
         return;
@@ -616,7 +616,7 @@ async fn live_echo_of_them_never_transcribes_as_me() {
 }
 
 #[tokio::test]
-#[ignore = "needs the LAN servers; run with LIVE_SERVER=1"]
+#[ignore = "needs reachable servers; run with LIVE_SERVER=1"]
 async fn live_ask_on_french_answers_and_logs_the_first_delta() {
     if !live_enabled() {
         return;
@@ -658,7 +658,7 @@ async fn live_ask_on_french_answers_and_logs_the_first_delta() {
 }
 
 #[tokio::test]
-#[ignore = "needs the LAN servers; run with LIVE_SERVER=1"]
+#[ignore = "needs reachable servers; run with LIVE_SERVER=1"]
 async fn live_silence_yields_no_lines_and_no_asr_request() {
     if !live_enabled() {
         return;

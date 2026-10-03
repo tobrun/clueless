@@ -2,7 +2,7 @@
 # Create the self-signed codesigning certificate "clueless-dev" that
 # `cargo xtask bundle` signs the dev app with, so macOS keeps the Microphone,
 # Screen Recording and Local Network grants across rebuilds (a stable
-# signature keeps the grants attached to the app; see D-dev-signing).
+# signature keeps the grants attached to the app; see docs/decisions.md).
 #
 # Run this once and enter the login keychain password when asked.
 #
