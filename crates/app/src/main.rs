@@ -14,6 +14,7 @@ use clueless_types::config::Config;
 use clueless_types::events::{
     CommandSink, EngineCommand, Speaker, StatusSink, SuggestionEnd, UiEvent,
 };
+use clueless_types::profile::AssistProfile;
 use engine::deps::EngineDeps;
 use engine::meeting;
 use engine::replay::WavSources;
@@ -73,9 +74,12 @@ fn main() -> ExitCode {
 }
 
 /// Replay mode: WAV sources through a real engine, printing finals to
-/// stdout and statuses to stderr; exits 0 when the sources drain (and,
-/// with `--ask`, when the suggestion ends).
-fn run_replay(config: Config, replay: Replay) -> ExitCode {
+/// stdout and statuses to stderr; exits 0 when the sources drain and no
+/// automatic answer is running or waiting (and, with `--ask`, when the
+/// suggestion asked for at the end ends). The profile is the flag's, or
+/// Manual: the config file's `start_profile` is for the GUI.
+fn run_replay(mut config: Config, replay: Replay) -> ExitCode {
+    config.assist.start_profile = replay.profile.unwrap_or(AssistProfile::Manual);
     let mut files = vec![(Speaker::Me, replay.files[0].clone())];
     if let Some(them) = replay.files.get(1) {
         files.push((Speaker::Them, them.clone()));
@@ -121,6 +125,8 @@ async fn replay_loop(
 
     let outcome = tokio::time::timeout(REPLAY_LIMIT, async {
         let mut asked = false;
+        // The id of the answer whose "--- suggestion ---" header is out.
+        let mut header_for: Option<u64> = None;
         while let Some(event) = events_rx.recv().await {
             match event {
                 UiEvent::TranscriptFinal(final_) => {
@@ -136,17 +142,27 @@ async fn replay_loop(
                     level,
                     text,
                 } => eprintln!("{source:?} {level:?}: {text}"),
-                UiEvent::SuggestionStart { .. } => println!("--- suggestion ---"),
-                UiEvent::SuggestionDelta { text, .. } => {
+                UiEvent::SuggestionDelta { id, text } => {
+                    if header_for != Some(id) {
+                        println!("--- suggestion ---");
+                        header_for = Some(id);
+                    }
                     print!("{text}");
                     let _ = std::io::stdout().flush();
                 }
-                UiEvent::SuggestionEnd { end, .. } => {
-                    println!();
+                UiEvent::SuggestionEnd { id, end } => {
+                    if header_for == Some(id) {
+                        println!();
+                    }
                     if let SuggestionEnd::Failed(reason) = end {
                         eprintln!("suggestion failed: {reason}");
                     }
-                    break;
+                    // `SourcesDrained` only arrives once nothing is running
+                    // or waiting, so after the asked request was sent this
+                    // is its end.
+                    if asked {
+                        break;
+                    }
                 }
                 UiEvent::SourcesDrained => {
                     if ask && !asked {

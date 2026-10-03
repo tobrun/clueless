@@ -3,6 +3,7 @@
 //! `LIVE_SERVER=1` opts in, without it each test returns early).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
@@ -79,7 +80,7 @@ fn write_live_env(dir: &TempDir) -> PathBuf {
         "LLM_BASE_URL",
         "LLM_MODEL",
         "LLM_API_KEY",
-        "LLM_PROFILE_PATH",
+        "LLM_NOTES_PATH",
         "LLM_ENABLE_THINKING",
         "ASR_BASE_URL",
         "ASR_MODEL",
@@ -148,6 +149,7 @@ async fn run_with_log(
         .env_remove("LLM_BASE_URL")
         .env_remove("LLM_MODEL")
         .env_remove("LLM_API_KEY")
+        .env_remove("LLM_NOTES_PATH")
         .env_remove("LLM_PROFILE_PATH")
         .env_remove("LLM_ENABLE_THINKING")
         .env_remove("ASR_BASE_URL")
@@ -238,6 +240,8 @@ async fn spawn_asr_mock(text: &str) -> u16 {
 #[derive(Clone)]
 struct LlmMock {
     parts: Vec<String>,
+    /// How many chat requests this mock served.
+    calls: Arc<AtomicUsize>,
 }
 
 async fn llm_models() -> impl IntoResponse {
@@ -248,6 +252,7 @@ async fn llm_models() -> impl IntoResponse {
 }
 
 async fn llm_chat(State(mock): State<LlmMock>) -> Response {
+    mock.calls.fetch_add(1, Ordering::SeqCst);
     let mut body = String::new();
     for part in &mock.parts {
         body.push_str(&format!(
@@ -259,14 +264,21 @@ async fn llm_chat(State(mock): State<LlmMock>) -> Response {
 }
 
 async fn spawn_llm_mock(parts: &[&str]) -> u16 {
+    spawn_counting_llm_mock(parts).await.0
+}
+
+/// The same mock, plus the count of chat requests it served.
+async fn spawn_counting_llm_mock(parts: &[&str]) -> (u16, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
     let state = LlmMock {
         parts: parts.iter().map(|p| p.to_string()).collect(),
+        calls: calls.clone(),
     };
     let app = Router::new()
         .route("/v1/models", get(llm_models))
         .route("/v1/chat/completions", post(llm_chat))
         .with_state(state);
-    spawn_mock(app).await
+    (spawn_mock(app).await, calls)
 }
 
 async fn spawn_mock(app: Router) -> u16 {
@@ -449,6 +461,150 @@ async fn ask_appends_the_mock_suggestion_after_its_header() {
         stdout.ends_with("--- suggestion ---\nmock answer\n"),
         "stdout ends with the suggestion: {stdout}"
     );
+}
+
+/// A transcription answer the Interview profile treats as a real question.
+const QUESTION_TEXT: &str = "what is the status of the release?";
+
+/// Replay the conversation fixture at speed 10 with `extra` arguments added.
+async fn replay_conversation(env_file: &Path, extra: &[&Path]) -> std::process::Output {
+    let mut args: Vec<&Path> = vec![Path::new("--env-file"), env_file, Path::new("--replay")];
+    let me = fixture("conv_me.wav");
+    let them = fixture("conv_them.wav");
+    args.push(&me);
+    args.push(&them);
+    args.push(Path::new("--speed"));
+    args.push(Path::new("10"));
+    args.extend_from_slice(extra);
+    run(&args, std::time::Duration::from_secs(120)).await
+}
+
+#[tokio::test]
+async fn profile_interview_prints_automatic_answers_between_the_transcript_lines() {
+    let dir = TempDir::new("profile-interview");
+    let asr = spawn_asr_mock(QUESTION_TEXT).await;
+    let (llm, calls) = spawn_counting_llm_mock(&["mock ", "answer"]).await;
+    let config = write_mock_env(&dir, llm, asr);
+    let out = replay_conversation(&config, &[Path::new("--profile"), Path::new("interview")]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines = stdout_lines(&out);
+    let headers: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.as_str() == "--- suggestion ---")
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        !headers.is_empty(),
+        "at least one automatic answer: {lines:?}"
+    );
+    for index in &headers {
+        assert_eq!(
+            lines.get(index + 1).map(String::as_str),
+            Some("mock answer"),
+            "every header is followed by the answer: {lines:?}"
+        );
+    }
+    let others: Vec<&String> = lines
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !headers.contains(index) && !headers.contains(&index.wrapping_sub(1)))
+        .map(|(_, line)| line)
+        .collect();
+    for line in others {
+        assert!(is_transcript_line(line), "unexpected stdout line: {line:?}");
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        headers.len(),
+        "one chat request per printed answer"
+    );
+}
+
+#[tokio::test]
+async fn profile_interview_with_a_pass_answer_prints_only_transcript_lines() {
+    let dir = TempDir::new("profile-pass");
+    let asr = spawn_asr_mock(QUESTION_TEXT).await;
+    let (llm, calls) = spawn_counting_llm_mock(&["PASS"]).await;
+    let config = write_mock_env(&dir, llm, asr);
+    let out = replay_conversation(&config, &[Path::new("--profile"), Path::new("interview")]).await;
+    assert_eq!(out.status.code(), Some(0));
+    assert!(calls.load(Ordering::SeqCst) >= 1, "the profile did ask");
+    let lines = stdout_lines(&out);
+    assert!(!lines.is_empty());
+    for line in &lines {
+        assert!(is_transcript_line(line), "unexpected stdout line: {line:?}");
+    }
+}
+
+#[tokio::test]
+async fn profile_interview_with_ask_ends_after_the_asked_answer() {
+    let dir = TempDir::new("profile-ask");
+    let asr = spawn_asr_mock(QUESTION_TEXT).await;
+    let (llm, calls) = spawn_counting_llm_mock(&["mock ", "answer"]).await;
+    let config = write_mock_env(&dir, llm, asr);
+    let out = replay_conversation(
+        &config,
+        &[
+            Path::new("--profile"),
+            Path::new("interview"),
+            Path::new("--ask"),
+        ],
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.ends_with("--- suggestion ---\nmock answer\n"),
+        "stdout ends with the asked answer: {stdout}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "at least one automatic request plus the asked one"
+    );
+}
+
+#[test]
+fn an_unknown_profile_exits_2_and_names_the_three_valid_ones() {
+    let dir = TempDir::new("profile-unknown");
+    let out = std::process::Command::new(BIN)
+        .arg("--replay")
+        .arg(fixture("conv_me.wav"))
+        .arg("--profile")
+        .arg("coach")
+        .arg("--log-file")
+        .arg(dir.join("log.txt"))
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for name in ["manual", "interview", "brainstorm"] {
+        assert!(stderr.contains(name), "stderr: {stderr}");
+    }
+}
+
+#[tokio::test]
+async fn the_config_files_start_profile_does_not_apply_to_replay() {
+    let dir = TempDir::new("profile-config");
+    let asr = spawn_asr_mock(QUESTION_TEXT).await;
+    let (llm, calls) = spawn_counting_llm_mock(&["mock answer"]).await;
+    let env = write_mock_env(&dir, llm, asr);
+    let toml = dir.join("config.toml");
+    std::fs::write(&toml, "[assist]\nstart_profile = \"interview\"\n").expect("config written");
+    let out = replay_conversation(&env, &[Path::new("--config"), &toml]).await;
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "replay runs in Manual");
+    for line in stdout_lines(&out) {
+        assert!(
+            is_transcript_line(&line),
+            "unexpected stdout line: {line:?}"
+        );
+    }
 }
 
 #[tokio::test]
