@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -390,9 +390,4 @@ pub fn panic_status(text: &str) -> UiEvent {
         level: StatusLevel::Error,
         text: format!("internal error: {text}"),
     }
-}
-
-/// Read a watermark without caring which stream it belongs to.
-pub fn watermark_value(watermark: &AtomicU64) -> u64 {
-    watermark.load(Ordering::Acquire)
 }
