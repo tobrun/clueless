@@ -1,8 +1,8 @@
 # Architecture
 
-Purpose: clueless is a macOS meeting copilot for one user on one Mac. During a meeting it records the microphone ("Me") and the system audio ("Them") as two streams, cuts each into utterances, transcribes each utterance on a speech-to-text server over HTTP, and shows a rolling transcript in a standard window or a hidden overlay panel. On a hotkey it asks an LLM server over HTTP what to say next and streams the answer into whichever window is on screen. Audio flows capture -> ring buffer -> engine stream thread (resample, voice detection, segmenter) -> ASR worker -> transcript store -> UI event -> overlay; a suggestion flows hotkey -> engine command -> prompt builder -> LLM stream -> overlay.
+Purpose: clueless is a macOS meeting copilot for one user on one Mac. During a meeting it records the microphone ("Me") and the system audio ("Them") as two streams, cuts each into utterances, transcribes each utterance on a speech-to-text server over HTTP, and shows a rolling transcript in a standard window or a hidden overlay panel. On a hotkey it asks an LLM server over HTTP what to say next and streams the answer into whichever window is on screen. Three built-in assist profiles (Manual, Interview, Brainstorm) decide whether the app also asks by itself at the end of a turn; Manual, the default, asks only on the hotkey. Audio flows capture -> ring buffer -> engine stream thread (resample, voice detection, segmenter) -> ASR worker -> transcript store -> UI event -> overlay; a suggestion flows hotkey (or, in Interview and Brainstorm, a finished turn) -> engine command -> prompt builder -> LLM stream -> overlay.
 
-Captured: 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.env` and the switchable window modes were added.
+Captured: 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.env`, the switchable window modes were added, and continuous assistance with assist profiles was added.
 
 ## Components
 
@@ -12,7 +12,7 @@ Captured: 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.en
 | segmenter | resample, VAD wrapper, utterance state machine, dedup | `crates/segmenter/` | types |
 | asr | WAV encoding and transcription client | `crates/asr/` | types |
 | llm | streaming chat client | `crates/llm/` | types |
-| context | transcript store, prompt builder, echo test, token estimate | `crates/context/` | types |
+| context | transcript store, prompt builder, assist profiles and trigger policy, echo test, token estimate | `crates/context/` | types |
 | engine | threads, queues, meeting state, suggestions, replay | `crates/engine/` | types, segmenter, asr, llm, context |
 | capture | microphone and system-audio sources | `crates/capture/` | types |
 | overlay | standard window, hidden overlay panel, mode switch, views, hotkeys, menu-bar item | `crates/overlay/` | types |
@@ -30,15 +30,22 @@ Captured: 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.en
 
 ### Suggestion
 
-1. A global hotkey in the overlay sends `EngineCommand::Suggest` (`crates/overlay/`).
-2. The engine builds one system and one user message from the transcript store, the profile file and the text in progress (`crates/context/`).
+1. A global hotkey in the overlay sends `EngineCommand::Suggest`, which means "answer now" in every profile and cancels a running answer; in Interview and Brainstorm the engine can also start a request by itself, see Automatic assistance (`crates/overlay/`, `crates/engine/`).
+2. The engine builds one system and one user message from the transcript store, the notes file and the text in progress, with the active profile's instruction after the transcript (`crates/context/`).
 3. The LLM client streams content deltas from the chat server (`crates/llm/`).
-4. Each delta is a `UiEvent` with the suggestion id; the overlay drops events with an old id (`crates/overlay/`).
+4. Each delta is a `UiEvent` with the suggestion id; the overlay drops events with an old id and shows the answer as the newest entry of a feed (`crates/overlay/`).
+
+### Automatic assistance
+
+1. Hotkey `hotkeys.cycle_profile` (default `ctrl+alt+KeyP`) sends `EngineCommand::CycleProfile` and the status icon menu sends `EngineCommand::SetProfile`; the engine keeps the active profile across meetings and sends `UiEvent::Profile`, which the overlay shows at the start of the status line (`crates/overlay/`, `crates/engine/`).
+2. The engine hears about every finished piece of either speaker, committed or dropped, plus whether a speaker is still busy (`crates/engine/`).
+3. The trigger policy decides per piece whether to fire: Interview waits for the end of a Them turn, Brainstorm fires at every finished piece of Me; it skips short turns, keeps a minimum gap between automatic requests, waits while an answer runs and stays quiet for a while after a failure (`crates/context/`).
+4. A fired request follows the Suggestion flow; the stream holds back its first words until it is clear the answer is not the single word PASS, which shows nothing and adds no feed entry (`crates/engine/`).
 
 ### Meeting lifecycle
 
 1. A hotkey or menu-bar click sends `StartMeeting` (`crates/overlay/`).
-2. The engine checks both servers, reads the profile file, opens each speaker the factory lists and starts one thread per source (`crates/engine/`, `crates/capture/`).
+2. The engine checks both servers, reads the notes file, opens each speaker the factory lists and starts one thread per source (`crates/engine/`, `crates/capture/`).
 3. `StopMeeting` flushes both segmenters, releases echo holds, waits for queued finals, cancels in-flight requests and joins the threads (`crates/engine/`).
 
 ### Mode switch
@@ -48,7 +55,7 @@ Captured: 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.en
 
 ### Replay
 
-1. The binary takes one or two WAV files and a speed factor on the command line (`crates/app/`).
+1. The binary takes one or two WAV files, a speed factor and optionally `--profile NAME` on the command line (`crates/app/`).
 2. Paced in-memory sources feed the same engine (`crates/engine/`), which prints each final utterance on stdout and exits when drained.
 
 ## Boundaries

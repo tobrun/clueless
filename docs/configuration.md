@@ -32,8 +32,11 @@ The old TOML `[server]` and `[llm]` tables are rejected with an error naming the
 | `LLM_API_KEY` | no | unset | Sent as `Authorization: Bearer <key>` when set |
 | `LLM_MAX_TOKENS` | no | 220 | Answer length cap |
 | `LLM_TEMPERATURE` | no | 0.4 | Sampling temperature |
-| `LLM_PROFILE_PATH` | no | unset | Text file placed in the system message, `~` is expanded |
+| `LLM_NOTES_PATH` | no | unset | Notes file placed in the system message, `~` is expanded |
 | `LLM_ENABLE_THINKING` | no | unset | `true`/`false`; unset omits the field from the request entirely |
+
+`LLM_NOTES_PATH` replaces the older `LLM_PROFILE_PATH`; the word "profile" now means only the switchable assist profile.
+A set `LLM_PROFILE_PATH` is a startup error that names `LLM_NOTES_PATH`.
 
 `LLM_ENABLE_THINKING=false` sends `chat_template_kwargs: {"enable_thinking": false}`, which removes the reasoning delay on vLLM-hosted Qwen-family models; hosted APIs generally want it unset.
 
@@ -102,6 +105,14 @@ Lookup order: the path given by `--config`, else `~/.config/clueless/config.toml
 | --- | --- | --- |
 | `hide_from_capture` | true | Sets the hidden overlay panel's sharing type to none; the standard window is never hidden from capture; best effort on macOS 15.4+ |
 
+### `[assist]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `start_profile` | `"manual"` | Profile active at launch: `"manual"`, `"interview"` or `"brainstorm"`; anything else is a startup error listing the three names |
+
+See Profiles below.
+
 ### `[hotkeys]`
 
 All keys are global while their registration window is active; the syntax is `cmd|ctrl|alt|shift` plus a key name like `cmd+shift+KeyR`.
@@ -115,6 +126,39 @@ All keys are global while their registration window is active; the syntax is `cm
 | `toggle_overlay` | `cmd+Backslash` | always |
 | `toggle_click_through` | `cmd+shift+KeyM` | always |
 | `toggle_mode` | `cmd+shift+Backslash` | always |
+| `cycle_profile` | `ctrl+alt+KeyP` | always |
+
+## Profiles
+
+An assist profile decides when the app asks the LLM for help by itself.
+There are three built-in ones, and `assist.start_profile` picks the one active at launch.
+The `cycle_profile` hotkey steps through them and the status icon menu lists all three for a direct pick; the active one is marked in the menu and its name opens the status line, followed by " ..." while a request runs.
+The active profile is kept across meetings in one session, and switching is allowed while idle.
+
+- Manual (default): the app starts no request by itself; the `suggest` hotkey is the only trigger.
+- Interview: asks at the end of a turn of the other side (Them), to help answer what they raised.
+  The turn counts as over 400 ms after its last finished piece with Them not speaking, or after at most 4 s of waiting.
+  Without a Them stream no automatic request ever fires.
+- Brainstorm: asks at every finished piece of your own speech (a pause of about 0.6 s or the 15 s cut), also while you keep talking, and offers ideas as up to 3 dash lines.
+
+The `suggest` hotkey means "answer now" in every profile and cancels a running answer; an automatic request never cancels one and instead waits and fires once when the answer is done.
+The model decides whether there is anything worth saying: answering with the single word PASS shows nothing and adds no feed entry.
+The previous answer is shown to the model so it does not repeat itself.
+
+Limits on automatic requests:
+
+- At least 2 s between the starts of two automatic requests, 8 s in Brainstorm.
+- Turns shorter than 12 characters without a question mark start no request.
+- After a failed or interrupted request automatic requests pause for 30 s, unless a request has ended successfully since.
+  Connect and HTTP failures (429 included) show in the status line and not in the feed; an answer that stalls mid-stream keeps its text and ends with "[interrupted]".
+
+Answers collect in a feed in both windows, newest at the bottom, older ones stay and can be scrolled to.
+Automatic help continues while the overlay is hidden.
+Each trigger decision writes one info log line with the profile and the outcome (fired, skipped short, waiting for gap, waiting for answer, paused), never transcript text.
+
+Cost note: every automatic request sends the whole transcript.
+On a paid API without prompt caching that costs up to the full context per turn, and on a server with one cache slot a compression request can push the transcript out of the cache.
+The system message and the transcript part do not depend on the profile, so switching profile keeps the server's prompt cache.
 
 ## Window modes
 
@@ -129,6 +173,6 @@ The bundled app and a bare `cargo run` binary have different bundle ids, so they
 
 ## Other inputs
 
-- `LLM_PROFILE_PATH` points at a plain text file with your name, role and anything the answers should know; it is read at meeting start and placed in the system message.
+- `LLM_NOTES_PATH` points at a plain text file (the notes file) with your name, role and anything the answers should know; it is read at meeting start and placed in the system message.
 - Transcripts and suggestions are never written to disk; the only files the app writes are its log (`~/Library/Logs/clueless/clueless.log`) and a single-instance lock (`~/Library/Application Support/clueless/lock`).
 - The one piece of state that survives a launch is the standard window's frame, kept by AppKit in the user defaults; the app owns no file for it.
