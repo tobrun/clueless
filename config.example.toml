@@ -32,4 +32,5 @@ move_down = "cmd+shift+ArrowDown"
 # always-on keys:
 toggle_meeting = "cmd+shift+KeyR"
 toggle_overlay = "cmd+Backslash"
+toggle_mode = "cmd+shift+Backslash"
 toggle_click_through = "cmd+shift+KeyM"

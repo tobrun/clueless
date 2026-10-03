@@ -187,6 +187,39 @@ fn default_suggest_hotkey_is_a_valid_hotkey_string() {
 }
 
 #[test]
+fn toggle_mode_defaults_to_cmd_shift_backslash() {
+    assert_eq!(
+        clueless_types::config::HotkeysConfig::default().toggle_mode,
+        "cmd+shift+Backslash"
+    );
+    let cfg = load("", "toggle-mode-default", &[]).unwrap();
+    assert_eq!(cfg.hotkeys.toggle_mode, "cmd+shift+Backslash");
+}
+
+#[test]
+fn toggle_mode_can_be_set_in_toml() {
+    let cfg = load(
+        "[hotkeys]\ntoggle_mode = \"ctrl+KeyM\"\n",
+        "toggle-mode-set",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(cfg.hotkeys.toggle_mode, "ctrl+KeyM");
+}
+
+#[test]
+fn a_misspelled_toggle_mode_key_is_reported_as_unknown() {
+    let err = load(
+        "[hotkeys]\ntoggle_modes = \"x\"\n",
+        "toggle-mode-unknown",
+        &[],
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("hotkeys.toggle_modes"), "error was: {msg}");
+}
+
+#[test]
 fn device_backend_parses_the_name_after_the_colon() {
     let cfg = load(
         "[audio]\nsystem_audio_backend = \"device:BlackHole 2ch\"\n",
