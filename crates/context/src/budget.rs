@@ -1,5 +1,5 @@
 //! Token budget: the characters/3.5 estimate, the compression threshold, and
-//! the summary request for the oldest half of the transcript (D-compression).
+//! the summary request for the oldest half of the transcript.
 
 use crate::prompt::{PromptMessage, format_line, transcript_part};
 use crate::store::TranscriptStore;

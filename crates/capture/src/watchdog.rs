@@ -1,4 +1,4 @@
-//! Pure restart policy for the system-audio watchdog (D-watchdog).
+//! Pure restart policy for the system-audio watchdog (the rationale is in `docs/decisions.md`).
 //!
 //! The policy is decided by three inputs - `on_stop_error`, `on_sample` and
 //! `tick` - against an injected clock, so the whole rule set is unit-testable

@@ -1,7 +1,7 @@
 //! The menu-bar item: a circle that fills while a meeting runs, a menu with
 //! Start/Stop Meeting, Show/Hide Overlay and Quit, and the quit path that
 //! waits for the engine's `MeetingState(Idle)` (with a 6 s deadline) so
-//! capture streams close before exit (spec decision D-quit-path).
+//! capture streams close before exit (the rationale is in `docs/decisions.md`).
 
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};

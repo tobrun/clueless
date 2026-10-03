@@ -1,5 +1,5 @@
 //! Paced WAV replay: the sources `--replay` feeds into the same pipeline
-//! the live capture uses (D-replay).
+//! the live capture uses.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

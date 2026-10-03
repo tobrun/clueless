@@ -1,5 +1,5 @@
 //! One tracing subscriber writing every line to both stderr and the log
-//! file, through a `Mutex<File>` writer as decided in D-logging. The
+//! file, through a `Mutex<File>` writer. The
 //! latency fields the pipeline logs (utterance `seq`, `vad_end_ms`,
 //! `asr_sent_ms`, `asr_done_ms`, `llm_first_delta_ms`) end up in both.
 

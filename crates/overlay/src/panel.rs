@@ -1,8 +1,8 @@
 //! The floating panel: an [`NSPanel`] subclass that is click-through by
 //! default and only becomes key window in interactive mode, sits at the
 //! status window level on every space, and moves clamped to the visible
-//! frame. Spec decisions: D-ui-stack (objc2), D-overlay-window (status-level
-//! panel), D-capture-hiding (sharing type none).
+//! frame. The rationale for the objc2 stack, the status-level
+//! panel and capture hiding is in `docs/decisions.md`.
 
 use std::cell::Cell;
 
@@ -115,7 +115,7 @@ impl OverlayPanel {
         self.ivars().interactive.get()
     }
 
-    /// Spec D-capture-hiding: the overlay must not appear in screen
+    /// The overlay must not appear in screen
     /// captures, driven by `overlay.hide_from_capture`.
     pub fn apply_capture_policy(&self, hide_from_capture: bool) {
         self.setSharingType(if hide_from_capture {

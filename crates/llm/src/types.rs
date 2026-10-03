@@ -34,7 +34,7 @@ impl Message {
 }
 
 /// vLLM-specific template options, sent only when `LLM_ENABLE_THINKING`
-/// is set (D-thinking).
+/// is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ChatTemplateKwargs {
     pub enable_thinking: bool,
@@ -56,7 +56,7 @@ pub struct ChatRequest {
 
 impl ChatRequest {
     /// A streaming request; `enable_thinking` comes from `LLM_ENABLE_THINKING`
-    /// (D-thinking): `None` omits the field, `Some(false)` sends thinking off.
+    /// `None` omits the field, `Some(false)` sends thinking off.
     pub fn new(
         model: impl Into<String>,
         messages: Vec<Message>,

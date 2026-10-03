@@ -1,6 +1,6 @@
 //! The compression watcher: one task per meeting that keeps the store's
-//! transcript part under the token budget by asking the LLM for a summary
-//! (D-segment-params keeps the summary request small at 1500 tokens).
+//! transcript part under the token budget by asking the LLM for a summary,
+//! keeping the summary request small at 1500 tokens.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

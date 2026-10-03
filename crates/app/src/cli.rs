@@ -17,7 +17,7 @@ pub struct Replay {
 /// The parsed command line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cli {
-    /// `None` means `~/.config/clueless/config.toml` (D-config).
+    /// `None` means `~/.config/clueless/config.toml`.
     pub config: Option<PathBuf>,
     /// `None` means `./.env`, then `~/.config/clueless/.env`.
     pub env_file: Option<PathBuf>,

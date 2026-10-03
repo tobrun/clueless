@@ -1,5 +1,5 @@
-//! ScreenCaptureKit system-audio capture (D-system-audio, D-watchdog,
-//! D-permissions).
+//! ScreenCaptureKit system-audio capture (the rationale for the backend,
+//! watchdog and permission handling is in `docs/decisions.md`).
 //!
 //! A display filter with audio enabled and video reduced to 2x2 at 1 fps
 //! yields a 48 kHz stereo float stream of everything this process does not
@@ -71,7 +71,7 @@ const K_AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
 const K_AUDIO_FORMAT_FLAG_IS_BIG_ENDIAN: u32 = 1 << 1;
 const K_AUDIO_FORMAT_FLAG_IS_NON_INTERLEAVED: u32 = 1 << 5;
 
-/// Screen recording permission check (D-permissions): preflight, request
+/// Screen recording permission check: preflight, request
 /// once on first failure, and report what the user must do.
 fn preflight_screen_recording() -> Result<(), SourceError> {
     let granted = unsafe { CGPreflightScreenCaptureAccess() };
@@ -344,7 +344,7 @@ impl SampleSource for SckSource {
         if self.shared.given_up.load(Ordering::Relaxed) {
             return SourceRead::Empty;
         }
-        // D-watchdog: the silence timer ticks here, the stop error in the
+        // The silence timer ticks here, the stop error in the
         // delegate.
         let action = {
             let mut policy = self.shared.policy.lock().unwrap();

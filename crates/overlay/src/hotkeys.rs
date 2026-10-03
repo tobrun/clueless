@@ -2,7 +2,7 @@
 //! on. One [`global_hotkey::GlobalHotKeyManager`] is created on the main
 //! thread in [`crate::ui::run`] and kept alive there. Always-on keys are
 //! registered at startup; meeting-only keys (suggest, clear) only while a
-//! meeting runs (spec decision D-hotkeys).
+//! meeting runs (the rationale is in `docs/decisions.md`).
 
 use clueless_types::EngineCommand;
 use clueless_types::config::HotkeysConfig;

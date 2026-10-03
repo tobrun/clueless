@@ -44,8 +44,8 @@ pub fn planar_bytes_to_mono(planes: &[&[u8]], out: &mut Vec<f32>) {
 }
 
 /// Counts consecutive exactly-zero samples and fires once at a limit of 3
-/// seconds of audio at the given sample rate (D-mic-silence: a denied
-/// microphone delivers zeros, not an error).
+/// seconds of audio at the given sample rate: a denied microphone delivers
+/// zeros, not an error.
 #[derive(Debug, Clone)]
 pub struct SilenceDetector {
     limit: u64,

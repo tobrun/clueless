@@ -16,6 +16,10 @@ members = [
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+description = "A local-first meeting copilot: live transcript overlay with suggestions from your own LLM servers"
+license = "MIT"
+repository = "https://github.com/tobrun/clueless"
+authors = ["Tobrun Van Nuland"]
 
 [workspace.lints.clippy]
 all = "warn"

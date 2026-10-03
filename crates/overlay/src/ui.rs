@@ -28,8 +28,8 @@ use crate::panel::OverlayPanel;
 use crate::status_item::StatusItemController;
 use crate::views::{self, OverlayViews};
 
-/// Quit deadline after `Shutdown` (spec decision D-quit-path: terminate on
-/// `MeetingState(Idle)` or after 6 s at the latest).
+/// Quit deadline after `Shutdown` (terminate on `MeetingState(Idle)` or
+/// after 6 s at the latest; the rationale is in `docs/decisions.md`).
 const QUIT_DEADLINE_SECS: f64 = 6.0;
 
 /// Everything the main thread owns. Reachable only through [`with_ui`].
@@ -103,7 +103,7 @@ fn handle_action(action: HotkeyAction) {
     }
 }
 
-/// Quit path (spec D-quit-path): ask the engine to shut down, and terminate
+/// Quit path: ask the engine to shut down, and terminate
 /// when it confirms `MeetingState(Idle)` - [`apply_event`] does that - or
 /// after [`QUIT_DEADLINE_SECS`] no matter what.
 fn request_quit() {

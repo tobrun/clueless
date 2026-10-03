@@ -16,7 +16,7 @@ const MODELS_PATH: &str = "/v1/models";
 /// How many leading bytes of an error body the `Http` variant keeps.
 const BODY_START_BYTES: usize = 200;
 
-/// Why a chat request failed. Maps onto the statuses of D-llm-failure.
+/// Why a chat request failed. Maps onto the overlay's LLM error statuses.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LlmError {
     /// Could not reach the server at all (or the connect timed out).

@@ -1,4 +1,4 @@
-//! The health check run once at meeting start (D-health): one `models()`
+//! The health check run once at meeting start: one `models()`
 //! call per server under a shared timeout, mapped to one status each.
 
 use std::time::Duration;

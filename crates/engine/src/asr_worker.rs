@@ -28,7 +28,7 @@ use crate::pipeline::Drain;
 
 /// A single-slot "latest wins" mailbox: an unread segment is replaced, so a
 /// slow interim worker always works on the newest audio and never queues
-/// stale interims (D-interim).
+/// stale interims.
 pub struct LatestSlot {
     inner: Mutex<Option<Segment>>,
     notify: tokio::sync::Notify,
@@ -186,7 +186,7 @@ async fn process_final(
     previous_committed: Option<String>,
 ) -> Option<String> {
     // 1. Transcribe with the client's built-in retries, abortable.
-    // The D-logging latency fields for one utterance (CS12c).
+    // Latency fields for one utterance, logged at the end of transcribe.
     tracing::info!(
         speaker = ?segment.id.speaker,
         seq = segment.id.seq,

@@ -26,5 +26,7 @@
 	<string>clueless uses the screen capture API so it can pick up the meeting audio played by this Mac.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>clueless talks to the speech-to-text and language models running on your local network.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Tobrun Van Nuland, MIT licensed</string>
 </dict>
 </plist>

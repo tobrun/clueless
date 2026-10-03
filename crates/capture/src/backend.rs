@@ -3,7 +3,7 @@
 //! "Me" is always a cpal input stream (default or named device).
 //! "Them" follows `audio.system_audio_backend`: ScreenCaptureKit (default),
 //! the cpal loopback tap on the default output device, or a named input
-//! device such as BlackHole (D-system-audio).
+//! device such as BlackHole (the rationale is in `docs/decisions.md`).
 
 use clueless_types::{
     SampleSource, SourceError, SourceFactory, Speaker, StatusSink, SystemAudioBackend,
@@ -46,8 +46,8 @@ impl LiveSources {
 
 impl SourceFactory for LiveSources {
     fn speakers(&self) -> Vec<Speaker> {
-        // The engine opens both and copes with one failing to open
-        // (D-permissions: a missing Screen Recording grant keeps Me working).
+        // The engine opens both and copes with one failing to open:
+        // a missing Screen Recording grant keeps Me working.
         vec![Speaker::Me, Speaker::Them]
     }
 

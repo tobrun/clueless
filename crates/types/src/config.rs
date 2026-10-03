@@ -194,7 +194,7 @@ pub struct LlmConfig {
     pub temperature: f32,
     pub profile_path: Option<String>,
     /// `None` omits `chat_template_kwargs` from requests entirely;
-    /// `Some(false)` sends `enable_thinking: false` (vLLM/Qwen, D-thinking).
+    /// `Some(false)` sends `enable_thinking: false` (vLLM/Qwen).
     pub enable_thinking: Option<bool>,
 }
 

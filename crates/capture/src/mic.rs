@@ -1,5 +1,5 @@
-//! Microphone (and cpal loopback) source over cpal 0.18 (D-device-change,
-//! D-mic-silence).
+//! Microphone (and cpal loopback) source over cpal 0.18; device changes
+//! and the digital-silence check are reasoned about in `docs/decisions.md`.
 //!
 //! The data callback only downmixes and pushes one sample at a time into the
 //! ring (C-audio-callback-realtime). A `DeviceNotAvailable` or
@@ -161,7 +161,7 @@ fn build_stream(
             },
             move |err: cpal::Error| {
                 // May run on the audio thread: only touch the atomic.
-                // D-device-change: cpal reroutes DeviceChanged by itself;
+                // cpal reroutes DeviceChanged by itself;
                 // only these two kinds need a rebuild.
                 if matches!(
                     err.kind(),
@@ -208,7 +208,7 @@ impl CpalSource {
         Ok(Self {
             shared,
             reader,
-            // D-mic-silence: the digital-silence check applies to the Me source.
+            // The digital-silence check applies to the Me source.
             silence: (speaker == Speaker::Me).then(|| SilenceDetector::new(rate)),
         })
     }

@@ -1,5 +1,5 @@
 //! Echo test: decide whether a "Me" final is really the other side's voice
-//! coming back through the speakers (D-echo-filter).
+//! coming back through the speakers.
 //!
 //! The caller holds a Me final, gathers the committed Them utterances plus the
 //! Them text still in progress (appended as one more entry with the open
