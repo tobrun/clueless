@@ -30,6 +30,7 @@ D-persistence: Is anything written to disk?
   ✗ sqlite as in the architecture diagram - belongs to Phase 6
   ✗ append-only JSON lines log - useful, but not asked for
   ⊘ not doing - the transcript lives in memory and is lost on quit or crash; reopen when the post-meeting summary is specced
+  The one thing the app does store is the window frame, in the user defaults; see D-frame-store.
   (2026-10-02)
 
 D-screen-context: Are screenshots sent to the model?
@@ -106,7 +107,7 @@ D-capture-hiding: What happens with "invisible to screen share"?
   (2026-10-02)
 
 D-hotkeys: Which hotkeys, and when are they registered?
-  ✓ meeting-only registration - suggest, clear and the four move keys are registered only while a meeting runs, because a global hotkey takes the key combination away from every other app (2026-10-02) ⚠ Cmd+Enter does not send messages and Cmd+Shift+arrows do not select text in other apps during a meeting, and the three always-on defaults also take Cmd+Shift+R (browser hard reload), Cmd+Backslash and Cmd+Shift+M from other apps all day; every key is configurable
+  ✓ meeting-only registration - suggest, clear and the four move keys are registered only while a meeting runs, because a global hotkey takes the key combination away from every other app (2026-10-02) ⚠ Cmd+Enter does not send messages and Cmd+Shift+arrows do not select text in other apps during a meeting, and the four always-on defaults also take Cmd+Shift+R (browser hard reload), Cmd+Backslash, Cmd+Shift+Backslash (mode switch, added 2026-10-03) and Cmd+Shift+M from other apps all day; every key is configurable; the move keys act on the active window, see D-ui-modes
   ✗ register everything at launch - Cmd+Enter would stop working in Slack and Mail all day
   ✗ detect conflicts with other apps - macOS reported success even when another process held the same combination (probe 2026-10-02)
   (2026-10-02)
@@ -120,6 +121,86 @@ D-suggestion-id: How are late tokens from a cancelled request kept off the scree
   ✓ id on every suggestion event - the overlay drops any delta whose id is not the newest one
   ✗ rely on cancellation alone - a delta already sent to the main queue would still be drawn
   (2026-10-02)
+
+D-ui-modes: How do we remove the fixed size and placement of the hidden overlay?
+  ✓ two modes, a standard window and the hidden overlay, sharing one frame - gives a normal everyday UI and a familiar way to place and size the overlay (2026-10-03)
+  ✗ placement tool only - the user wants the standard window as a real UI (2026-10-03)
+  ✗ make the overlay itself draggable and resizable - gives no standard app UI (2026-10-03)
+  ✗ `overlay.width` / `overlay.x` config keys - needs an app restart for every try, no visual feedback
+  (2026-10-03)
+
+D-window-structure: How are the two modes built?
+  ✓ two windows, each with its own view tree, both rendered from the one `UiModel` on every change - each window keeps the styling that fits it, no view is moved between windows, switching is only show and hide ⚠ every repaint runs twice, and scroll position is per window
+  ✗ two windows, one view tree moved with `setContentView` - the root view is a HUD card with rounded corners made for a borderless panel, so it would need restyling on every move
+  ✗ one window whose style mask, level and sharing type change at runtime - the non-activating panel flag is fixed when the window is created verify: AppKit ignores `NonactivatingPanel` changes after init
+  (2026-10-03)
+
+D-app-presence: Does the app show a Dock icon or a top-left app menu in standard mode?
+  ✓ always menu-bar-only (`Accessory` policy, `LSUIElement` true) in both modes - most discreet, mode switch lives in the status icon menu (2026-10-03) ⚠ the standard window does not appear in the Dock or in `cmd+Tab`
+  ✗ regular app in standard mode only - Dock icon appearing and vanishing during a meeting (2026-10-03)
+  ✗ regular app in both modes - Dock icon visible in screen shares while the overlay is hidden (2026-10-03)
+  (2026-10-03)
+
+D-launch-mode: Which mode does the app start in?
+  ✓ always standard - behaves like a normal app at launch (2026-10-03) ⚠ a launch during a screen share shows the window to viewers until the user switches
+  ✗ last used mode - turned down by the user (2026-10-03)
+  ✗ always hidden - turned down by the user (2026-10-03)
+  (2026-10-03)
+
+D-frame-mapping: What exactly does the hidden overlay copy from the standard window?
+  ✓ the content area (the part below the title bar), same origin and same size - the text sits in the same screen position in both modes, so nothing jumps on a switch
+  ✗ the whole window frame including the title bar - the overlay has no title bar, so its content would shift up by the title bar height on every switch
+  (2026-10-03)
+
+D-frame-store: Where does the shared frame live, and is it remembered across launches?
+  ✓ the standard window is the only store: it uses AppKit frame autosave (`setFrameAutosaveName`), and every change made in hidden mode is written into the standard window too, followed by `saveFrameUsingName` - no file format of our own, no window delegate, no save-on-quit hook (the app exits through `std::process::exit` in `apply_event` and `request_quit`) ⚠ the frame lives in the user defaults of the bundle id, so the dev bundle and an unbundled `cargo run` remember different frames verify: frame autosave restores a saved frame onto a screen that still exists
+  ✗ JSON state file in `~/Library/Application Support/clueless/` - needs a window delegate or notifications to know when to save, plus parsing and error handling for a few numbers
+  ✗ keys in `config.toml` - the app never writes its config; the user would edit numbers by hand
+  ✗ not remembered - the user would place the window again on every launch, which is the complaint this change exists to fix
+  (2026-10-03)
+
+D-standard-style: What does the standard window look like?
+  ✓ titled, closable, resizable, title "clueless", normal level, default Spaces behaviour, opaque with shadow, root view using the window background material with square corners - the plain macOS look (2026-10-03)
+  ✗ miniaturizable - a menu-bar-only app has no Dock icon to restore from, so a minimized window is easy to lose
+  ✗ always on top - turned down by the user (2026-10-03)
+  (2026-10-03)
+
+D-space: On which Space does the standard window appear when the user switches to it from another Space?
+  ✓ the Space the user is on (`MoveToActiveSpace` collection behaviour) - the switch must not throw the user to a different Space in the middle of a meeting
+  ✗ the Space where the window was last shown (AppKit default) - `makeKeyAndOrderFront` would change Space under the user
+  (2026-10-03)
+
+D-capture-scope: Is the standard window hidden from screen capture?
+  ✓ never; it always uses the default sharing type, and `overlay.hide_from_capture` keeps applying to the hidden overlay only - the two modes exist so one is visible and one is not
+  ✗ apply `hide_from_capture` to both - makes the modes differ only in chrome
+  (2026-10-03)
+
+D-mode-switch: What happens on a mode switch?
+  ✓ always show the new mode's window at the shared frame, also when the UI was toggled hidden; going to hidden mode orders out the standard window, resets the overlay to click-through and gives keyboard focus back to the app that had it before; going to standard mode orders out the overlay and brings the window to the front with `makeKeyAndOrderFront` plus `NSApplication::activate` - asking for a mode means wanting to see it, and a hotkey press in the middle of typing must not leave the keyboard pointed at an invisible app verify: `-[NSApplication deactivate]` returns focus to the previous app; fallback is `hide:` followed by `orderFrontRegardless` on the overlay
+  ✗ keep the hidden state across a switch - a switch that shows nothing looks broken
+  (2026-10-03)
+
+D-close: What do the red close button and `cmd+W` do in standard mode?
+  ✓ hide the window through the same path as the show/hide action, so the menu title stays correct; the app keeps running in the menu bar - a menu-bar app must not quit when its window closes
+  ✗ quit the app - ends a running meeting by accident
+  ✗ let AppKit close it with no hook - the menu would still say "Hide Window"
+  (2026-10-03)
+
+D-key-equivalents: How do `cmd+C`, `cmd+A`, `cmd+W` and `cmd+Q` work in the standard window without an app menu?
+  ✓ install a main menu that is never drawn (an `Accessory` app shows no menu bar) with Copy, Select All, Close Window and Quit items; Quit goes through `request_quit` - AppKit takes these shortcuts from the main menu verify: an `Accessory` app with a key window handles main-menu key equivalents
+  ✗ no shortcuts - a standard window where copy and close do not work feels broken
+  ✗ local key event monitor - reimplements what the main menu already does
+  (2026-10-03)
+
+D-mode-hotkey: Which hotkey switches modes, and when is it registered?
+  ✓ new config key `hotkeys.toggle_mode`, default `cmd+shift+Backslash`, always registered - sits next to `toggle_overlay` (`cmd+Backslash`) verify: no common macOS app claims this combination
+  ✗ meeting-only registration - the user places the window before a meeting starts
+  (2026-10-03)
+
+D-screen-change: What if displays change while the app runs?
+  ✗ observe screen-change notifications and refit the overlay - needs notification plumbing the crate does not have, for a case nobody has hit
+  ⊘ not doing - no screen-change handling exists today, AppKit moves the titled window by itself, and the overlay is fitted again on the next switch to hidden mode (D-fit); reopen if the overlay is reported stranded off screen after unplugging a display
+  (2026-10-03)
 
 ## Capture
 
