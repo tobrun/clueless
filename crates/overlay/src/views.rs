@@ -1,8 +1,11 @@
-//! The view tree inside the panel: an [`NSVisualEffectView`] (HUD window
-//! material, rounded 12 pt) holding the status line, the transcript ticker
-//! and a scrollable suggestion text view. Plain AppKit widgets with manual
-//! frames; all rendering flows from [`crate::model::UiModel`] via
-//! [`crate::ui`].
+//! The view tree inside each window: an [`NSVisualEffectView`] holding the
+//! status line, the transcript ticker and a scrollable suggestion text view.
+//! Installed twice, once per window ([`crate::panel::OverlayPanel`] and
+//! [`crate::window::StandardWindow`]), differing only in [`ViewStyle`]: the
+//! panel keeps its rounded HUD card, the standard window gets the opaque
+//! window-background material (spec D-standard-style). Plain AppKit widgets
+//! with manual frames; all rendering flows from [`crate::model::UiModel`]
+//! via [`crate::ui`].
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -14,7 +17,6 @@ use objc2_app_kit::{
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, ns_string};
 
 use crate::model::{UiModel, speaker_label};
-use crate::panel::PANEL_SIZE;
 
 /// Corner radius of the panel background (spec: 12).
 const CORNER_RADIUS: f64 = 12.0;
@@ -24,6 +26,17 @@ const MARGIN: f64 = 14.0;
 const STATUS_HEIGHT: f64 = 14.0;
 /// One ticker line's height; the ticker shows three.
 const TICKER_LINE_HEIGHT: f64 = 16.0;
+
+/// How the shared view tree dresses the window it is installed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewStyle {
+    /// Hidden overlay: HUD material, rounded 12 pt card.
+    Hud,
+    /// Standard window: window-background material, square corners; the
+    /// opaque window and its shadow are window properties AppKit already
+    /// gives a titled window (spec D-standard-style).
+    Window,
+}
 
 /// Handles to the labels the UI layer updates.
 pub struct OverlayViews {
@@ -45,27 +58,39 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
-/// Build the content view for `panel` and return the update handles.
-pub fn install(panel: &Retained<NSWindow>, mtm: MainThreadMarker) -> OverlayViews {
-    let (width, height) = PANEL_SIZE;
+/// Build the content view for `window` at its current content `size` and
+/// return the update handles.
+pub fn install(
+    window: &NSWindow,
+    size: (f64, f64),
+    style: ViewStyle,
+    mtm: MainThreadMarker,
+) -> OverlayViews {
+    let (width, height) = size;
     let inner_width = width - 2.0 * MARGIN;
 
     let effect = NSVisualEffectView::new(mtm);
     effect.setFrame(rect(0.0, 0.0, width, height));
-    effect.setMaterial(NSVisualEffectMaterial::HUDWindow);
+    effect.setMaterial(match style {
+        ViewStyle::Hud => NSVisualEffectMaterial::HUDWindow,
+        ViewStyle::Window => NSVisualEffectMaterial::WindowBackground,
+    });
     effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
     effect.setState(NSVisualEffectState::Active);
-    // Rounded card: layer-backed with a corner radius. The layer is reached
-    // untyped because the workspace pins objc2-app-kit without the
-    // `objc2-quartz-core` feature; CALayer always answers these two setters.
+    // Rounded card for the HUD style: layer-backed with a corner radius.
+    // The layer is reached untyped because the workspace pins objc2-app-kit
+    // without the `objc2-quartz-core` feature; CALayer always answers these
+    // two setters. The window style stays square.
     effect.setWantsLayer(true);
-    // SAFETY: `-layer` returns the CALayer created by wantsLayer;
-    // setCornerRadius:/setMasksToBounds: take a CGFloat and a BOOL.
-    unsafe {
-        let layer: Option<Retained<AnyObject>> = msg_send![&effect, layer];
-        if let Some(layer) = layer {
-            let _: () = msg_send![&layer, setCornerRadius: CORNER_RADIUS];
-            let _: () = msg_send![&layer, setMasksToBounds: true];
+    if style == ViewStyle::Hud {
+        // SAFETY: `-layer` returns the CALayer created by wantsLayer;
+        // setCornerRadius:/setMasksToBounds: take a CGFloat and a BOOL.
+        unsafe {
+            let layer: Option<Retained<AnyObject>> = msg_send![&effect, layer];
+            if let Some(layer) = layer {
+                let _: () = msg_send![&layer, setCornerRadius: CORNER_RADIUS];
+                let _: () = msg_send![&layer, setMasksToBounds: true];
+            }
         }
     }
 
@@ -129,6 +154,9 @@ pub fn install(panel: &Retained<NSWindow>, mtm: MainThreadMarker) -> OverlayView
     text.setVerticallyResizable(true);
     text.setHorizontallyResizable(false);
     text.setFrameSize(NSSize::new(inner_width, scroll_top - scroll_y));
+    // The view itself follows the clip view's width on window resizes, so
+    // wrapped text re-wraps to the new width (spec D-resize).
+    text.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
     // The container tracks the view width so the text wraps; the
     // `NSTextContainer` type is not in the enabled feature set, so this is
     // untyped messaging on the live container object.
@@ -147,7 +175,7 @@ pub fn install(panel: &Retained<NSWindow>, mtm: MainThreadMarker) -> OverlayView
     effect.addSubview(&status);
     effect.addSubview(&ticker);
     effect.addSubview(&scroll);
-    panel.setContentView(Some(&effect));
+    window.setContentView(Some(&effect));
 
     OverlayViews {
         effect,

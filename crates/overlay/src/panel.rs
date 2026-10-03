@@ -1,8 +1,10 @@
-//! The floating panel: an [`NSPanel`] subclass that is click-through by
+//! The hidden-mode panel: an [`NSPanel`] subclass that is click-through by
 //! default and only becomes key window in interactive mode, sits at the
 //! status window level on every space, and moves clamped to the visible
-//! frame. The rationale for the objc2 stack, the status-level
-//! panel and capture hiding is in `docs/decisions.md`.
+//! frame. Its frame is no longer fixed: it copies the standard window's
+//! content frame on every mode switch (spec D-frame-mapping). The rationale
+//! for the objc2 stack, the status-level panel and capture hiding is in
+//! `docs/decisions.md`.
 
 use std::cell::Cell;
 
@@ -10,17 +12,13 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSPanel, NSStatusWindowLevel, NSWindowCollectionBehavior,
-    NSWindowSharingType, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSPanel, NSStatusWindowLevel, NSWindow,
+    NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
+use crate::mode::Frame;
 use crate::model::clamp_origin;
-
-/// Panel size in points (spec: 560 by 320).
-pub const PANEL_SIZE: (f64, f64) = (560.0, 320.0);
-/// Points below the menu bar for the default position (spec: 24).
-pub const TOP_INSET: f64 = 24.0;
 
 #[derive(Debug, Default)]
 pub(crate) struct PanelIvars {
@@ -57,14 +55,14 @@ define_class!(
 );
 
 impl OverlayPanel {
-    /// Create the configured panel, not yet ordered in. The content view is
-    /// installed by the caller ([`crate::views::install`]).
-    pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
+    /// Create the configured panel at `frame` (its content frame - the panel
+    /// is borderless, so frame and content frame are the same), not yet
+    /// ordered in. The content view is installed by the caller
+    /// ([`crate::views::install`]).
+    pub fn new(mtm: MainThreadMarker, frame: Frame) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(PanelIvars::default());
-        let rect = NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(PANEL_SIZE.0, PANEL_SIZE.1),
-        );
+        let (x, y, w, h) = frame;
+        let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
         // SAFETY: NSPanel's designated initialiser signature; the returned
         // object is always this class.
         let this: Retained<Self> = unsafe {
@@ -125,39 +123,52 @@ impl OverlayPanel {
         });
     }
 
-    /// Shift the panel by `(dx, dy)` points, kept inside the screen's
-    /// visible frame (spec: move keys never push it off screen).
-    pub fn move_by(&self, dx: f64, dy: f64) {
+    /// The panel's current frame as a [`Frame`]; for this borderless panel
+    /// the frame is the content frame the standard window mirrors.
+    pub fn content_frame(&self) -> Frame {
         let frame = self.frame();
-        let target = (frame.origin.x + dx, frame.origin.y + dy);
-        let origin = clamp_origin(target, PANEL_SIZE, visible_frame_of(self));
-        self.setFrameOrigin(NSPoint::new(origin.0, origin.1));
+        (
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+        )
     }
 
-    /// Place the panel top-centre of its screen, [`TOP_INSET`] points below
-    /// the menu bar (spec default position), clamped on screen.
-    pub fn place_default(&self) {
-        let visible = visible_frame_of(self);
-        let raw = (
-            visible.0 + (visible.2 - PANEL_SIZE.0) / 2.0,
-            visible.1 + visible.3 - TOP_INSET - PANEL_SIZE.1,
+    /// Move and resize the panel to `frame` in one step (spec D-frame-mapping:
+    /// the overlay shows exactly the standard window's content area).
+    pub fn set_frame(&self, frame: Frame) {
+        let (x, y, w, h) = frame;
+        self.setFrameOrigin(NSPoint::new(x, y));
+        self.setContentSize(NSSize::new(w, h));
+    }
+
+    /// Shift the panel by `(dx, dy)` points, clamped with its real size and
+    /// kept inside the screen's visible frame (spec D-move-keys: move keys
+    /// never push the UI off screen).
+    pub fn move_by(&self, dx: f64, dy: f64) {
+        let frame = self.content_frame();
+        let origin = clamp_origin(
+            (frame.0 + dx, frame.1 + dy),
+            (frame.2, frame.3),
+            visible_frame_of(self),
         );
-        let origin = clamp_origin(raw, PANEL_SIZE, visible);
         self.setFrameOrigin(NSPoint::new(origin.0, origin.1));
     }
 }
 
-/// The visible frame of the screen the panel is on, falling back to the main
-/// screen and then to a 1440x900 safe default.
+/// The visible frame of the screen `window` is on, falling back to the main
+/// screen and then to a 1440x900 safe default. Works for any window - the
+/// panel before it is ordered in and the standard window alike.
 ///
-/// The workspace pins `objc2-app-kit` without the `NSScreen` feature (owned
-/// by change set 1), so the screen is reached through untyped messaging on
-/// the `NSScreen` class, which every macOS has.
-pub fn visible_frame_of(panel: &OverlayPanel) -> (f64, f64, f64, f64) {
+/// The workspace pins `objc2-app-kit` without the `NSScreen` feature, so the
+/// screen is reached through untyped messaging on the `NSScreen` class,
+/// which every macOS has.
+pub fn visible_frame_of(window: &NSWindow) -> (f64, f64, f64, f64) {
     // SAFETY: `-screen` returns the window's NSScreen or nil; `+[NSScreen
     // mainScreen]` and `-visibleFrame` are ancient stable APIs.
     let screen = unsafe {
-        let screen: Option<Retained<AnyObject>> = msg_send![panel, screen];
+        let screen: Option<Retained<AnyObject>> = msg_send![window, screen];
         screen.or_else(|| msg_send![class!(NSScreen), mainScreen])
     };
     let Some(screen) = screen else {
@@ -171,20 +182,4 @@ pub fn visible_frame_of(panel: &OverlayPanel) -> (f64, f64, f64, f64) {
         rect.size.width,
         rect.size.height,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn place_default_math_centers_and_tops_the_panel() {
-        // Pure math of `place_default` on a 1440x900 screen.
-        let visible = (0.0, 0.0, 1440.0, 900.0);
-        let raw = (
-            visible.0 + (visible.2 - PANEL_SIZE.0) / 2.0,
-            visible.1 + visible.3 - TOP_INSET - PANEL_SIZE.1,
-        );
-        assert_eq!(clamp_origin(raw, PANEL_SIZE, visible), (440.0, 556.0));
-    }
 }

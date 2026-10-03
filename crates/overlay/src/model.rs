@@ -279,8 +279,9 @@ impl UiModel {
         self.meeting
     }
 
-    /// Meeting-only hotkeys (suggest, clear) are registered while a meeting
-    /// runs (spec: registered on `Running`, unregistered on `Idle`).
+    /// Meeting-only hotkeys (suggest, clear and the four move keys) are
+    /// registered while a meeting runs (spec: registered on `Running`,
+    /// unregistered on `Idle`).
     pub fn meeting_hotkeys_wanted(&self) -> bool {
         self.meeting == MeetingState::Running
     }
