@@ -58,6 +58,12 @@ impl Changes {
         self.terminate |= other.terminate;
         self.hotkeys |= other.hotkeys;
     }
+
+    /// Whether any rendered text part changed: only these three force a
+    /// repaint; meeting, hotkey and terminate signals never touch pixels.
+    pub fn repaints(&self) -> bool {
+        self.status || self.ticker || self.suggestion
+    }
 }
 
 /// One entry of the ticker: the latest known text of one utterance.
@@ -524,6 +530,101 @@ mod tests {
     }
 
     // --- meeting state, hotkeys, quit ---
+
+    #[test]
+    fn repaints_tracks_only_the_visible_parts() {
+        assert!(!Changes::NONE.repaints());
+        assert!(
+            Changes {
+                status: true,
+                ..Changes::NONE
+            }
+            .repaints()
+        );
+        assert!(
+            Changes {
+                ticker: true,
+                ..Changes::NONE
+            }
+            .repaints()
+        );
+        assert!(
+            Changes {
+                suggestion: true,
+                ..Changes::NONE
+            }
+            .repaints()
+        );
+        // Signals that never touch pixels never force a repaint.
+        assert!(
+            !Changes {
+                meeting: true,
+                terminate: true,
+                hotkeys: true,
+                ..Changes::NONE
+            }
+            .repaints()
+        );
+    }
+
+    /// The change report `apply` returns is what the UI repaints and
+    /// re-registers from, so every event class must report its own part -
+    /// dropping a field from any of `apply`'s literals must fail here.
+    #[test]
+    fn apply_reports_exactly_the_changed_parts() {
+        let mut m = UiModel::default();
+        let c = m.apply(UiEvent::Status {
+            source: StatusSource::App,
+            level: StatusLevel::Info,
+            text: "ready".into(),
+        });
+        assert!(c.status && !c.ticker && !c.suggestion && !c.meeting && !c.hotkeys);
+
+        let c = m.apply(UiEvent::TranscriptInterim {
+            id: uid(Speaker::Me, 0),
+            text: "hello".into(),
+        });
+        assert!(c.ticker && !c.status && !c.suggestion);
+
+        m.apply(UiEvent::SuggestionStart { id: 1 });
+        let c = m.apply(UiEvent::SuggestionStart { id: 2 });
+        assert!(c.suggestion && !c.status && !c.ticker);
+        let c = m.apply(UiEvent::SuggestionDelta {
+            id: 2,
+            text: "try".into(),
+        });
+        assert!(c.suggestion && !c.status && !c.ticker);
+        let c = m.apply(UiEvent::SuggestionEnd {
+            id: 2,
+            end: SuggestionEnd::Cancelled,
+        });
+        assert!(c.suggestion && !c.status && !c.ticker);
+        let c = m.apply(UiEvent::ClearSuggestion);
+        assert!(c.suggestion && !c.status && !c.ticker);
+
+        // Running registers the meeting keys, so the switch reports both;
+        // a repeated Running changes nothing but `meeting` itself.
+        let c = m.apply(UiEvent::MeetingState(MeetingState::Running));
+        assert!(c.meeting && c.hotkeys && !c.repaints());
+        let c = m.apply(UiEvent::MeetingState(MeetingState::Running));
+        assert!(c.meeting && !c.hotkeys);
+
+        // Ignored events report nothing; a drop that actually removes a
+        // line reports the ticker.
+        m.apply(UiEvent::TranscriptInterim {
+            id: uid(Speaker::Me, 0),
+            text: "hello".into(),
+        });
+        let c = m.apply(UiEvent::TranscriptDropped {
+            id: uid(Speaker::Me, 0),
+        });
+        assert!(c.ticker && !c.status && !c.suggestion);
+        let c = m.apply(UiEvent::TranscriptDropped {
+            id: uid(Speaker::Them, 99),
+        });
+        assert!(!c.status && !c.ticker && !c.suggestion);
+        assert_eq!(m.apply(UiEvent::SourcesDrained), Changes::NONE);
+    }
 
     #[test]
     fn meeting_hotkeys_follow_the_meeting_state() {

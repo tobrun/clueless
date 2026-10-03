@@ -22,11 +22,9 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 
 use crate::app_menu;
-use crate::hotkeys::{
-    self, HotkeyAction, MOVE_STEP, ParsedHotkey, register_always_on, sync_meeting_keys,
-};
+use crate::hotkeys::{self, HotkeyAction, ParsedHotkey, register_always_on, sync_meeting_keys};
 use crate::mode::{self, Presentation, UiMode};
-use crate::model::UiModel;
+use crate::model::{Changes, UiModel};
 use crate::panel::{self, OverlayPanel};
 use crate::status_item::StatusItemController;
 use crate::views::{self, OverlayViews, ViewStyle};
@@ -65,18 +63,25 @@ fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
 }
 
 impl Ui {
-    /// One move-key press applied to the window of the active mode. Hidden
-    /// mode mirrors the panel's new frame back into the standard window,
-    /// which saves it (spec D-move-keys + D-frame-store: the frame is the
-    /// single source of truth for where the UI is).
+    /// One move-key press applied to the window of the active mode,
+    /// followed by the shared-frame write-back (spec D-move-keys).
     fn move_active(&mut self, dx: f64, dy: f64) {
-        match self.presentation.mode {
-            UiMode::Standard => self.main.move_by(dx, dy),
-            UiMode::Hidden => {
-                self.panel.move_by(dx, dy);
-                let frame = self.panel.content_frame();
-                self.main.set_content_frame(frame);
-            }
+        if self.presentation.mode == UiMode::Standard {
+            self.main.move_by(dx, dy);
+            return;
+        }
+        self.panel.move_by(dx, dy);
+        self.mirror_after_move();
+    }
+
+    /// Hidden mode mirrors the panel's moved frame back into the standard
+    /// window, which saves it (spec D-frame-store: the frame is the single
+    /// source of truth for where the UI is).
+    fn mirror_after_move(&mut self) {
+        let mirrored =
+            mode::mirrored_move_target(self.presentation.mode, self.panel.content_frame());
+        if let Some(frame) = mirrored {
+            self.main.set_content_frame(frame);
         }
     }
 }
@@ -120,8 +125,15 @@ fn force_activate(app: &NSApplication) {
 /// app activation alone is not enough on macOS 26).
 fn present_standard_window(ui: &Ui, app: &NSApplication) {
     ui.panel.orderOut(None);
-    ui.main.makeKeyAndOrderFront(None);
-    ui.main.orderFrontRegardless();
+    present_standard(&ui.main, app);
+}
+
+/// Order the standard window in front of everything and take key status;
+/// shared by every path that shows it (see [`present_standard_window`] for
+/// the full presentation, which also orders the panel out).
+fn present_standard(main: &StandardWindow, app: &NSApplication) {
+    main.makeKeyAndOrderFront(None);
+    main.orderFrontRegardless();
     force_activate(app);
 }
 
@@ -170,49 +182,73 @@ fn switch_mode(ui: &mut Ui, mtm: MainThreadMarker) {
 /// Apply an action on the main thread; the windows and `status_item` change
 /// here, engine commands go out through the sink.
 fn handle_action(action: HotkeyAction) {
-    if let Some(mtm) = MainThreadMarker::new() {
-        with_ui(|ui| {
-            if let Some(command) = action.engine_command() {
-                (ui.commands)(command);
-                return;
-            }
-            match action {
-                HotkeyAction::Suggest
-                | HotkeyAction::ClearSuggestion
-                | HotkeyAction::ToggleMeeting => {
-                    unreachable!("engine commands exit through the sink above")
-                }
-                HotkeyAction::ToggleOverlay => {
-                    ui.presentation.toggle_visible();
-                    if ui.presentation.visible {
-                        show_active_window(ui, mtm);
-                    } else {
-                        ui.panel.orderOut(None);
-                        ui.main.orderOut(None);
-                    }
-                    refresh_menu(ui, mtm);
-                }
-                HotkeyAction::ToggleMode => {
-                    switch_mode(ui, mtm);
-                    refresh_menu(ui, mtm);
-                }
-                HotkeyAction::ToggleClickThrough => {
-                    // An overlay-only feature: the standard window always
-                    // takes its clicks (spec D-click-through-standard).
-                    if ui.presentation.click_through_allowed() {
-                        let interactive = !ui.panel.is_interactive();
-                        ui.panel.set_interactive(interactive);
-                        if interactive {
-                            ui.panel.makeKeyAndOrderFront(None);
-                        }
-                    }
-                }
-                HotkeyAction::MoveLeft => ui.move_active(-MOVE_STEP, 0.0),
-                HotkeyAction::MoveRight => ui.move_active(MOVE_STEP, 0.0),
-                HotkeyAction::MoveUp => ui.move_active(0.0, MOVE_STEP),
-                HotkeyAction::MoveDown => ui.move_active(0.0, -MOVE_STEP),
-            }
-        });
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    with_ui(|ui| {
+        let Some(command) = action.engine_command() else {
+            apply_local_action(ui, action, mtm);
+            return;
+        };
+        (ui.commands)(command);
+    });
+}
+
+/// Apply a non-engine [`HotkeyAction`] to the windows and presentation
+/// directly; the engine-command variants can never reach here because
+/// [`handle_action`] sends them out through the sink first.
+fn apply_local_action(ui: &mut Ui, action: HotkeyAction, mtm: MainThreadMarker) {
+    match action {
+        HotkeyAction::Suggest | HotkeyAction::ClearSuggestion | HotkeyAction::ToggleMeeting => {
+            unreachable!("engine commands exit through the sink above")
+        }
+        HotkeyAction::ToggleOverlay => {
+            toggle_overlay(ui, mtm);
+        }
+        HotkeyAction::ToggleMode => {
+            switch_mode(ui, mtm);
+            refresh_menu(ui, mtm);
+        }
+        HotkeyAction::ToggleClickThrough => {
+            toggle_click_through(ui);
+        }
+        HotkeyAction::MoveLeft
+        | HotkeyAction::MoveRight
+        | HotkeyAction::MoveUp
+        | HotkeyAction::MoveDown => {
+            let (dx, dy) = action.move_delta().expect("move actions carry a delta");
+            ui.move_active(dx, dy);
+        }
+    }
+}
+
+/// Show or hide the active mode's window and refresh the menu titles to
+/// match (spec D-toggle-visibility).
+fn toggle_overlay(ui: &mut Ui, mtm: MainThreadMarker) {
+    ui.presentation.toggle_visible();
+    if ui.presentation.visible {
+        show_active_window(ui, mtm);
+    } else {
+        ui.panel.orderOut(None);
+        ui.main.orderOut(None);
+    }
+    refresh_menu(ui, mtm);
+}
+
+/// Flip the panel's click-through state (spec D-click-through-standard:
+/// an overlay-only feature, the standard window always takes its clicks).
+fn toggle_click_through(ui: &mut Ui) {
+    if ui.presentation.click_through_allowed() {
+        set_panel_interactive(ui, !ui.panel.is_interactive());
+    }
+}
+
+/// Apply the interactive flag; becoming interactive also makes the panel
+/// key so it can take keyboard focus (spec: interactive mode).
+fn set_panel_interactive(ui: &mut Ui, interactive: bool) {
+    ui.panel.set_interactive(interactive);
+    if interactive {
+        ui.panel.makeKeyAndOrderFront(None);
     }
 }
 
@@ -241,6 +277,53 @@ fn request_quit() {
     });
 }
 
+/// Repaint both view trees when a visible part of the model changed. Both
+/// windows render: only one is on screen, but the hidden one must be current
+/// when a switch brings it forward. The standard window always follows its
+/// transcript (spec D-autoscroll-standard); the panel scrolls to the end only
+/// while click-through is on, so a user reading history keeps their scroll
+/// position in interactive mode (spec: interactive mode).
+fn repaint_views(ui: &mut Ui, changes: &Changes) {
+    if changes.repaints() {
+        let scroll = !ui.panel.is_interactive();
+        ui.panel_views.render(&ui.model, scroll);
+        ui.window_views.render(&ui.model, true);
+    }
+}
+
+/// Keep the menu-bar item in step with the meeting state: its icon and its
+/// menu, whose titles depend on the mode as well (spec D-mode-menu).
+fn update_meeting_indicator(ui: &Ui, changes: &Changes, mtm: MainThreadMarker) {
+    if changes.meeting {
+        ui.status_item
+            .set_meeting_running(ui.model.meeting() == MeetingState::Running, mtm);
+        refresh_menu(ui, mtm);
+    }
+}
+
+/// Re-register the meeting-only hotkeys when the model says the wanted set
+/// changed; a key that cannot be registered is logged, not fatal.
+fn sync_hotkeys(ui: &mut Ui, changes: &Changes) {
+    let Some(manager) = ui.hotkey_manager.as_ref().filter(|_| changes.hotkeys) else {
+        return;
+    };
+    let meeting = ui.model.meeting_hotkeys_wanted();
+    log_hotkey_errors(sync_meeting_keys(
+        manager,
+        &ui.parsed_hotkeys,
+        meeting,
+        &mut ui.registered,
+    ));
+}
+
+/// Surface the meeting-key registrations that failed; a failed meeting-key
+/// registration is not fatal (spec: the always-on keys keep working).
+fn log_hotkey_errors(results: Vec<Result<HotkeyAction, String>>) {
+    for err in results.into_iter().filter_map(Result::err) {
+        tracing::warn!(%err, "meeting hotkey registration failed");
+    }
+}
+
 /// Apply one UI event on the main thread: update the model, repaint the
 /// parts that changed, sync the menu-bar item and the meeting-only hotkeys,
 /// and terminate when the quit path is released.
@@ -250,32 +333,9 @@ fn apply_event(event: UiEvent) {
     };
     let Some(changes) = with_ui(|ui| {
         let changes = ui.model.apply(event);
-        if changes.status || changes.ticker || changes.suggestion {
-            // Spec: deltas scroll to the end unless interactive mode is on.
-            // Both windows render: only one is on screen, but the hidden one
-            // must be current when a switch brings it forward. The standard
-            // window is always interactive, so it follows its transcript.
-            let scroll = !ui.panel.is_interactive();
-            ui.panel_views.render(&ui.model, scroll);
-            ui.window_views.render(&ui.model, true);
-        }
-        if changes.meeting {
-            ui.status_item
-                .set_meeting_running(ui.model.meeting() == MeetingState::Running, mtm);
-            refresh_menu(ui, mtm);
-        }
-        if changes.hotkeys
-            && let Some(manager) = ui.hotkey_manager.as_ref()
-        {
-            let meeting = ui.model.meeting_hotkeys_wanted();
-            for result in
-                sync_meeting_keys(manager, &ui.parsed_hotkeys, meeting, &mut ui.registered)
-            {
-                if let Err(err) = result {
-                    tracing::warn!(%err, "meeting hotkey registration failed");
-                }
-            }
-        }
+        repaint_views(ui, &changes);
+        update_meeting_indicator(ui, &changes, mtm);
+        sync_hotkeys(ui, &changes);
         changes
     }) else {
         return;
@@ -311,6 +371,11 @@ fn on_hotkey_event(event: GlobalHotKeyEvent) {
         .ok()
         .and_then(|map| map.get(&event.id()).copied());
     let Some(action) = action else { return };
+    dispatch_action(action);
+}
+
+/// Hop a pressed action onto the main thread, where the [`Ui`] lives.
+fn dispatch_action(action: HotkeyAction) {
     DispatchQueue::main().exec_async(move || handle_action(action));
 }
 
@@ -319,6 +384,104 @@ fn on_hotkey_event(event: GlobalHotKeyEvent) {
 pub fn run_on_main_thread(config: Config, commands: CommandSink) {
     let mtm = MainThreadMarker::new().expect("overlay::run_on_main_thread runs on the main thread");
     run(mtm, config, commands);
+}
+
+/// What [`run`] wires up for the global hotkeys: the manager (when global
+/// hotkeys are available at all), everything parsed from the config, and the
+/// keys currently registered.
+#[derive(Default)]
+struct HotkeyWiring {
+    manager: Option<GlobalHotKeyManager>,
+    parsed: Vec<ParsedHotkey>,
+    registered: Vec<(u32, HotkeyAction)>,
+}
+
+/// The standard window's close handler: hide instead of close; the app keeps
+/// running in the menu bar (spec D-close). The close button fires on the
+/// main run loop.
+fn on_main_window_close() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    with_ui(|ui| {
+        ui.presentation.hide();
+        ui.main.orderOut(None);
+        refresh_menu(ui, mtm);
+    });
+}
+
+/// Build the menu-bar item with its four callbacks. The meeting toggle goes
+/// straight to the sink; the other three run on the main thread, where the
+/// [`Ui`] lives.
+fn install_status_item(mtm: MainThreadMarker, commands: CommandSink) -> StatusItemController {
+    StatusItemController::new(
+        mtm,
+        false,
+        Presentation::launch(),
+        move || commands(EngineCommand::ToggleMeeting),
+        post_toggle_overlay,
+        post_toggle_mode,
+        quit_from_menu,
+    )
+}
+
+/// Menu Show/Hide item: hop the toggle onto the main thread.
+fn post_toggle_overlay() {
+    dispatch_action(HotkeyAction::ToggleOverlay);
+}
+
+/// Menu mode-switch item: hop the switch onto the main thread.
+fn post_toggle_mode() {
+    dispatch_action(HotkeyAction::ToggleMode);
+}
+
+/// Menu and `cmd+Q` quit: the deadline timer is a main-thread object, so
+/// only proceed when running there.
+fn quit_from_menu() {
+    if MainThreadMarker::new().is_some() {
+        request_quit();
+    }
+}
+
+/// Parse every configured hotkey; a bad config string is reported through
+/// the status line and yields no wiring (spec: bad hotkey shows a status
+/// error, app keeps running).
+fn parse_hotkeys(config: &Config) -> Option<Vec<ParsedHotkey>> {
+    hotkeys::parse_all(&config.hotkeys)
+        .inspect_err(|err| {
+            tracing::warn!("{err}");
+            post_status(err.to_string())
+        })
+        .ok()
+}
+
+/// Route presses by id, register the always-on keys and keep the manager
+/// alive; per-key and manager-level failures surface as status errors, never
+/// as a dead app.
+fn wire_hotkeys(parsed: Vec<ParsedHotkey>) -> Option<HotkeyWiring> {
+    let map = parsed.iter().map(|p| (p.hotkey.id, p.action)).collect();
+    let _ = ACTION_BY_ID.set(Mutex::new(map));
+    GlobalHotKeyEvent::set_event_handler(Some(on_hotkey_event));
+    let manager = GlobalHotKeyManager::new()
+        .map_err(|err| {
+            let msg = format!("global hotkeys unavailable: {err}");
+            tracing::warn!("{msg}");
+            post_status(msg)
+        })
+        .ok()?;
+    let (registered, errors) = register_always_on(&manager, &parsed);
+    errors.into_iter().for_each(|err| {
+        // The status line is the user-facing surface (spec: bad hotkey keeps
+        // the app running), but leave a durable trace too, like the
+        // meeting-key path does in `log_hotkey_errors`.
+        tracing::warn!("{err}");
+        post_status(err);
+    });
+    Some(HotkeyWiring {
+        manager: Some(manager),
+        parsed,
+        registered,
+    })
 }
 
 /// Build both windows, the status item, the main menu and the hotkeys, and
@@ -332,19 +495,7 @@ pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {
     // The standard window first: its restored (or default) content frame
     // seeds the panel's frame (spec D-frame-mapping, D-default-frame).
     let main = StandardWindow::new(mtm);
-    main.set_on_close(|| {
-        // The close button fires on the main run loop.
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
-        with_ui(|ui| {
-            // Hide instead of close; the app keeps running in the menu bar
-            // (spec D-close).
-            ui.presentation.hide();
-            ui.main.orderOut(None);
-            refresh_menu(ui, mtm);
-        });
-    });
+    main.set_on_close(on_main_window_close);
     let main_size = main.content_frame();
     let window_views = views::install(&main, (main_size.2, main_size.3), ViewStyle::Window, mtm);
 
@@ -358,64 +509,15 @@ pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {
     panel.apply_capture_policy(config.overlay.hide_from_capture);
 
     // Every launch starts standard and visible (spec D-launch-mode); the
-    // panel waits for the first mode switch. Same presentation sequence as
-    // `present_standard_window` (which needs a built `Ui`, not yet here).
-    main.makeKeyAndOrderFront(None);
-    main.orderFrontRegardless();
-    force_activate(&app);
+    // panel has never been ordered in at this point, so the shared core of
+    // `present_standard_window` is the whole story (no `Ui` exists yet).
+    present_standard(&main, &app);
 
-    let status_item = StatusItemController::new(
-        mtm,
-        false,
-        Presentation::launch(),
-        {
-            let commands = commands.clone();
-            move || commands(EngineCommand::ToggleMeeting)
-        },
-        move || {
-            DispatchQueue::main().exec_async(|| {
-                handle_action(HotkeyAction::ToggleOverlay);
-            })
-        },
-        move || {
-            DispatchQueue::main().exec_async(|| {
-                handle_action(HotkeyAction::ToggleMode);
-            })
-        },
-        move || {
-            if MainThreadMarker::new().is_some() {
-                request_quit();
-            }
-        },
-    );
+    let status_item = install_status_item(mtm, commands.clone());
     app_menu::install(mtm, status_item.handler());
-
-    let mut parsed_hotkeys = Vec::new();
-    let mut hotkey_manager = None;
-    let mut registered: Vec<(u32, HotkeyAction)> = Vec::new();
-    match hotkeys::parse_all(&config.hotkeys) {
-        Ok(parsed) => {
-            let mut map = HashMap::new();
-            for p in &parsed {
-                map.insert(p.hotkey.id, p.action);
-            }
-            let _ = ACTION_BY_ID.set(Mutex::new(map));
-            GlobalHotKeyEvent::set_event_handler(Some(on_hotkey_event));
-            match GlobalHotKeyManager::new() {
-                Ok(manager) => {
-                    let (reg, errors) = register_always_on(&manager, &parsed);
-                    for err in errors {
-                        post_status(err);
-                    }
-                    registered = reg;
-                    parsed_hotkeys = parsed;
-                    hotkey_manager = Some(manager);
-                }
-                Err(err) => post_status(format!("global hotkeys unavailable: {err}")),
-            }
-        }
-        Err(err) => post_status(err.to_string()),
-    }
+    let wiring = parse_hotkeys(&config)
+        .and_then(wire_hotkeys)
+        .unwrap_or_default();
 
     UI.with(|cell| {
         *cell.borrow_mut() = Some(Ui {
@@ -426,9 +528,9 @@ pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {
             window_views,
             status_item,
             commands,
-            hotkey_manager,
-            parsed_hotkeys,
-            registered,
+            hotkey_manager: wiring.manager,
+            parsed_hotkeys: wiring.parsed,
+            registered: wiring.registered,
             presentation: Presentation::launch(),
             quit_timer: None,
         })
@@ -461,6 +563,34 @@ mod tests {
         });
         // Still no UI, and the process survived the round trip.
         assert!(UI.with(|cell| cell.borrow().is_none()));
+    }
+
+    /// [`log_hotkey_errors`] passes the successful registrations and logs
+    /// the failed ones without panicking (the app keeps running either way).
+    #[test]
+    fn log_hotkey_errors_accepts_ok_and_err_results() {
+        log_hotkey_errors(vec![
+            Ok(HotkeyAction::Suggest),
+            Err("hotkey cmd+shift+arrows (move_left) could not be registered".into()),
+            Ok(HotkeyAction::MoveUp),
+            Err("hotkey cmd+shift+space (clear) could not be registered".into()),
+        ]);
+    }
+
+    /// [`parse_hotkeys`] over a real [`Config`]: the defaults yield the full
+    /// parsed list, and one bad hotkey string yields `None` (the status
+    /// post is a no-op while no UI exists, so this is testable headlessly).
+    #[test]
+    fn parse_hotkeys_returns_the_parsed_list_or_none_for_a_bad_config() {
+        let parsed = parse_hotkeys(&Config::default()).expect("default hotkeys must parse");
+        assert_eq!(parsed.len(), 10, "every hotkeys table entry is parsed");
+
+        let mut broken = Config::default();
+        broken.hotkeys.toggle_overlay = "cmd+Nope".into();
+        assert!(
+            parse_hotkeys(&broken).is_none(),
+            "an unparseable hotkey yields no wiring"
+        );
     }
 
     /// The reducer half of the wiring, driven through the same

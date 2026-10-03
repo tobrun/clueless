@@ -57,6 +57,19 @@ impl HotkeyAction {
             _ => None,
         }
     }
+
+    /// The window shift one press of a move key performs `(dx, dy)`, or
+    /// `None` for every other action (spec D-move-keys: 40 points per press,
+    /// screen clamping happens where the move is applied).
+    pub fn move_delta(self) -> Option<(f64, f64)> {
+        match self {
+            Self::MoveLeft => Some((-MOVE_STEP, 0.0)),
+            Self::MoveRight => Some((MOVE_STEP, 0.0)),
+            Self::MoveUp => Some((0.0, MOVE_STEP)),
+            Self::MoveDown => Some((0.0, -MOVE_STEP)),
+            _ => None,
+        }
+    }
 }
 
 /// One parsed hotkey with its provenance, so a registration failure can name
@@ -240,6 +253,24 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("Nope"), "names the key: {message}");
         assert!(message.contains("move_left"), "names the field: {message}");
+    }
+
+    #[test]
+    fn move_deltas_shift_one_step_along_the_pressed_axis() {
+        assert_eq!(HotkeyAction::MoveLeft.move_delta(), Some((-MOVE_STEP, 0.0)));
+        assert_eq!(HotkeyAction::MoveRight.move_delta(), Some((MOVE_STEP, 0.0)));
+        assert_eq!(HotkeyAction::MoveUp.move_delta(), Some((0.0, MOVE_STEP)));
+        assert_eq!(HotkeyAction::MoveDown.move_delta(), Some((0.0, -MOVE_STEP)));
+        for action in [
+            HotkeyAction::Suggest,
+            HotkeyAction::ClearSuggestion,
+            HotkeyAction::ToggleMeeting,
+            HotkeyAction::ToggleOverlay,
+            HotkeyAction::ToggleMode,
+            HotkeyAction::ToggleClickThrough,
+        ] {
+            assert_eq!(action.move_delta(), None, "{action:?} is not a move");
+        }
     }
 
     #[test]

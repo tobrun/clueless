@@ -99,27 +99,57 @@ pub fn fit_frame(frame: Frame, visible: Frame) -> Frame {
     (x, y, w, h)
 }
 
+/// The frame the standard window adopts after a move-key press (spec
+/// D-frame-store: one shared frame is the single source of truth for where
+/// the UI is). In hidden mode the panel moved, so its resulting frame is
+/// written back; in standard mode the window moved itself and there is
+/// nothing to mirror.
+pub fn mirrored_move_target(mode: UiMode, panel_frame: Frame) -> Option<Frame> {
+    match mode {
+        UiMode::Standard => None,
+        UiMode::Hidden => Some(panel_frame),
+    }
+}
+
 /// The three status-item menu titles for a meeting state and presentation:
 /// the meeting toggle, the show/hide item naming the active window kind
 /// (spec D-toggle-visibility), and the mode switch naming the destination
 /// (spec D-mode-menu).
 pub fn menu_titles(running: bool, p: Presentation) -> (&'static str, &'static str, &'static str) {
-    let meeting = if running {
+    (
+        meeting_title(running),
+        visibility_title(p),
+        mode_switch_title(p.mode),
+    )
+}
+
+/// The meeting toggle item's title for the current meeting state.
+fn meeting_title(running: bool) -> &'static str {
+    if running {
         "Stop Meeting"
     } else {
         "Start Meeting"
-    };
-    let visibility = match (p.mode, p.visible) {
+    }
+}
+
+/// The show/hide item's title naming the active window kind
+/// (spec D-toggle-visibility).
+fn visibility_title(p: Presentation) -> &'static str {
+    match (p.mode, p.visible) {
         (UiMode::Standard, true) => "Hide Window",
         (UiMode::Standard, false) => "Show Window",
         (UiMode::Hidden, true) => "Hide Overlay",
         (UiMode::Hidden, false) => "Show Overlay",
-    };
-    let mode_switch = match p.mode {
+    }
+}
+
+/// The mode switch item's title naming the destination mode
+/// (spec D-mode-menu).
+fn mode_switch_title(mode: UiMode) -> &'static str {
+    match mode {
         UiMode::Standard => "Switch to Hidden Overlay",
         UiMode::Hidden => "Switch to Standard Window",
-    };
-    (meeting, visibility, mode_switch)
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +281,15 @@ mod tests {
             menu_titles(true, hidden_hidden),
             ("Stop Meeting", "Show Overlay", "Switch to Standard Window")
         );
+    }
+
+    #[test]
+    fn hidden_move_mirrors_the_panel_frame_and_standard_move_does_not() {
+        // D-frame-store: a hidden-mode move writes the panel's moved frame
+        // back so both modes share one rect; a standard-mode move leaves the
+        // panel alone (spec D-move-keys + D-frame-store).
+        let moved: Frame = (120.0, 80.0, 640.0, 400.0);
+        assert_eq!(mirrored_move_target(UiMode::Hidden, moved), Some(moved));
+        assert_eq!(mirrored_move_target(UiMode::Standard, moved), None);
     }
 }
