@@ -7,7 +7,10 @@ on:
 
 jobs:
   checks:
-    runs-on: macos-15
+    # macos-26: the screencapturekit -> apple-metal Swift bridge needs the
+    # macOS 26 SDK to compile (it references MTLSamplerReductionMode behind
+    # an #available(macOS 26.0) check, which still must exist in the SDK).
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
