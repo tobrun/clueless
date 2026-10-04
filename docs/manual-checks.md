@@ -10,6 +10,8 @@ Run from the repo root after `cargo xtask bundle` (assembles `target/debug/cluel
 - [ ] `clueless --help` prints the usage text and exits 0.
 - [ ] `clueless --config /does/not/exist.toml` prints the path and exits 2.
 - [ ] With no `.env` anywhere and no `ASR_*`/`LLM_*` in the environment, startup prints one error naming every missing variable and exits 2.
+- [ ] With an `[llm]` table in `config.toml`, `cargo xtask run` exits 1 within seconds and prints the `startup failed:` config error and the log path.
+- [ ] With that table removed, `cargo xtask run` starts the app and stays attached until the app quits.
 
 ## GUI lifecycle
 
