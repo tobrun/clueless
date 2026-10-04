@@ -38,3 +38,10 @@ C-server-read-only: the app sends only GET /v1/models, POST /v1/audio/transcript
   guaranteed by: asr and llm clients, engine workers (asr_worker, Engine::run, context::assist policy) verified 2026-10-02, extended 2026-10-03 (clients hit only those routes; mock servers in engine/tests/support/mod.rs serve nothing else and every suite passes through them; engine/tests/transcribe.rs::slow_first_final_keeps_order_and_single_flight; engine/tests/meeting.rs::compression_fires_once_and_summary_leads_the_transcript; engine/tests/assist.rs::brainstorm_spaces_requests_by_four_times_the_gap_and_never_overlaps asserts one request in flight and the spacing; engine/tests/assist.rs::brainstorm_does_not_cancel_a_running_answer_and_asks_once_after_it asserts an automatic request waits for the open one)
   relied on by: the shared inference server (other users of it)
   (2026-10-02)
+
+## App startup
+
+C-startup-failure-marker: a startup failure after the logger is open (env file, config or lock setup) appears in the log file as a line containing `startup failed: ` followed by the full message, before the process exits with code 2
+  guaranteed by: the startup_failure helper in crates/app/src/main.rs verified 2026-10-04 (crates/app/tests/startup.rs, one test per failure site)
+  relied on by: cargo xtask run (reads the log bytes appended during the launch and fails with the message)
+  (2026-10-04, D-marker-string)
