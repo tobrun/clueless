@@ -85,6 +85,35 @@ D-single-instance: What stops two copies from running?
   ✗ nothing - two copies would both register hotkeys and both record
   (2026-10-02)
 
+D-failure-channel: How does the app report a startup failure so a user launched through `open` can see it? (2026-10-04, loud-startup-failures/spec.md)
+  ✓ one helper in `main.rs` logs the message at error level, then returns exit code 2 - the log file is the one place a user of the bundled app already looks (docs/troubleshooting.md names it), and the logger writes to stderr too, so terminal runs lose nothing
+  ✗ stderr only (today) - `open` discards it, which is the bug
+  ✗ a macOS alert or notification - a new AppKit path before the run loop exists, for a problem the log and xtask already cover
+
+D-detect-failure: How does xtask learn that the app died at launch? (2026-10-04, loud-startup-failures/spec.md)
+  ✓ read the new bytes of the log file after `open -W` returns and look for the marker - works because the app's failure is now in the log, and the log path is already known to xtask (`log_file_path`)
+  ✗ time the launch and treat a short run as a failure - a user who quits within seconds would be reported as a failure, and a slow failure would be missed
+  ✗ launch the binary directly to get its exit code - permission prompts then name the terminal instead of clueless (docs/troubleshooting.md, `cargo xtask run` entry), and the point of `open` is to avoid that
+  ✗ `open --stderr FILE` capture - gets all log lines, not only failures, and `open` still drops the exit code, so a marker is needed anyway
+
+D-marker-string: What exactly does xtask look for? (2026-10-04, loud-startup-failures/spec.md)
+  ✓ the substring `startup failed: ` - the formatter prints `ERROR clueless: startup failed: ...` so a plain substring match works with no log parsing ⚠ the string is written in two crates (app and xtask) and nothing but tests and the contract keeps them equal; a log line from some other source containing the same words would be a false positive, which is unlikely because transcript text is logged only at debug level (docs/architecture.md, Cross-cutting)
+  ✗ a structured field or special target - the log is plain text, so xtask would have to parse the formatter's output
+  ✗ share a constant through a crate both depend on - xtask must not build or link the app crates (its tests skip the build on purpose, see `CLUELESS_XTASK_SKIP_BUILD`)
+
+D-sites: Which exits use the loud path? (2026-10-04, loud-startup-failures/spec.md)
+  ✓ env file load failure, config load failure and lock failure in `main` and `run_gui`, in both GUI and replay mode - these are the failures that happen after the log is open and before the first window, and replay shares the env and config code (replay tests only check that stderr contains the file name, which stays true) ⚠ replay's stderr lines now carry the log formatter's timestamp and level prefix
+  ✗ argument parse errors and log-open errors - they happen before the logger exists, so there is no log to write to; `open` is started by xtask with fixed valid arguments, so a user cannot hit them through `cargo xtask run`
+  ✗ every `eprintln!` in replay mode - those run in a terminal where stderr is visible
+
+D-existing-instance: Should `xtask run` handle an instance that is already running (including one still shutting down)? (2026-10-04, loud-startup-failures/spec.md)
+  ⊘ not doing - not the reported symptom, and the observed behaviour is unproven: without `-n`, `open -W` seems to attach to the running instance instead of starting a new one ? verify: start the app, rebuild, run `cargo xtask run`, and see whether the old build keeps running; reopen if it does
+  ✗ add `open -n` or kill the running copy - changes how the single-instance lock is used and could drop a user's running meeting
+
+D-config-migration: Should the app or xtask upgrade an old `config.toml` for the user? (2026-10-04, loud-startup-failures/spec.md)
+  ✗ migrate the file automatically - rewrites a user-owned file and needs a mapping for every moved key
+  ⊘ not doing - the user chose loud failures only (user 2026-10-04); the error text already names the exact replacement variables; reopen if a second config key moves
+
 ## Overlay
 
 D-ui-stack: Which UI technology draws the overlay?
