@@ -12,6 +12,10 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
+mod common;
+
+use common::TempDir;
+
 const BIN: &str = env!("CARGO_BIN_EXE_clueless");
 
 // ---------------------------------------------------------------- plumbing
@@ -32,30 +36,6 @@ fn expected_lines(name: &str) -> Vec<(String, String)> {
 }
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "clueless-app-{tag}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("temp dir");
-        Self(path)
-    }
-    fn join(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// An env file pointing both servers at `127.0.0.1` ports, with one shared
 /// model id the mocks list.

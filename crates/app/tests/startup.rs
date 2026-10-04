@@ -5,44 +5,22 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod common;
+
+use common::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_clueless");
 const MARKER: &str = "startup failed: ";
 
-static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "clueless-startup-{tag}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("temp dir");
-        Self(path)
-    }
-    fn join(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Runs the binary with an empty environment, `dir` as home and working
 /// directory, and the log in `dir/log.txt`.
 fn run(dir: &TempDir, args: &[&Path]) -> Output {
+    let home: &Path = dir;
     Command::new(BIN)
         .env_clear()
-        .env("HOME", &dir.0)
-        .current_dir(&dir.0)
+        .env("HOME", home)
+        .current_dir(home)
         .arg("--log-file")
         .arg(dir.join("log.txt"))
         .args(args)
@@ -125,7 +103,7 @@ fn an_unknown_flag_prints_usage_and_writes_no_log() {
     let dir = TempDir::new("bad-flag");
     let out = Command::new(BIN)
         .env_clear()
-        .env("HOME", &dir.0)
+        .env("HOME", &*dir)
         .arg("--no-such-flag")
         .arg("--log-file")
         .arg(dir.join("log.txt"))
