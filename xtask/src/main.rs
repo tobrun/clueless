@@ -93,7 +93,25 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         return Err(format!("run takes no arguments, got {args:?}"));
     }
     cmd_bundle(&[])?;
-    let root = workspace_root()?;
+    launch_and_check(&workspace_root()?)
+}
+
+/// Launches the bundle and fails with the app's own message when the app
+/// logged a startup failure while `open` was waiting for it.
+fn launch_and_check(root: &Path) -> Result<(), String> {
+    let env_file = ensure_env_file(root)?;
+    let log = log_file_path();
+    let log_len_before = fs::metadata(&log).map_or(0, |meta| meta.len());
+    open_bundle(root, &env_file)?;
+    if let Some(message) = startup_failure_since(&log, log_len_before) {
+        return Err(startup_failure_error(&log, &message));
+    }
+    println!("log file: {}", log.display());
+    Ok(())
+}
+
+/// The root `.env`, copied from the example when it does not exist yet.
+fn ensure_env_file(root: &Path) -> Result<PathBuf, String> {
     let env_file = root.join(ENV_FILE);
     if !env_file.exists() {
         let example = root.join(ENV_EXAMPLE);
@@ -106,6 +124,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         })?;
         println!("copied {ENV_EXAMPLE} to {ENV_FILE}; edit it to point at your servers");
     }
+    Ok(env_file)
+}
+
+/// Launches the bundle with `open -W` and waits until the app quits.
+fn open_bundle(root: &Path, env_file: &Path) -> Result<(), String> {
     // An app launched with `open` inherits neither the shell's cwd nor its
     // environment, so point it at this workspace's files explicitly.
     let config = root.join("config.toml");
@@ -114,22 +137,16 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         .arg(target_debug_dir()?.join("clueless.app"))
         .arg("--args")
         .arg("--env-file")
-        .arg(&env_file);
+        .arg(env_file);
     if config.is_file() {
         open.arg("--config").arg(&config);
     }
-    let log = log_file_path();
-    let log_len_before = fs::metadata(&log).map_or(0, |meta| meta.len());
     let status = open
         .status()
         .map_err(|error| format!("could not run open: {error}"))?;
     if !status.success() {
         return Err(format!("open -W clueless.app exited with {status}"));
     }
-    if let Some(message) = startup_failure_since(&log, log_len_before) {
-        return Err(startup_failure_error(&log, &message));
-    }
-    println!("log file: {}", log.display());
     Ok(())
 }
 
