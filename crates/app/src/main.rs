@@ -45,10 +45,7 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| cli::home().join(".config/clueless/config.toml"));
     let env_vars = match envfile::load(parsed.env_file.as_deref()) {
         Ok(vars) => vars,
-        Err(message) => {
-            eprintln!("{message}");
-            return ExitCode::from(2);
-        }
+        Err(message) => return startup_failure(&message),
     };
     // Process environment first, then the .env file, then defaults inside
     // the config builders.
@@ -62,15 +59,21 @@ fn main() -> ExitCode {
     };
     let config = match Config::load(config_file, &lookup) {
         Ok(config) => config,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(2);
-        }
+        Err(error) => return startup_failure(&error.to_string()),
     };
     match parsed.replay {
         Some(replay) => run_replay(config, replay),
         None => run_gui(config),
     }
+}
+
+/// Reports a failure after the logger is open and ends the process with
+/// exit code 2. An app started with `open` has no visible stderr, so the
+/// message goes to the log file as well; `cargo xtask run` looks for the
+/// `startup failed: ` marker in the log (C-startup-failure-marker).
+fn startup_failure(message: &str) -> ExitCode {
+    tracing::error!("startup failed: {message}");
+    ExitCode::from(2)
 }
 
 /// Replay mode: WAV sources through a real engine, printing finals to
@@ -180,10 +183,7 @@ fn run_gui(config: Config) -> ExitCode {
     let lock_path = cli::home().join("Library/Application Support/clueless/lock");
     let _lock = match lock::acquire(&lock_path) {
         Ok(lock) => lock,
-        Err(message) => {
-            eprintln!("{message}");
-            return ExitCode::from(2);
-        }
+        Err(message) => return startup_failure(&message),
     };
     let (commands_tx, commands_rx) = meeting::command_channel();
     let commands: CommandSink = Arc::new(move |command| {
