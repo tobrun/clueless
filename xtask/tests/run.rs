@@ -124,3 +124,25 @@ fn a_failure_logged_by_an_earlier_run_does_not_fail_this_launch() {
     let all = text(&output);
     assert_eq!(output.status.code(), Some(0), "{all}");
 }
+
+#[test]
+fn run_points_the_app_at_the_workspace_env_file() {
+    let (output, log) = xtask_run(
+        "open-args",
+        None,
+        "printf '%s\\n' \"$@\" > \"$HOME/open-args\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let home = log.ancestors().nth(4).expect("the log lives under HOME");
+    let args = fs::read_to_string(home.join("open-args")).expect("the fake open recorded its args");
+    let lines: Vec<&str> = args.lines().collect();
+    let flag = lines
+        .iter()
+        .position(|line| *line == "--env-file")
+        .expect("--env-file is passed to open");
+    assert_eq!(
+        lines[flag + 1],
+        workspace_root().join(".env").to_str().expect("utf-8 path"),
+        "args: {args}"
+    );
+}
