@@ -13,6 +13,8 @@ scripts/make-dev-cert.sh             # once: self-signed cert so permission gran
 cargo xtask run                      # bundle + codesign + open the dev app
 ```
 
+`cargo xtask run` exits 1 and prints the startup error when the app dies during startup, for example on an invalid `config.toml`.
+
 `cargo xtask bundle` assembles `target/debug/clueless.app` (binary, `Info.plist`, icon) and signs it with the `clueless-dev` identity.
 Options: `--identity ID` (`-` for ad-hoc signing), `--out DIR`, `--binary PATH`.
 Ad-hoc signing works but macOS treats each rebuild as a new app and drops permission grants.

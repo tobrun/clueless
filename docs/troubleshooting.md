@@ -3,6 +3,8 @@
 ## The app exits at startup with a config error
 
 The error names every problem at once and exits with code 2.
+The app also writes it to the log file (`~/Library/Logs/clueless/clueless.log`, the line starts with `startup failed:`), because an app started with `open` has no visible stderr.
+`cargo xtask run` reads that line back, prints it and exits 1.
 
 - "missing required environment variables" means no `.env` was found (or it lacks `LLM_BASE_URL`, `LLM_MODEL`, `ASR_BASE_URL`, `ASR_MODEL`).
   Copy `.env.example` to `./.env` or `~/.config/clueless/.env` and fill the four required variables; see [configuration.md](configuration.md).
