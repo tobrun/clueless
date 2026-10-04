@@ -362,8 +362,19 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// A scratch directory under the workspace `target`, one per process.
+    fn unit_scratch() -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("target")
+            .join("xtask-unit-tests")
+            .join(std::process::id().to_string());
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
     fn log_with(name: &str, content: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("clueless-xtask-unit-{}", std::process::id()));
+        let dir = unit_scratch();
         fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join(name);
         fs::write(&path, content).expect("log file");
@@ -406,7 +417,7 @@ mod tests {
 
     #[test]
     fn a_missing_log_is_not_a_failure() {
-        let missing = env::temp_dir().join("clueless-xtask-unit-no-such.log");
+        let missing = unit_scratch().join("no-such.log");
         assert_eq!(startup_failure_since(&missing, 0), None);
     }
 
