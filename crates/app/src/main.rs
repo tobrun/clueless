@@ -67,10 +67,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Reports a failure after the logger is open and ends the process with
-/// exit code 2. An app started with `open` has no visible stderr, so the
+/// Logs a failure after the logger is open (to stderr and the log file) and
+/// returns the exit code 2 for `main` to return. An app started with `open` has no visible stderr, so the
 /// message goes to the log file as well; `cargo xtask run` looks for the
-/// `startup failed: ` marker in the log (C-startup-failure-marker).
+/// `startup failed: ` marker in the log (C-startup-failure-marker); the same
+/// literal is `STARTUP_FAILURE_MARKER` in xtask.
 fn startup_failure(message: &str) -> ExitCode {
     tracing::error!("startup failed: {message}");
     ExitCode::from(2)

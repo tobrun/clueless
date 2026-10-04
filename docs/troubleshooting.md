@@ -1,16 +1,16 @@
 # Troubleshooting
 
-## The app exits at startup with a config error
+## The app exits at startup with a config or lock error
 
 The error names every problem at once and exits with code 2.
-The app also writes it to the log file (`~/Library/Logs/clueless/clueless.log`, the line starts with `startup failed:`), because an app started with `open` has no visible stderr.
+The app also writes it to the log file (`~/Library/Logs/clueless/clueless.log`, the line contains `startup failed:`), because an app started with `open` has no visible stderr.
 `cargo xtask run` reads that line back, prints it and exits 1.
 
 - "missing required environment variables" means no `.env` was found (or it lacks `LLM_BASE_URL`, `LLM_MODEL`, `ASR_BASE_URL`, `ASR_MODEL`).
   Copy `.env.example` to `./.env` or `~/.config/clueless/.env` and fill the four required variables; see [configuration.md](configuration.md).
 - A message about `[server]` or `[llm]` means an old `config.toml` still has endpoint keys; delete those tables, they now live in the environment.
 - An "unknown key" message names the offending key in `config.toml`; fix or remove it.
-- A message naming `~/Library/Application Support/clueless/lock` means another copy is running; quit it from its menu bar icon.
+- A message naming `~/Library/Application Support/clueless/lock` means another copy is running; quit it from its menu bar icon. Launched with `open`, a second copy exits at once, so look for this line in the log file.
 
 ## The status label shows a server as offline
 
