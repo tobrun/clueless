@@ -11,6 +11,9 @@
 //! (a stable signature is what keeps the grants attached to the app).
 //! `run` bundles, makes sure a root `.env` exists and launches the bundle
 //! with `open`, so the app itself is responsible for its permission prompts.
+//! `open` neither shows the app's stderr nor passes on its exit code, so
+//! `run` reads back what the app appended to its log during the launch and
+//! fails with the message when the app logged a startup failure.
 //!
 //! One environment variable exists for the integration tests, which must not
 //! build the sibling crates: `CLUELESS_XTASK_SKIP_BUILD=1` skips
@@ -26,6 +29,9 @@ use std::process::Command;
 const DEFAULT_IDENTITY: &str = "clueless-dev";
 const ENV_EXAMPLE: &str = ".env.example";
 const ENV_FILE: &str = ".env";
+/// What the app logs in front of every startup failure message
+/// (C-startup-failure-marker in docs/contracts.md).
+const STARTUP_FAILURE_MARKER: &str = "startup failed: ";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -112,14 +118,42 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     if config.is_file() {
         open.arg("--config").arg(&config);
     }
+    let log = log_file_path();
+    let log_len_before = fs::metadata(&log).map_or(0, |meta| meta.len());
     let status = open
         .status()
         .map_err(|error| format!("could not run open: {error}"))?;
     if !status.success() {
         return Err(format!("open -W clueless.app exited with {status}"));
     }
-    println!("log file: {}", log_file_path().display());
+    if let Some(message) = startup_failure_since(&log, log_len_before) {
+        return Err(startup_failure_error(&log, &message));
+    }
+    println!("log file: {}", log.display());
     Ok(())
+}
+
+/// The error `run` ends with when the app logged a startup failure.
+fn startup_failure_error(log: &Path, message: &str) -> String {
+    format!(
+        "the app exited during startup; the log ({}) says:\n{message}",
+        log.display()
+    )
+}
+
+/// The text from the startup failure marker to the end of what the app
+/// appended to `log` after it had `offset` bytes; `None` when nothing
+/// appended carries the marker or the log cannot be read. A log shorter
+/// than `offset` was replaced, so all of it counts as new.
+fn startup_failure_since(log: &Path, offset: u64) -> Option<String> {
+    let bytes = fs::read(log).ok()?;
+    let start = usize::try_from(offset)
+        .ok()
+        .filter(|start| *start <= bytes.len())
+        .unwrap_or(0);
+    let appended = String::from_utf8_lossy(&bytes[start..]);
+    let at = appended.find(STARTUP_FAILURE_MARKER)?;
+    Some(appended[at..].trim_end().to_string())
 }
 
 fn parse_bundle_args(args: &[String]) -> Result<BundleOptions, String> {
@@ -322,4 +356,77 @@ fn home_dir() -> PathBuf {
     env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log_with(name: &str, content: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("clueless-xtask-unit-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(name);
+        fs::write(&path, content).expect("log file");
+        path
+    }
+
+    #[test]
+    fn a_failure_appended_after_the_offset_is_returned_from_the_marker() {
+        let old = "2026-10-03T15:50:12Z  INFO overlay::ui: engine idle\n";
+        let new = "2026-10-04T07:00:00Z ERROR clueless: startup failed: invalid config: x\n";
+        let log = log_with("appended.log", &format!("{old}{new}"));
+        assert_eq!(
+            startup_failure_since(&log, old.len() as u64).as_deref(),
+            Some("startup failed: invalid config: x")
+        );
+    }
+
+    #[test]
+    fn a_failure_from_an_earlier_run_does_not_fail_this_launch() {
+        let old = "2026-10-03T15:50:12Z ERROR clueless: startup failed: old\n";
+        let log = log_with("earlier.log", old);
+        assert_eq!(startup_failure_since(&log, old.len() as u64), None);
+    }
+
+    #[test]
+    fn a_log_shorter_than_the_offset_is_read_from_the_start() {
+        let log = log_with("replaced.log", "ERROR clueless: startup failed: fresh\n");
+        assert_eq!(
+            startup_failure_since(&log, 10_000).as_deref(),
+            Some("startup failed: fresh")
+        );
+    }
+
+    #[test]
+    fn the_error_names_the_log_path_and_the_message() {
+        let error = startup_failure_error(Path::new("/x/clueless.log"), "startup failed: boom");
+        assert!(error.contains("/x/clueless.log"), "{error}");
+        assert!(error.contains("startup failed: boom"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_log_is_not_a_failure() {
+        let missing = env::temp_dir().join("clueless-xtask-unit-no-such.log");
+        assert_eq!(startup_failure_since(&missing, 0), None);
+    }
+
+    #[test]
+    fn a_multi_line_message_is_returned_whole() {
+        let log = log_with(
+            "multi.log",
+            "2026-10-04T07:00:00Z ERROR clueless: startup failed: invalid config:\n  first problem\n  second problem\n",
+        );
+        assert_eq!(
+            startup_failure_since(&log, 0).as_deref(),
+            Some("startup failed: invalid config:\n  first problem\n  second problem")
+        );
+    }
+
+    #[test]
+    fn a_normal_start_with_many_runtime_lines_is_not_a_failure() {
+        let noise =
+            "2026-10-04T07:00:00Z  INFO ort::logging: Saving initialized tensors.\n".repeat(2_000);
+        let log = log_with("normal.log", &noise);
+        assert_eq!(startup_failure_since(&log, 0), None);
+    }
 }
