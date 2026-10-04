@@ -79,6 +79,17 @@ fn missing_required_variables_are_reported_in_the_log() {
 }
 
 #[test]
+fn an_unreadable_env_file_is_reported_in_the_log_with_its_path() {
+    let dir = TempDir::new("bad-env-file");
+    let missing = dir.join("nope.env");
+    let out = run(&dir, &[Path::new("--env-file"), &missing]);
+    assert_eq!(out.status.code(), Some(2));
+    let log = log_text(&dir);
+    assert!(log.contains(MARKER), "log: {log}");
+    assert!(log.contains("nope.env"), "log: {log}");
+}
+
+#[test]
 fn a_held_instance_lock_is_reported_in_the_log_with_its_path() {
     let dir = TempDir::new("lock-held");
     let env = write_valid_env(&dir);
