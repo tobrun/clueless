@@ -30,6 +30,8 @@ use segmenter::vad::SpeechProb;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
+use trace::manifest::SessionStart;
+use trace::sink::{FailureSink, NoTrace, TraceOpener, TraceSink};
 
 use engine::clock::MeetingClock;
 use engine::deps::{EngineDeps, EngineTimings};
@@ -534,6 +536,7 @@ pub fn start(specs: Vec<StreamSpec>, mock: &MockAsr, opts: Opts) -> Harness {
         vad,
         timings: opts.timings,
         compress_threshold_tokens: 1_000,
+        trace: Arc::new(NoTrace),
     };
     let asr = Arc::new(AsrClient::new(
         mock.base_url.clone(),
@@ -560,6 +563,7 @@ pub fn start(specs: Vec<StreamSpec>, mock: &MockAsr, opts: Opts) -> Harness {
         store.clone(),
         MeetingClock::new(),
         cancel.clone(),
+        Arc::new(NoTrace),
     );
     Harness {
         events,
@@ -1118,6 +1122,9 @@ pub struct MeetingOpts {
     pub asr_model: Option<String>,
     /// Override the llm port (closed-port tests pass a freed one).
     pub llm_port: Option<u16>,
+    /// Record meetings through this opener instead of nothing (a
+    /// `MemoryOpener` in tests that assert on records).
+    pub trace: Option<Arc<dyn TraceOpener>>,
 }
 
 impl Default for MeetingOpts {
@@ -1130,6 +1137,7 @@ impl Default for MeetingOpts {
             start_profile: AssistProfile::Manual,
             asr_model: None,
             llm_port: None,
+            trace: None,
         }
     }
 }
@@ -1173,6 +1181,8 @@ impl MeetingHarness {
                 notes_path: opts.notes_path.clone(),
                 // what the app sends when LLM_ENABLE_THINKING is unset
                 enable_thinking: Some(false),
+                // the production default (D-llm-usage)
+                include_usage: true,
                 ..Default::default()
             },
             assist: AssistConfig {
@@ -1194,6 +1204,10 @@ impl MeetingHarness {
             vad: vad_factory_scripts(vad),
             timings: opts.timings,
             compress_threshold_tokens: opts.compress_threshold_tokens,
+            trace: opts
+                .trace
+                .clone()
+                .unwrap_or_else(|| Arc::new(NoTrace) as Arc<dyn TraceOpener>),
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = tokio::spawn(Engine::new(config, deps).run(rx));
@@ -1289,6 +1303,30 @@ impl MeetingHarness {
     pub async fn shutdown(self) {
         self.cmd(EngineCommand::Shutdown);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.engine).await;
+    }
+}
+
+/// An opener that always fails to open, like a data directory that cannot
+/// be created (D-write-failure).
+pub struct FailingOpener {
+    pub message: String,
+}
+
+impl FailingOpener {
+    pub fn new(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl TraceOpener for FailingOpener {
+    fn open(
+        &self,
+        _start: SessionStart,
+        _on_failure: FailureSink,
+    ) -> Result<Arc<dyn TraceSink>, String> {
+        Err(self.message.clone())
     }
 }
 
