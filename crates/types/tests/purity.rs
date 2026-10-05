@@ -9,6 +9,7 @@ const PURE_CRATES: &[&str] = &[
     "asr",
     "llm",
     "context",
+    "trace",
     "engine",
 ];
 

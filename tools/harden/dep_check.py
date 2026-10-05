@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover
 
 # Prose rule from the top of docs/dependencies.md: these module crates are
 # pure and must not pull in macOS-only external crates.
-PURE_MODULES = ["types", "segmenter", "asr", "llm", "context", "engine"]
+PURE_MODULES = ["types", "segmenter", "asr", "llm", "context", "trace", "engine"]
 MACOS_ONLY_CRATES = {
     "objc2",
     "objc2-app-kit",

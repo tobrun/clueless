@@ -178,6 +178,7 @@ impl Default for LlmConfig {
             temperature: 0.4,
             notes_path: None,
             enable_thinking: None,
+            include_usage: true,
         }
     }
 }
@@ -198,6 +199,9 @@ pub struct LlmConfig {
     /// `None` omits `chat_template_kwargs` from requests entirely;
     /// `Some(false)` sends `enable_thinking: false` (vLLM/Qwen).
     pub enable_thinking: Option<bool>,
+    /// Ask streaming responses for token usage (`stream_options`) and ask
+    /// completions for it too, so traces can carry the server's counts.
+    pub include_usage: bool,
 }
 
 /// `LLM_PROFILE_PATH` became `LLM_NOTES_PATH`; refuse the old name loudly.
@@ -224,6 +228,21 @@ fn parse_enable_thinking(lookup: Lookup, problems: &mut Vec<String>) -> Option<O
     }
 }
 
+/// `LLM_INCLUDE_USAGE` is a plain `true`/`false` switch, on by default.
+fn parse_include_usage(lookup: Lookup, problems: &mut Vec<String>) -> Option<bool> {
+    match lookup_value(lookup, "LLM_INCLUDE_USAGE").as_deref() {
+        None => Some(true),
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(raw) => {
+            problems.push(format!(
+                "LLM_INCLUDE_USAGE = \"{raw}\" is not \"true\" or \"false\""
+            ));
+            None
+        }
+    }
+}
+
 impl LlmConfig {
     /// Collects every problem into one `Err(Vec)` so a half-filled `.env`
     /// gets one actionable message, not a one-variable-at-a-time drill.
@@ -242,6 +261,7 @@ impl LlmConfig {
         };
         check_renamed_profile_path(lookup, &mut problems);
         let enable_thinking = parse_enable_thinking(lookup, &mut problems);
+        let include_usage = parse_include_usage(lookup, &mut problems);
         if !problems.is_empty() {
             return Err(problems);
         }
@@ -253,6 +273,7 @@ impl LlmConfig {
             temperature: temperature.expect("checked above"),
             notes_path: lookup_value(lookup, "LLM_NOTES_PATH").map(|p| expand_tilde(&p)),
             enable_thinking: enable_thinking.expect("checked above"),
+            include_usage: include_usage.expect("checked above"),
         })
     }
 }
@@ -268,6 +289,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("temperature", &self.temperature)
             .field("notes_path", &self.notes_path)
             .field("enable_thinking", &self.enable_thinking)
+            .field("include_usage", &self.include_usage)
             .finish()
     }
 }
@@ -377,6 +399,26 @@ impl Default for AssistConfig {
     }
 }
 
+/// Session trace recording switches. Text records are always written for a
+/// meeting while `enabled` holds; audio is opt-in.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TraceConfig {
+    /// Whether meetings write trace directories under the data directory.
+    pub enabled: bool,
+    /// Whether the meeting audio is written to WAV files too.
+    pub audio: bool,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            audio: false,
+        }
+    }
+}
+
 /// The deserialize target for the TOML file: the app-behavior tables only.
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
@@ -386,6 +428,7 @@ struct TomlTuning {
     overlay: OverlayConfig,
     hotkeys: HotkeysConfig,
     assist: AssistConfig,
+    trace: TraceConfig,
 }
 
 /// Everything the app needs: the app-behavior tables from the (optional)
@@ -397,6 +440,7 @@ pub struct Config {
     pub overlay: OverlayConfig,
     pub hotkeys: HotkeysConfig,
     pub assist: AssistConfig,
+    pub trace: TraceConfig,
     pub llm: LlmConfig,
     pub asr: AsrConfig,
 }
@@ -423,6 +467,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     ("overlay", &["hide_from_capture"]),
     ("assist", &["start_profile"]),
+    ("trace", &["enabled", "audio"]),
     (
         "hotkeys",
         &[
@@ -467,9 +512,17 @@ fn check_unknown_keys(text: &str) -> Result<(), ConfigError> {
             None => return Err(ConfigError::Parse(format!("unknown key {name}"))),
             Some((_, keys)) => {
                 if let Some(t) = value.as_table() {
-                    for key in t.keys() {
+                    for (key, value) in t {
                         if !keys.contains(&key.as_str()) {
                             return Err(ConfigError::Parse(format!("unknown key {name}.{key}")));
+                        }
+                        // The switches are read before deserialization runs,
+                        // so a wrong type names `trace.enabled`, not just
+                        // "a boolean".
+                        if name == "trace" && value.as_bool().is_none() {
+                            return Err(ConfigError::Parse(format!(
+                                "{name}.{key} must be true or false, got {value}"
+                            )));
                         }
                     }
                 }
@@ -515,6 +568,7 @@ impl Config {
                 overlay: tuning.overlay,
                 hotkeys: tuning.hotkeys,
                 assist: tuning.assist,
+                trace: tuning.trace,
                 llm,
                 asr,
             }),
