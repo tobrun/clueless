@@ -3,6 +3,10 @@
 //! The script is a list of steps written to the connection as raw frames, so a
 //! test can control exact bytes, write gaps and disconnects.
 
+// This harness is compiled into every integration test binary, and no single
+// binary exercises every step, reply shape and accessor.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -28,6 +32,11 @@ pub enum Step {
     Reasoning(String),
     /// Write one `delta.reasoning_content` chunk for this text.
     ReasoningContent(String),
+    /// Write one chunk whose first choice carries this `finish_reason`.
+    Finish(String),
+    /// Write one chunk with empty `choices` and this exact `usage` value
+    /// (an object like the server's, or anything unreadable on purpose).
+    Usage(serde_json::Value),
     /// Write the `data: [DONE]` event.
     Done,
     /// Wait before the next step, keeping the connection open.
@@ -219,6 +228,8 @@ async fn run_script(
             Step::Chunk(content) => chunk_frame(json!({"content": content})),
             Step::Reasoning(text) => chunk_frame(json!({"reasoning": text})),
             Step::ReasoningContent(text) => chunk_frame(json!({"reasoning_content": text})),
+            Step::Finish(reason) => finish_frame(&reason),
+            Step::Usage(usage) => usage_frame(usage),
             Step::Done => "data: [DONE]\n\n".to_string(),
         };
         if send(&tx, &disconnected, frame).await {
@@ -257,6 +268,39 @@ pub fn chunk_frame(delta: serde_json::Value) -> String {
             "token_ids": null,
             "delta": delta,
         }],
+    });
+    format!("data: {chunk}\n\n")
+}
+
+/// A chunk whose only payload is the choice's `finish_reason` (empty delta).
+pub fn finish_frame(reason: &str) -> String {
+    let chunk = json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion.chunk",
+        "created": 1759400000u64,
+        "model": "mock-model",
+        "system_fingerprint": null,
+        "choices": [{
+            "index": 0,
+            "logprobs": null,
+            "finish_reason": reason,
+            "token_ids": null,
+            "delta": {},
+        }],
+    });
+    format!("data: {chunk}\n\n")
+}
+
+/// A usage-only chunk: empty `choices`, `usage` written exactly as given.
+pub fn usage_frame(usage: serde_json::Value) -> String {
+    let chunk = json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion.chunk",
+        "created": 1759400000u64,
+        "model": "mock-model",
+        "system_fingerprint": null,
+        "usage": usage,
+        "choices": [],
     });
     format!("data: {chunk}\n\n")
 }

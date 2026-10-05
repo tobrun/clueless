@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::types::ChatRequest;
+use crate::types::{ChatRequest, Completion, StreamPart, Usage};
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 const MODELS_PATH: &str = "/v1/models";
@@ -42,10 +42,31 @@ type EvStream =
 enum State {
     /// Send the request on the first poll.
     Init(ChatRequest),
-    /// Read content deltas from the opened event stream.
-    Streaming(EvStream),
+    /// Read parts from the opened event stream, remembering the last seen
+    /// finish reason and usage for the `Finish` part at `[DONE]`.
+    Streaming {
+        events: EvStream,
+        finish_reason: Option<String>,
+        usage: Option<Usage>,
+        /// Parts of the last chunk not yielded yet (a chunk can carry
+        /// content and reasoning at once).
+        pending: std::collections::VecDeque<StreamPart>,
+    },
     /// A terminal error was yielded; end the stream.
     Done,
+}
+
+impl LlmError {
+    /// The display text plus, for `Http`, the first bytes of the server's
+    /// answer. Only for logs and traces; text shown to users stays `Display`.
+    pub fn detail(&self) -> String {
+        match self {
+            LlmError::Http { body_start, .. } => {
+                format!("{self}; server answer started with: {body_start}")
+            }
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Client for `POST /v1/chat/completions` (streaming) and `GET /v1/models`.
@@ -90,15 +111,19 @@ impl LlmClient {
         &self.model
     }
 
-    /// Stream the non-empty `delta.content` pieces of the response.
+    /// Stream the parts of the response: non-empty `delta.content` pieces as
+    /// `Content`, non-empty `delta.reasoning` / `delta.reasoning_content`
+    /// pieces as `Reasoning`, and one `Finish` at `[DONE]` carrying the last
+    /// seen finish reason and usage.
     ///
-    /// The stream yields items until the first error (then ends), ends cleanly at
-    /// `[DONE]`, and ends without an item as soon as `cancel` fires.
+    /// The stream yields items until the first error (then ends), ends after
+    /// the `Finish` at `[DONE]`, and ends without an item as soon as `cancel`
+    /// fires (then no `Finish` is sent).
     pub fn stream(
         &self,
         request: ChatRequest,
         cancel: CancellationToken,
-    ) -> futures_util::stream::BoxStream<'static, Result<String, LlmError>> {
+    ) -> futures_util::stream::BoxStream<'static, Result<StreamPart, LlmError>> {
         let http = self.http.clone();
         let url = format!("{}{}", self.base_url, CHAT_PATH);
         let stall = self.stall_timeout;
@@ -117,12 +142,33 @@ impl LlmClient {
                                 r = open_chat(&http, &url, &request, stall) => r,
                             };
                             match opened {
-                                Ok(events) => State::Streaming(events),
+                                Ok(events) => State::Streaming {
+                                    events,
+                                    finish_reason: None,
+                                    usage: None,
+                                    pending: std::collections::VecDeque::new(),
+                                },
                                 Err(err) => return Some((Err(err), State::Done)),
                             }
                         }
-                        State::Streaming(mut events) => {
+                        State::Streaming {
+                            mut events,
+                            mut finish_reason,
+                            mut usage,
+                            mut pending,
+                        } => {
                             loop {
+                                if let Some(part) = pending.pop_front() {
+                                    return Some((
+                                        Ok(part),
+                                        State::Streaming {
+                                            events,
+                                            finish_reason,
+                                            usage,
+                                            pending,
+                                        },
+                                    ));
+                                }
                                 let next = tokio::select! {
                                     biased;
                                     _ = cancel.cancelled() => return None,
@@ -133,7 +179,9 @@ impl LlmClient {
                                         return Some((Err(LlmError::Stalled), State::Done));
                                     }
                                     // Body ended without `[DONE]`.
-                                    Ok(None) => return Some((Err(LlmError::Closed), State::Done)),
+                                    Ok(None) => {
+                                        return Some((Err(LlmError::Closed), State::Done));
+                                    }
                                     Ok(Some(Err(err))) => {
                                         let err = match err {
                                             EventStreamError::Transport(_) => LlmError::Closed,
@@ -145,18 +193,37 @@ impl LlmClient {
                                     Ok(Some(Ok(event))) => event,
                                 };
                                 if event.data == "[DONE]" {
-                                    return None;
+                                    return Some((
+                                        Ok(StreamPart::Finish {
+                                            reason: finish_reason,
+                                            usage,
+                                        }),
+                                        State::Done,
+                                    ));
                                 }
                                 let Ok(chunk) =
                                     serde_json::from_str::<crate::types::ChatChunk>(&event.data)
                                 else {
                                     return Some((Err(LlmError::Decode), State::Done));
                                 };
-                                // Ignore reasoning fields and empty strings; the spec says so.
+                                // A chunk may carry only a finish reason, only
+                                // usage (empty `choices`), or both; record them
+                                // for the `Finish` at `[DONE]`.
+                                finish_reason =
+                                    chunk.finish_reason().map(str::to_owned).or(finish_reason);
+                                usage = chunk.usage().or(usage);
+                                // Ignore empty pieces; the spec says so. A
+                                // chunk carrying content and reasoning at once
+                                // queues both, content first.
                                 if let Some(text) = chunk.content()
                                     && !text.is_empty()
                                 {
-                                    return Some((Ok(text.to_string()), State::Streaming(events)));
+                                    pending.push_back(StreamPart::Content(text.to_string()));
+                                }
+                                if let Some(text) = chunk.reasoning()
+                                    && !text.is_empty()
+                                {
+                                    pending.push_back(StreamPart::Reasoning(text.to_string()));
                                 }
                             }
                         }
@@ -168,16 +235,23 @@ impl LlmClient {
         .boxed()
     }
 
-    /// Collect a whole response into one string (used for compression).
+    /// Collect a whole response into one `Completion` (used for compression).
     ///
     /// Fails on the first stream error, keeping nothing of the partial text.
-    pub async fn complete(&self, request: ChatRequest) -> Result<String, LlmError> {
+    pub async fn complete(&self, request: ChatRequest) -> Result<Completion, LlmError> {
         let mut stream = self.stream(request, CancellationToken::new());
-        let mut text = String::new();
+        let mut completion = Completion::default();
         while let Some(item) = stream.next().await {
-            text.push_str(&item?);
+            match item? {
+                StreamPart::Content(text) => completion.text.push_str(&text),
+                StreamPart::Reasoning(text) => completion.reasoning.push_str(&text),
+                StreamPart::Finish { reason, usage } => {
+                    completion.finish_reason = reason;
+                    completion.usage = usage;
+                }
+            }
         }
-        Ok(text)
+        Ok(completion)
     }
 
     /// The ids from `GET /v1/models`.

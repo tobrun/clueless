@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 use llm::client::{LlmClient, LlmError};
-use llm::types::{ChatRequest, Message};
+use llm::types::{ChatRequest, Message, StreamPart};
 use serde_json::json;
 use support::{Mock, Reply, Step};
 use tokio_util::sync::CancellationToken;
@@ -30,18 +30,21 @@ fn request() -> ChatRequest {
         220,
         0.4,
         Some(false),
+        true,
     )
 }
 
-/// Drain a suggestion stream into its content items and the error that ended it, if any.
+/// Drain a suggestion stream into its content items and the error that ended
+/// it, if any; reasoning and finish parts are not content and drop out here.
 async fn drain(
-    mut stream: impl Stream<Item = Result<String, LlmError>> + Unpin,
+    mut stream: impl Stream<Item = Result<StreamPart, LlmError>> + Unpin,
 ) -> (Vec<String>, Option<LlmError>) {
     let mut items = Vec::new();
     let mut error = None;
     while let Some(item) = stream.next().await {
         match item {
-            Ok(text) => items.push(text),
+            Ok(StreamPart::Content(text)) => items.push(text),
+            Ok(StreamPart::Reasoning(_)) | Ok(StreamPart::Finish { .. }) => {}
             Err(err) => {
                 error = Some(err);
                 break;
@@ -73,7 +76,14 @@ async fn stream_yields_non_empty_content_deltas_and_ends_at_done() {
 async fn unset_enable_thinking_omits_chat_template_kwargs_from_the_body() {
     let mock = Mock::start(Reply::contents(&["ok"])).await;
     let client = client_for(&mock.base_url);
-    let request = ChatRequest::new("mock-model", vec![Message::user("hi")], 220, 0.4, None);
+    let request = ChatRequest::new(
+        "mock-model",
+        vec![Message::user("hi")],
+        220,
+        0.4,
+        None,
+        true,
+    );
     let _ = drain(Box::pin(client.stream(request, CancellationToken::new()))).await;
     let bodies = mock.bodies();
     assert_eq!(bodies.len(), 1);
@@ -115,7 +125,7 @@ async fn no_api_key_sends_no_authorization_header() {
 }
 
 #[tokio::test]
-async fn reasoning_deltas_before_content_are_not_yielded() {
+async fn reasoning_deltas_before_content_never_show_up_as_content() {
     let mock = Mock::start(Reply::stream(vec![
         Step::Reasoning("thinking ".into()),
         Step::Reasoning("very hard".into()),
@@ -130,7 +140,7 @@ async fn reasoning_deltas_before_content_are_not_yielded() {
 }
 
 #[tokio::test]
-async fn reasoning_content_deltas_yield_nothing() {
+async fn reasoning_content_deltas_yield_no_content() {
     let mock = Mock::start(Reply::stream(vec![
         Step::ReasoningContent("hidden ".into()),
         Step::ReasoningContent("still hidden".into()),
@@ -203,7 +213,10 @@ async fn cancelling_after_a_delta_ends_the_stream_and_closes_the_connection() {
     let client = client_for(&mock.base_url);
     let cancel = CancellationToken::new();
     let mut stream = Box::pin(client.stream(request(), cancel.clone()));
-    assert_eq!(stream.next().await, Some(Ok("first".to_string())));
+    assert_eq!(
+        stream.next().await,
+        Some(Ok(StreamPart::Content("first".to_string())))
+    );
 
     let started = std::time::Instant::now();
     cancel.cancel();
@@ -265,8 +278,9 @@ async fn nothing_listening_ends_as_connect() {
 async fn complete_returns_the_concatenated_content() {
     let mock = Mock::start(Reply::contents(&["Hello", ", ", "world"])).await;
     let client = client_for(&mock.base_url);
-    let text = client.complete(request()).await.expect("complete succeeds");
-    assert_eq!(text, "Hello, world");
+    let completion = client.complete(request()).await.expect("complete succeeds");
+    assert_eq!(completion.text, "Hello, world");
+    assert_eq!(completion.reasoning, "");
 }
 
 #[tokio::test]

@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use clueless_types::events::{StatusSink, SuggestionEnd, UiEvent};
 use context::prompt::{PASS_TOKEN, PromptMessage};
 use llm::client::{LlmClient, LlmError};
-use llm::types::{ChatRequest, Message};
+use llm::types::{ChatRequest, Message, StreamPart};
 
 /// Convert the prompt builder's messages to the LLM client's type.
 pub fn to_llm_messages(messages: Vec<PromptMessage>) -> Vec<Message> {
@@ -130,7 +130,9 @@ pub async fn run(
     let mut shown = String::new();
     let end = loop {
         match stream.next().await {
-            Some(Ok(text)) => {
+            // Reasoning and Finish parts do not reach the UI; change set 6
+            // of the trace spec records them.
+            Some(Ok(StreamPart::Content(text))) => {
                 if first_delta {
                     first_delta = false;
                     tracing::info!(
@@ -148,6 +150,7 @@ pub async fn run(
                     ui(UiEvent::SuggestionDelta { id, text });
                 }
             }
+            Some(Ok(StreamPart::Reasoning(_))) | Some(Ok(StreamPart::Finish { .. })) => {}
             Some(Err(error)) => break map_llm_error(&error),
             None => break stream_closed_end(&cancel),
         }
@@ -220,13 +223,15 @@ pub async fn cancel_and_wait(task: &mut tokio::task::JoinHandle<()>, cancel: &Ca
 
 #[cfg(test)]
 mod tests {
-    use clueless_types::events::SuggestionEnd;
+    use clueless_types::events::{StatusSink, SuggestionEnd};
 
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use clueless_types::events::UiEvent;
+    use serde_json::json;
 
-    use super::{EndGuard, Finished, PassFilter, release_chunk, stream_closed_end};
+    use super::{EndGuard, Finished, PassFilter, release_chunk, run, stream_closed_end};
 
     fn feed(chunks: &[&str]) -> Vec<Option<String>> {
         let mut filter = PassFilter::new();
@@ -340,5 +345,108 @@ mod tests {
         let finished = rx.try_recv().expect("one report");
         assert_eq!(finished.shown, "text");
         assert!(rx.try_recv().is_err(), "no second report from the drop");
+    }
+
+    /// An SSE mock answering one chat request with reasoning pieces (under
+    /// both field names) and then content pieces, then `[DONE]`.
+    async fn reasoning_then_content_mock(pieces: &[&str]) -> String {
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::response::Response;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let mut sse = String::new();
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"reasoning": "thinking hard"}}]})
+        ));
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"reasoning_content": " still going"}}]})
+        ));
+        for piece in pieces {
+            sse.push_str(&format!(
+                "data: {}\n\n",
+                json!({"choices": [{"index": 0, "delta": {"content": piece}}]})
+            ));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let sse = sse.clone();
+                async move {
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(sse))
+                        .expect("sse response")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn reasoning_pieces_never_reach_the_ui_deltas() {
+        let base_url = reasoning_then_content_mock(&["The ", "answer."]).await;
+        let llm = Arc::new(llm::client::LlmClient::new(
+            base_url,
+            "mock-model",
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+        ));
+        let request = llm::types::ChatRequest::new(
+            "mock-model",
+            vec![llm::types::Message::user("hi")],
+            220,
+            0.4,
+            Some(false),
+            true,
+        );
+        let events: Arc<Mutex<Vec<UiEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let ui: StatusSink = Arc::new(move |event| sink.lock().unwrap().push(event));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            9,
+            llm,
+            request,
+            tokio_util::sync::CancellationToken::new(),
+            ui,
+            false,
+            tx,
+        )
+        .await;
+
+        let deltas: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::SuggestionDelta { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["The ".to_string(), "answer.".to_string()]);
+        let shown = events.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                UiEvent::SuggestionEnd {
+                    end: SuggestionEnd::Done,
+                    ..
+                }
+            )
+        });
+        assert!(shown, "the run ends Done: {:?}", events.lock().unwrap());
+        let finished = rx.recv().await.expect("the engine hears the end");
+        assert_eq!(finished.shown, "The answer.");
     }
 }

@@ -527,6 +527,7 @@ impl Engine {
             timings.compress_retry,
             self.config.llm.temperature as f64,
             self.config.llm.enable_thinking,
+            self.config.llm.include_usage,
             pipeline.commits(),
             self.deps.ui.clone(),
             compress_cancel.clone(),
@@ -638,6 +639,7 @@ impl Engine {
             self.config.llm.max_tokens,
             self.config.llm.temperature as f64,
             self.config.llm.enable_thinking,
+            self.config.llm.include_usage,
         );
         let cancel = CancellationToken::new();
         meeting.policy.request_started(origin, Instant::now());

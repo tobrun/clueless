@@ -45,6 +45,7 @@ CODE=$(curl -s -N -o "$OUT" -w '%{http_code}' -m 60 \
   "${AUTH[@]}" \
   -H 'Content-Type: application/json' \
   -d "{\"model\":\"${MODEL}\",\"stream\":true,\"max_tokens\":32,\"temperature\":0.4,\
+\"stream_options\":{\"include_usage\":true},\
 \"chat_template_kwargs\":{\"enable_thinking\":false},\
 \"messages\":[{\"role\":\"user\",\"content\":\"Say hello in five words.\"}]}" \
   "${BASE}/v1/chat/completions") || fail "chat request failed"

@@ -30,6 +30,7 @@ pub async fn run(
     retry: Duration,
     temperature: f64,
     enable_thinking: Option<bool>,
+    include_usage: bool,
     mut commits: watch::Receiver<u64>,
     ui: StatusSink,
     cancel: CancellationToken,
@@ -59,6 +60,7 @@ pub async fn run(
                 SUMMARY_MAX_TOKENS,
                 temperature,
                 enable_thinking,
+                include_usage,
             );
             let outcome = tokio::select! {
                 biased;
@@ -66,12 +68,12 @@ pub async fn run(
                 () = cancel.cancelled() => return,
             };
             match outcome {
-                Ok(text) => {
+                Ok(completion) => {
                     last_failure = None;
                     store
                         .lock()
                         .expect("store lock")
-                        .set_summary(text, replaced);
+                        .set_summary(completion.text, replaced);
                 }
                 Err(error) => {
                     last_failure = Some(Instant::now());
