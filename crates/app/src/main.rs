@@ -1,23 +1,26 @@
-//! The clueless binary: parses the command line, then runs either the
-//! replay pipeline over WAV files or the GUI (overlay on the main thread,
-//! engine with live capture on a background tokio runtime).
+//! The clueless binary: parses the command line, then runs one mode - the
+//! GUI (overlay on the main thread, engine with live capture on a background
+//! tokio runtime), a headless replay over WAV files or a recorded session,
+//! or one of the session commands (`--sessions`, `--show`, `--delete`,
+//! `--compare`), which read files only and therefore run before the server
+//! settings are read (D-inspect-tools).
 
 use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clueless::cli::{self, Replay};
-use clueless::{envfile, lock, logging};
+use clueless::cli::{self, Cli, Mode, Replay};
+use clueless::{envfile, lock, logging, recording, replay_print, rerun, session_cmd};
 use clueless_types::audio::SourceFactory;
 use clueless_types::config::Config;
-use clueless_types::events::{
-    CommandSink, EngineCommand, Speaker, StatusSink, SuggestionEnd, UiEvent,
-};
+use clueless_types::events::{CommandSink, EngineCommand, Speaker, StatusSink, UiEvent};
 use clueless_types::profile::AssistProfile;
 use engine::deps::EngineDeps;
 use engine::meeting;
 use engine::replay::WavSources;
+use trace::manifest::Origin;
+use trace::sink::TraceOpener;
 
 /// A replay run may not take longer than this (generous: real-time e2e
 /// replays of the longest fixture plus server latency fit inside).
@@ -38,6 +41,19 @@ fn main() -> ExitCode {
     if let Err(message) = logging::init(&parsed.log_file) {
         eprintln!("{message}");
         return ExitCode::from(2);
+    }
+    // Reading files must not need a server address, so the inspect modes
+    // are dispatched before the env file and the config are touched.
+    match &parsed.mode {
+        Mode::Sessions => return session_cmd::sessions(&parsed.data_dir),
+        Mode::Show { session } => return session_cmd::show(&parsed.data_dir, session),
+        Mode::Delete { session, yes } => {
+            return session_cmd::delete(&parsed.data_dir, session, *yes);
+        }
+        Mode::Compare { a, b, judge: false } => {
+            return session_cmd::compare(&parsed.data_dir, a, b.as_deref(), None);
+        }
+        _ => {}
     }
     let config_path = parsed
         .config
@@ -61,9 +77,18 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(error) => return startup_failure(&error.to_string()),
     };
-    match parsed.replay {
-        Some(replay) => run_replay(config, replay),
-        None => run_gui(config),
+    match parsed.mode.clone() {
+        Mode::Replay(replay) => run_replay(config, &parsed, replay),
+        Mode::ReplaySession { session, speed } => {
+            rerun::run(config, &parsed.data_dir, &session, speed)
+        }
+        Mode::Compare { a, b, judge: true } => {
+            session_cmd::compare(&parsed.data_dir, &a, b.as_deref(), Some(&config))
+        }
+        Mode::Gui => run_gui(config, &parsed),
+        Mode::Sessions | Mode::Show { .. } | Mode::Delete { .. } | Mode::Compare { .. } => {
+            unreachable!("the read-only modes returned before the config was read")
+        }
     }
 }
 
@@ -82,7 +107,7 @@ fn startup_failure(message: &str) -> ExitCode {
 /// automatic answer is running or waiting (and, with `--ask`, when the
 /// suggestion asked for at the end ends). The profile is the flag's, or
 /// Manual: the config file's `start_profile` is for the GUI.
-fn run_replay(mut config: Config, replay: Replay) -> ExitCode {
+fn run_replay(mut config: Config, cli: &Cli, replay: Replay) -> ExitCode {
     config.assist.start_profile = replay.profile.unwrap_or(AssistProfile::Manual);
     let mut files = vec![(Speaker::Me, replay.files[0].clone())];
     if let Some(them) = replay.files.get(1) {
@@ -95,6 +120,9 @@ fn run_replay(mut config: Config, replay: Replay) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // A WAV replay records a session like a live meeting, with origin
+    // `replay_wav` (D-wav-replay-records).
+    let trace = recording::opener(&config, cli, Origin::ReplayWav, replay.speed);
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -102,7 +130,7 @@ fn run_replay(mut config: Config, replay: Replay) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(replay_loop(config, factory, replay.ask)) {
+    match runtime.block_on(replay_loop(config, factory, trace, replay.ask)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("replay: {message}");
@@ -114,6 +142,7 @@ fn run_replay(mut config: Config, replay: Replay) -> ExitCode {
 async fn replay_loop(
     config: Config,
     factory: Arc<dyn SourceFactory>,
+    trace_opener: Arc<dyn TraceOpener>,
     ask: bool,
 ) -> Result<(), String> {
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
@@ -121,7 +150,9 @@ async fn replay_loop(
         let _ = events_tx.send(event);
     });
     let (commands, receiver) = meeting::command_channel();
-    let engine = meeting::Engine::new(config, EngineDeps::production(factory, ui));
+    let mut deps = EngineDeps::production(factory, ui);
+    deps.trace = trace_opener;
+    let engine = meeting::Engine::new(config, deps);
     let running = tokio::spawn(engine.run(receiver));
     commands
         .send(EngineCommand::StartMeeting)
@@ -129,22 +160,15 @@ async fn replay_loop(
 
     let outcome = tokio::time::timeout(REPLAY_LIMIT, async {
         let mut asked = false;
-        let mut printer = SuggestionPrinter::default();
+        let mut printer = replay_print::SuggestionPrinter::default();
         while let Some(event) = events_rx.recv().await {
             match event {
-                UiEvent::TranscriptFinal(final_) => {
-                    println!(
-                        "{} {}: {}",
-                        clock_label(final_.t0_ms),
-                        speaker_label(final_.id.speaker),
-                        final_.text
-                    );
-                }
+                UiEvent::TranscriptFinal(final_) => replay_print::print_final(&final_),
                 UiEvent::Status {
                     source,
                     level,
                     text,
-                } => eprintln!("{source:?} {level:?}: {text}"),
+                } => replay_print::print_status(source, level, &text),
                 UiEvent::SuggestionDelta { id, text } => {
                     let mut out = std::io::stdout();
                     printer.delta(id, &text, &mut out);
@@ -180,7 +204,7 @@ async fn replay_loop(
 
 /// GUI mode: the single-instance lock, the engine with live capture on a
 /// background runtime thread, and the overlay on the main thread.
-fn run_gui(config: Config) -> ExitCode {
+fn run_gui(config: Config, cli: &Cli) -> ExitCode {
     let lock_path = cli::home().join("Library/Application Support/clueless/lock");
     let _lock = match lock::acquire(&lock_path) {
         Ok(lock) => lock,
@@ -198,7 +222,9 @@ fn run_gui(config: Config) -> ExitCode {
         audio.watchdog_silence_secs,
     ));
     let ui: StatusSink = Arc::new(overlay::ui::post);
-    let engine = meeting::Engine::new(config.clone(), EngineDeps::production(factory, ui));
+    let mut deps = EngineDeps::production(factory, ui);
+    deps.trace = recording::opener(&config, cli, Origin::Live, 1.0);
+    let engine = meeting::Engine::new(config.clone(), deps);
     std::thread::Builder::new()
         .name("engine".to_string())
         .spawn(move || {
@@ -208,88 +234,4 @@ fn run_gui(config: Config) -> ExitCode {
         .expect("the engine thread starts");
     overlay::ui::run_on_main_thread(config, commands);
     ExitCode::SUCCESS
-}
-
-/// Prints suggestion deltas and ends, with the "--- suggestion ---" header
-/// once per answer.
-#[derive(Default)]
-struct SuggestionPrinter {
-    /// The id of the answer whose header is out.
-    header_for: Option<u64>,
-}
-
-impl SuggestionPrinter {
-    fn delta(&mut self, id: u64, text: &str, out: &mut impl std::io::Write) {
-        if self.header_for != Some(id) {
-            let _ = writeln!(out, "--- suggestion ---");
-            self.header_for = Some(id);
-        }
-        let _ = write!(out, "{text}");
-    }
-
-    fn end(
-        &self,
-        id: u64,
-        end: &SuggestionEnd,
-        out: &mut impl std::io::Write,
-        err: &mut impl std::io::Write,
-    ) {
-        if self.header_for == Some(id) {
-            let _ = writeln!(out);
-        }
-        if let SuggestionEnd::Failed(reason) = end {
-            let _ = writeln!(err, "suggestion failed: {reason}");
-        }
-    }
-}
-
-fn speaker_label(speaker: Speaker) -> &'static str {
-    match speaker {
-        Speaker::Me => "Me",
-        Speaker::Them => "Them",
-    }
-}
-
-/// `t0_ms` as `[mm:ss]`, clamping minutes at 99 for absurd offsets.
-fn clock_label(t0_ms: u64) -> String {
-    let total_seconds = t0_ms / 1000;
-    let minutes = (total_seconds / 60).min(99);
-    format!("[{minutes:02}:{:02}]", total_seconds % 60)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn text(buffer: Vec<u8>) -> String {
-        String::from_utf8(buffer).expect("utf-8")
-    }
-
-    #[test]
-    fn the_header_is_printed_once_per_answer_and_the_end_closes_the_line() {
-        let mut printer = SuggestionPrinter::default();
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        printer.delta(1, "a", &mut out);
-        printer.delta(1, "b", &mut out);
-        printer.end(1, &SuggestionEnd::Done, &mut out, &mut err);
-        printer.delta(2, "c", &mut out);
-        assert_eq!(text(out), "--- suggestion ---\nab\n--- suggestion ---\nc");
-        assert!(err.is_empty());
-    }
-
-    #[test]
-    fn a_failed_end_is_reported_on_stderr_and_an_unseen_id_prints_no_newline() {
-        let printer = SuggestionPrinter::default();
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        printer.end(
-            7,
-            &SuggestionEnd::Failed("boom".to_string()),
-            &mut out,
-            &mut err,
-        );
-        assert!(out.is_empty());
-        assert_eq!(text(err), "suggestion failed: boom\n");
-    }
 }
