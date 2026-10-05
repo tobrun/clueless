@@ -15,6 +15,8 @@ use segmenter::machine::{Machine, MachineParams};
 use segmenter::resample::Resampler16k;
 use segmenter::vad::SpeechProb;
 use tokio::sync::mpsc;
+use trace::record::{Body, DropReason, SegmentKind as TraceSegmentKind};
+use trace::sink::TraceSink;
 
 use crate::asr_worker::LatestSlot;
 use crate::clock::StreamClock;
@@ -25,6 +27,8 @@ use crate::pipeline::Drain;
 pub struct StreamPipes {
     pub status_source: StatusSource,
     pub ui: StatusSink,
+    /// This meeting's trace sink.
+    pub trace: Arc<dyn TraceSink>,
     /// Bounded finals queue (16) consumed in order by the stream's final worker.
     pub final_tx: mpsc::Sender<Segment>,
     /// Latest-wins slot for interims.
@@ -141,6 +145,7 @@ fn stream_loop(
                     machine.push_audio(frame, &f);
                     let p = vad.prob(&f);
                     let segments = machine.push(p, frame, t_start);
+                    pipes.trace.audio(speaker.into(), t_start, &f);
                     clock.advance(512);
                     frame += 1;
                     for segment in segments {
@@ -261,6 +266,15 @@ fn sync_open_state(speaker: Speaker, machine: &Machine, pipes: &StreamPipes) {
 /// are queued in order and become `TranscriptDropped` (with one status error)
 /// when the bounded queue is full.
 fn send_segment(speaker: Speaker, segment: Segment, pipes: &StreamPipes) {
+    pipes.trace.record(Body::Segment {
+        speaker: speaker.into(),
+        utterance: segment.id.seq,
+        segment_kind: TraceSegmentKind::from(segment.kind),
+        t0_ms: segment.t0_ms,
+        t1_ms: segment.t1_ms,
+        samples: segment.pcm.len() as u64,
+        overlaps_prev: segment.overlaps_prev,
+    });
     match segment.kind {
         SegmentKind::Interim => {
             pipes.interim_slot.push(segment);
@@ -284,6 +298,11 @@ fn send_segment(speaker: Speaker, segment: Segment, pipes: &StreamPipes) {
                         remove_pending(&pipes.them_pending, segment.t0_ms);
                     }
                     (pipes.ui)(UiEvent::TranscriptDropped { id: segment.id });
+                    pipes.trace.record(Body::UtteranceDropped {
+                        speaker: speaker.into(),
+                        utterance: segment.id.seq,
+                        reason: DropReason::QueueFull,
+                    });
                     (pipes.ui)(UiEvent::Status {
                         source: StatusSource::Asr,
                         level: StatusLevel::Error,

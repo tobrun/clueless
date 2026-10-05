@@ -22,6 +22,8 @@ use clueless_types::events::{
 use context::echo::is_echo;
 use context::prompt::InProgressText;
 use segmenter::dedup::strip_overlap;
+use trace::record::{AsrOutcome, Body, DropReason, SegmentKind as TraceSegmentKind};
+use trace::sink::TraceSink;
 
 use crate::deps::EngineTimings;
 use crate::pipeline::Drain;
@@ -150,11 +152,18 @@ pub struct WorkerCtx {
     /// Some only for a Me stream while a Them source is open.
     pub echo: Option<EchoCtx>,
     pub timings: EngineTimings,
+    /// This meeting's trace sink.
+    pub trace: Arc<dyn TraceSink>,
 }
 
 impl WorkerCtx {
-    fn drop_final(&self, segment: &Segment) {
+    fn drop_final(&self, segment: &Segment, reason: DropReason) {
         (self.ui)(UiEvent::TranscriptDropped { id: segment.id });
+        self.trace.record(Body::UtteranceDropped {
+            speaker: self.speaker.into(),
+            utterance: segment.id.seq,
+            reason,
+        });
         self.release(segment, None);
     }
 
@@ -200,16 +209,16 @@ pub async fn run_final(ctx: Arc<WorkerCtx>, mut finals: mpsc::Receiver<Segment>)
             _ = ctx.cancel.cancelled() => {
                 finals.close();
                 while let Ok(segment) = finals.try_recv() {
-                    ctx.drop_final(&segment);
+                    ctx.drop_final(&segment, DropReason::Cancelled);
                 }
                 break;
             }
         };
         if ctx.cancel.is_cancelled() {
-            ctx.drop_final(&segment);
+            ctx.drop_final(&segment, DropReason::Cancelled);
             finals.close();
             while let Ok(rest) = finals.try_recv() {
-                ctx.drop_final(&rest);
+                ctx.drop_final(&rest, DropReason::Cancelled);
             }
             break;
         }
@@ -234,10 +243,26 @@ async fn process_final(
         asr_sent_ms = uptime_ms(),
         "final transcription request"
     );
+    // The recorded call window uses the trace clock so it lands on the same
+    // axis as the audio that produced it (C-trace-audio-timeline).
+    let started_at_ms = ctx.trace.now_ms();
+    let asr_call = |outcome: AsrOutcome, raw_text: Option<String>, error: Option<String>| {
+        ctx.trace.record(Body::AsrCall {
+            speaker: ctx.speaker.into(),
+            utterance: segment.id.seq,
+            segment_kind: TraceSegmentKind::Final,
+            started_at_ms,
+            duration_ms: ctx.trace.now_ms().saturating_sub(started_at_ms),
+            outcome,
+            raw_text,
+            error,
+        });
+    };
     let result = tokio::select! {
         result = ctx.asr.transcribe(&segment.pcm, 3) => result,
         _ = ctx.cancel.cancelled() => {
-            ctx.drop_final(&segment);
+            asr_call(AsrOutcome::Cancelled, None, None);
+            ctx.drop_final(&segment, DropReason::Cancelled);
             return None;
         }
     };
@@ -249,20 +274,27 @@ async fn process_final(
         "final transcription response"
     );
     let text = match result {
-        Ok(Some(text)) => text,
+        Ok(Some(text)) => {
+            // The raw transcription is what the service returned, recorded
+            // before the overlap strip below can rewrite it.
+            asr_call(AsrOutcome::Text, Some(text.clone()), None);
+            text
+        }
         Ok(None) => {
+            asr_call(AsrOutcome::NoSpeech, None, None);
             tracing::debug!(seq = segment.id.seq, "no speech, dropped");
-            ctx.drop_final(&segment);
+            ctx.drop_final(&segment, DropReason::NoSpeech);
             return None;
         }
         Err(error) => {
+            asr_call(AsrOutcome::Error, None, Some(error.to_string()));
             tracing::warn!(%error, seq = segment.id.seq, "final transcription failed");
             (ctx.ui)(UiEvent::Status {
                 source: StatusSource::Asr,
                 level: StatusLevel::Error,
                 text: format!("ASR failed, dropped an utterance: {error}"),
             });
-            ctx.drop_final(&segment);
+            ctx.drop_final(&segment, DropReason::AsrError);
             return None;
         }
     };
@@ -279,7 +311,7 @@ async fn process_final(
     };
     if !text.chars().any(char::is_alphanumeric) {
         tracing::debug!(seq = segment.id.seq, "empty after overlap strip, dropped");
-        ctx.drop_final(&segment);
+        ctx.drop_final(&segment, DropReason::EmptyAfterOverlap);
         return None;
     }
 
@@ -287,7 +319,7 @@ async fn process_final(
     if ctx.speaker == Speaker::Me
         && let Some(echo) = &ctx.echo
     {
-        hold_for_them(ctx, echo, segment.t1_ms).await;
+        let held_ms = hold_for_them(ctx, echo, segment.t1_ms).await;
         let comparison = comparison_set(ctx);
         let me = Utterance {
             id: segment.id,
@@ -295,16 +327,22 @@ async fn process_final(
             t1_ms: segment.t1_ms,
             text: text.clone(),
         };
-        if is_echo(&me, &comparison) {
+        let verdict = is_echo(&me, &comparison);
+        ctx.trace.record(Body::EchoCheck {
+            utterance: segment.id.seq,
+            held_ms,
+            echo: verdict,
+        });
+        if verdict {
             tracing::info!(seq = segment.id.seq, "Me final dropped as echo");
-            ctx.drop_final(&segment);
+            ctx.drop_final(&segment, DropReason::Echo);
             return None;
         }
     }
 
     // 4. Commit.
     if ctx.cancel.is_cancelled() {
-        ctx.drop_final(&segment);
+        ctx.drop_final(&segment, DropReason::Cancelled);
         return None;
     }
     let utterance = Utterance {
@@ -326,26 +364,28 @@ async fn process_final(
 /// NOT cut this short: the pipeline's stop waits inside `stop_wait` for the
 /// decision, so a tail echo can never commit while the Them final covering
 /// it is still in flight. Only the meeting's cancel token releases early.
-async fn hold_for_them(ctx: &WorkerCtx, echo: &EchoCtx, t1_ms: u64) {
+async fn hold_for_them(ctx: &WorkerCtx, echo: &EchoCtx, t1_ms: u64) -> u64 {
+    let started = Instant::now();
     let deadline = tokio::time::Instant::now() + echo.hold;
     let mut ticker = tokio::time::interval(Duration::from_millis(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if ctx.cancel.is_cancelled() {
-            return;
+            break;
         }
         if echo_released(echo, t1_ms) {
-            return;
+            break;
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::debug!("echo hold timed out, deciding with what is known");
-            return;
+            break;
         }
         tokio::select! {
             _ = ticker.tick() => {}
-            _ = ctx.cancel.cancelled() => return,
+            _ = ctx.cancel.cancelled() => break,
         }
     }
+    started.elapsed().as_millis() as u64
 }
 
 /// The hold's release condition, checked without any waiting.
@@ -426,10 +466,26 @@ pub async fn run_interim(
             asr_sent_ms = uptime_ms(),
             "interim transcription request"
         );
+        let started_at_ms = ctx.trace.now_ms();
         let result = tokio::select! {
             result = ctx.asr.transcribe(&segment.pcm, 1) => result,
             _ = ctx.cancel.cancelled() => break,
         };
+        let (outcome, raw_text, error) = match &result {
+            Ok(Some(text)) => (AsrOutcome::Text, Some(text.clone()), None),
+            Ok(None) => (AsrOutcome::NoSpeech, None, None),
+            Err(error) => (AsrOutcome::Error, None, Some(error.to_string())),
+        };
+        ctx.trace.record(Body::AsrCall {
+            speaker: ctx.speaker.into(),
+            utterance: seq,
+            segment_kind: TraceSegmentKind::Interim,
+            started_at_ms,
+            duration_ms: ctx.trace.now_ms().saturating_sub(started_at_ms),
+            outcome,
+            raw_text,
+            error,
+        });
         tracing::info!(
             speaker = ?ctx.speaker,
             seq,

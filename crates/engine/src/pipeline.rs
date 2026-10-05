@@ -21,6 +21,7 @@ use context::prompt::InProgressText;
 use context::store::TranscriptStore;
 use futures_util::FutureExt;
 use segmenter::machine::MachineParams;
+use trace::sink::TraceSink;
 
 use crate::asr_worker::{self, LatestSlot, ProgressEntry, WorkerCtx};
 use crate::clock::{MeetingClock, StreamClock};
@@ -152,6 +153,8 @@ impl Pipeline {
     /// Must be called inside a tokio runtime. `asr` and `machine` come in
     /// beside `deps` (the lifecycle builds them from the config; tests
     /// script them directly), a small widening of the spec signature.
+    /// `trace` records this meeting's segments, calls and audio frames.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         sources: Vec<(Speaker, Box<dyn SampleSource>)>,
         deps: &EngineDeps,
@@ -160,6 +163,7 @@ impl Pipeline {
         store: Arc<Mutex<TranscriptStore>>,
         clock: MeetingClock,
         cancel: CancellationToken,
+        trace: Arc<dyn TraceSink>,
     ) -> Self {
         let (panic_tx, panic_rx) = mpsc::unbounded_channel();
         let has_them = sources.iter().any(|(speaker, _)| *speaker == Speaker::Them);
@@ -201,6 +205,7 @@ impl Pipeline {
             let pipes = StreamPipes {
                 status_source,
                 ui: deps.ui.clone(),
+                trace: trace.clone(),
                 final_tx,
                 interim_slot: slot.clone(),
                 final_seq_watermark: final_seq_watermark.clone(),
@@ -235,6 +240,7 @@ impl Pipeline {
             let ctx = Arc::new(WorkerCtx {
                 speaker,
                 ui: deps.ui.clone(),
+                trace: trace.clone(),
                 asr: asr.clone(),
                 store: store.clone(),
                 commits_tx: commits_tx.clone(),

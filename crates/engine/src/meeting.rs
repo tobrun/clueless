@@ -4,7 +4,7 @@
 //! compressed, exactly once per meeting.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -23,6 +23,9 @@ use context::store::TranscriptStore;
 use llm::client::LlmClient;
 use llm::types::ChatRequest;
 use segmenter::machine::MachineParams;
+use trace::manifest::SessionStart;
+use trace::record::{Body, EndReason, PolicyOutcome};
+use trace::sink::{FailureSink, NoTrace, TraceSink};
 
 use crate::asr_worker::PieceDone;
 use crate::clock::MeetingClock;
@@ -31,6 +34,7 @@ use crate::deps::EngineDeps;
 use crate::health;
 use crate::pipeline::{self, Pipeline};
 use crate::suggest;
+use crate::trace_tap::{self, Current};
 
 /// Messages from the engine's own helper tasks back into the loop.
 enum Internal {
@@ -67,6 +71,10 @@ struct Meeting {
     wake_at: Option<tokio::time::Instant>,
     /// Whether the policy was last seen waiting (logging only).
     was_waiting: bool,
+    /// This meeting's trace sink (records nothing when tracing is off).
+    sink: Arc<dyn TraceSink>,
+    /// The profile in effect, for `policy` records.
+    profile: AssistProfile,
 }
 
 /// The one suggestion request that is open.
@@ -82,6 +90,8 @@ struct RunningSuggestion {
 pub struct Engine {
     config: Config,
     deps: EngineDeps,
+    /// The tap `deps.ui` records through while a meeting holds a sink.
+    trace: Current,
 }
 
 enum Next {
@@ -130,8 +140,15 @@ async fn next_event(
 }
 
 impl Engine {
-    pub fn new(config: Config, deps: EngineDeps) -> Self {
-        Self { config, deps }
+    pub fn new(config: Config, mut deps: EngineDeps) -> Self {
+        let trace = Current::new();
+        let ui = deps.ui.clone();
+        deps.ui = trace_tap::wrap_ui(ui, trace.clone());
+        Self {
+            config,
+            deps,
+            trace,
+        }
     }
 
     /// Own the meeting state until `Shutdown` or the command sender is
@@ -158,7 +175,7 @@ impl Engine {
                     tracing::error!(%message, "engine component panicked");
                     self.emit(pipeline::panic_status(&message));
                     if meeting.is_some() {
-                        self.stop_meeting(&mut meeting).await;
+                        self.stop_meeting(&mut meeting, EndReason::Panic).await;
                         state = MeetingState::Idle;
                     }
                 }
@@ -175,69 +192,74 @@ impl Engine {
                 Next::Finished(finished) => self.on_finished(&mut meeting, finished),
                 Next::Piece(piece) => Self::on_piece(&mut meeting, piece),
                 Next::Tick => {}
-                Next::Command(command) => match command {
-                    EngineCommand::StartMeeting if state == MeetingState::Idle => {
-                        state = self
-                            .start_meeting(&mut meeting, &internal_tx, profile)
-                            .await;
-                    }
-                    EngineCommand::StopMeeting if state == MeetingState::Running => {
-                        self.stop_meeting(&mut meeting).await;
-                        state = MeetingState::Idle;
-                    }
-                    EngineCommand::ToggleMeeting => match state {
-                        MeetingState::Idle => {
+                Next::Command(command) => {
+                    // Every command received while a meeting exists, also
+                    // the ones its state ignores.
+                    self.trace.record(Body::command(&command));
+                    match command {
+                        EngineCommand::StartMeeting if state == MeetingState::Idle => {
                             state = self
                                 .start_meeting(&mut meeting, &internal_tx, profile)
                                 .await;
                         }
-                        MeetingState::Running => {
-                            self.stop_meeting(&mut meeting).await;
+                        EngineCommand::StopMeeting if state == MeetingState::Running => {
+                            self.stop_meeting(&mut meeting, EndReason::Stop).await;
                             state = MeetingState::Idle;
                         }
-                        MeetingState::Starting | MeetingState::Stopping => {}
-                    },
-                    EngineCommand::Suggest if state == MeetingState::Running => {
-                        if let Some(current) = meeting.as_mut() {
-                            next_suggestion_id += 1;
-                            self.run_suggestion(
-                                current,
-                                next_suggestion_id,
-                                profile,
-                                Origin::Manual,
-                                &finished_tx,
-                            )
-                            .await;
+                        EngineCommand::ToggleMeeting => match state {
+                            MeetingState::Idle => {
+                                state = self
+                                    .start_meeting(&mut meeting, &internal_tx, profile)
+                                    .await;
+                            }
+                            MeetingState::Running => {
+                                self.stop_meeting(&mut meeting, EndReason::Stop).await;
+                                state = MeetingState::Idle;
+                            }
+                            MeetingState::Starting | MeetingState::Stopping => {}
+                        },
+                        EngineCommand::Suggest if state == MeetingState::Running => {
+                            if let Some(current) = meeting.as_mut() {
+                                next_suggestion_id += 1;
+                                self.run_suggestion(
+                                    current,
+                                    next_suggestion_id,
+                                    profile,
+                                    Origin::Manual,
+                                    &finished_tx,
+                                )
+                                .await;
+                            }
                         }
-                    }
-                    EngineCommand::ClearSuggestion if state == MeetingState::Running => {
-                        if let Some(current) = meeting.as_mut() {
-                            Self::cancel_suggestion(current).await;
-                            current.previous_answer = None;
-                            self.emit(UiEvent::ClearSuggestion);
+                        EngineCommand::ClearSuggestion if state == MeetingState::Running => {
+                            if let Some(current) = meeting.as_mut() {
+                                Self::cancel_suggestion(current).await;
+                                current.previous_answer = None;
+                                self.emit(UiEvent::ClearSuggestion);
+                            }
                         }
-                    }
-                    EngineCommand::CycleProfile => {
-                        let wanted = profile.next();
-                        self.change_profile(&mut profile, wanted, &mut meeting);
-                    }
-                    EngineCommand::SetProfile(wanted) => {
-                        self.set_profile(&mut profile, wanted, &mut meeting);
-                    }
-                    EngineCommand::Shutdown => {
-                        if meeting.is_some() {
-                            // The stop sequence itself ends with an Idle event.
-                            self.stop_meeting(&mut meeting).await;
-                        } else {
-                            self.emit(UiEvent::MeetingState(MeetingState::Idle));
+                        EngineCommand::CycleProfile => {
+                            let wanted = profile.next();
+                            self.change_profile(&mut profile, wanted, &mut meeting);
                         }
-                        return;
+                        EngineCommand::SetProfile(wanted) => {
+                            self.set_profile(&mut profile, wanted, &mut meeting);
+                        }
+                        EngineCommand::Shutdown => {
+                            if meeting.is_some() {
+                                // The stop sequence itself ends with an Idle event.
+                                self.stop_meeting(&mut meeting, EndReason::Shutdown).await;
+                            } else {
+                                self.emit(UiEvent::MeetingState(MeetingState::Idle));
+                            }
+                            return;
+                        }
+                        EngineCommand::StartMeeting
+                        | EngineCommand::StopMeeting
+                        | EngineCommand::Suggest
+                        | EngineCommand::ClearSuggestion => {}
                     }
-                    EngineCommand::StartMeeting
-                    | EngineCommand::StopMeeting
-                    | EngineCommand::Suggest
-                    | EngineCommand::ClearSuggestion => {}
-                },
+                }
                 Next::Closed => break,
             }
             self.pump_running(
@@ -251,7 +273,8 @@ impl Engine {
         }
         // The command sender went away: shut down like `Shutdown` did.
         if meeting.is_some() {
-            self.stop_meeting(&mut meeting).await;
+            self.stop_meeting(&mut meeting, EndReason::ChannelClosed)
+                .await;
         }
     }
 
@@ -265,6 +288,10 @@ impl Engine {
     /// A finished piece only matters while a meeting exists.
     fn on_piece(meeting: &mut Option<Meeting>, piece: PieceDone) {
         if let Some(current) = meeting.as_mut() {
+            current.sink.record(Body::PieceDone {
+                speaker: piece.speaker.into(),
+                chars: piece.text.as_ref().map(|text| text.chars().count()),
+            });
             current
                 .policy
                 .piece_done(piece.speaker, piece.text.as_deref(), Instant::now());
@@ -311,6 +338,7 @@ impl Engine {
         *profile = wanted;
         if let Some(current) = meeting.as_mut() {
             current.policy.set_profile(wanted);
+            current.profile = wanted;
         }
         self.emit(UiEvent::Profile(wanted));
     }
@@ -318,6 +346,10 @@ impl Engine {
     /// Feed every queued piece report to the policy.
     fn absorb_pieces(meeting: &mut Meeting) {
         while let Ok(piece) = meeting.pieces.try_recv() {
+            meeting.sink.record(Body::PieceDone {
+                speaker: piece.speaker.into(),
+                chars: piece.text.as_ref().map(|text| text.chars().count()),
+            });
             meeting
                 .policy
                 .piece_done(piece.speaker, piece.text.as_deref(), Instant::now());
@@ -342,6 +374,11 @@ impl Engine {
             Decision::WaitUntil(at) => {
                 if !meeting.was_waiting {
                     tracing::info!(assist_profile = profile.key(), assist_outcome = "waiting");
+                    meeting.sink.record(Body::Policy {
+                        outcome: PolicyOutcome::Waiting,
+                        profile: profile.into(),
+                        suggestion: None,
+                    });
                     meeting.was_waiting = true;
                 }
                 meeting.wake_at = Some(tokio::time::Instant::from_std(at));
@@ -354,6 +391,11 @@ impl Engine {
                     assist_outcome = "fired",
                     suggestion = *next_suggestion_id,
                 );
+                meeting.sink.record(Body::Policy {
+                    outcome: PolicyOutcome::Fired,
+                    profile: profile.into(),
+                    suggestion: Some(*next_suggestion_id),
+                });
                 self.run_suggestion(
                     meeting,
                     *next_suggestion_id,
@@ -394,7 +436,7 @@ impl Engine {
     }
 
     /// Automatic requests pause after a failed or interrupted request; say so.
-    fn log_pause(&self, suggestion: u64, reason: &str) {
+    fn log_pause(&self, meeting: &Meeting, suggestion: u64, reason: &str) {
         tracing::warn!(
             suggestion,
             reason,
@@ -402,6 +444,11 @@ impl Engine {
             assist_outcome = "paused",
             "suggestion failed, automatic requests pause"
         );
+        meeting.sink.record(Body::Policy {
+            outcome: PolicyOutcome::Paused,
+            profile: meeting.profile.into(),
+            suggestion: Some(suggestion),
+        });
     }
 
     /// Remember the answer and update the LLM status for how the run ended.
@@ -417,12 +464,12 @@ impl Engine {
                 }
             }
             SuggestionEnd::Failed(reason) => {
-                self.log_pause(finished.id, &reason);
+                self.log_pause(meeting, finished.id, &reason);
                 meeting.llm_failed = true;
                 self.llm_status(reason);
             }
             SuggestionEnd::Interrupted => {
-                self.log_pause(finished.id, "interrupted");
+                self.log_pause(meeting, finished.id, "interrupted");
                 meeting.llm_failed = true;
                 self.llm_status("LLM answer interrupted".to_owned());
             }
@@ -446,7 +493,23 @@ impl Engine {
         internal_tx: &mpsc::UnboundedSender<Internal>,
         profile: AssistProfile,
     ) -> MeetingState {
+        // The trace opens before the first event so the whole meeting,
+        // `Starting` included, lands in it (D-trace-tap).
+        let speakers = self.deps.factory.speakers();
+        let start = trace_tap::session_start(&self.config, &self.deps, &speakers, profile);
+        let sink = self.open_trace(start).await;
+        self.trace.set(sink.clone());
         self.emit(UiEvent::MeetingState(MeetingState::Starting));
+        if let Some(location) = sink.location() {
+            // One line telling the user where this meeting is stored
+            // (D-audio-indicator); the text comes from the sink, not the config.
+            let audio = if location.audio { " (with audio)" } else { "" };
+            self.emit(UiEvent::Status {
+                source: StatusSource::App,
+                level: StatusLevel::Info,
+                text: format!("recording to {}{}", location.dir.display(), audio),
+            });
+        }
         let timings = self.deps.timings;
         let asr = Arc::new(AsrClient::new(
             &self.config.asr.base_url,
@@ -468,6 +531,9 @@ impl Engine {
             self.emit(event);
         }
         let notes = self.read_notes();
+        if let Some(text) = &notes {
+            sink.record(Body::Notes { text: text.clone() });
+        }
 
         let mut sources = Vec::new();
         for speaker in self.deps.factory.speakers() {
@@ -481,10 +547,15 @@ impl Engine {
             }
         }
         if sources.is_empty() {
+            // The meeting ended before it began; the trace says so (D-session-end).
+            sink.close(EndReason::StartFailed);
+            self.trace.take();
             self.emit(UiEvent::MeetingState(MeetingState::Idle));
             return MeetingState::Idle;
         }
 
+        let clock = MeetingClock::new();
+        sink.record(Body::ClockStarted);
         let store = Arc::new(Mutex::new(TranscriptStore::new()));
         let cancel = CancellationToken::new();
         let machine = MachineParams::from(&self.config.vad);
@@ -494,8 +565,9 @@ impl Engine {
             asr,
             &machine,
             store.clone(),
-            MeetingClock::new(),
+            clock,
             cancel.clone(),
+            sink.clone(),
         );
 
         let pieces = pipeline
@@ -561,15 +633,17 @@ impl Engine {
             llm_failed: false,
             wake_at: None,
             was_waiting: false,
+            sink,
+            profile,
         });
         self.emit(UiEvent::MeetingState(MeetingState::Running));
         MeetingState::Running
     }
 
     /// The full stop sequence: cancel the suggestion, the compression
-    /// task and the meeting token, flush and join the pipeline, then
-    /// report `Idle`.
-    async fn stop_meeting(&self, meeting: &mut Option<Meeting>) {
+    /// task and the meeting token, flush and join the pipeline, close the
+    /// trace, then report `Idle`.
+    async fn stop_meeting(&self, meeting: &mut Option<Meeting>, reason: EndReason) {
         let Some(current) = meeting.as_mut() else {
             return;
         };
@@ -585,8 +659,60 @@ impl Engine {
         if let Some(task) = current.panic_task.as_mut() {
             task.abort();
         }
+        let sink = std::mem::replace(&mut current.sink, Arc::new(NoTrace));
         *meeting = None;
+        self.close_trace(sink, reason).await;
         self.emit(UiEvent::MeetingState(MeetingState::Idle));
+    }
+
+    /// Open this meeting's trace off the loop thread: an opener may create
+    /// directories, which must not stall the engine. A failed open is one
+    /// Warn status and an unrecorded meeting (C-trace-failure-isolated).
+    async fn open_trace(&self, start: SessionStart) -> Arc<dyn TraceSink> {
+        let opener = self.deps.trace.clone();
+        let ui = self.deps.ui.clone();
+        let on_failure: FailureSink = Arc::new(move |message| {
+            (ui)(UiEvent::Status {
+                source: StatusSource::App,
+                level: StatusLevel::Warn,
+                text: format!("trace: recording stopped: {message}"),
+            });
+        });
+        match tokio::task::spawn_blocking(move || opener.open(start, on_failure)).await {
+            Ok(Ok(sink)) => sink,
+            Ok(Err(message)) => {
+                self.emit(UiEvent::Status {
+                    source: StatusSource::App,
+                    level: StatusLevel::Warn,
+                    text: format!("trace: cannot record this meeting: {message}"),
+                });
+                Arc::new(NoTrace)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "trace opener task failed");
+                Arc::new(NoTrace)
+            }
+        }
+    }
+
+    /// Flush and close a meeting's trace before the loop may report `Idle`
+    /// (C-trace-closed-before-idle): the writer thread is joined off the
+    /// loop, and the whole close gives up after 3 s so a stuck disk can
+    /// never keep `Idle` from being sent.
+    async fn close_trace(&self, sink: Arc<dyn TraceSink>, reason: EndReason) {
+        // Take the slot first: the `Idle` event must not be recorded and
+        // nothing may be added after the `end` record.
+        self.trace.take();
+        let closing = tokio::task::spawn_blocking(move || sink.close(reason));
+        match tokio::time::timeout(Duration::from_secs(3), closing).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "trace close task failed"),
+            Err(_) => {
+                tracing::warn!(
+                    "trace close did not finish in time; the session may lack its end record"
+                );
+            }
+        }
     }
 
     /// Cancel the running suggestion (its task reports `Cancelled`) and

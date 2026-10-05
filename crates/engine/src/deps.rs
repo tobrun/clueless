@@ -9,6 +9,7 @@ use std::time::Duration;
 use clueless_types::audio::SourceFactory;
 use clueless_types::events::StatusSink;
 use segmenter::vad::SpeechProb;
+use trace::sink::{NoTrace, TraceOpener};
 
 /// Every wait and timeout inside the engine, in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +73,8 @@ pub struct EngineDeps {
     pub vad: Arc<dyn Fn() -> Box<dyn SpeechProb> + Send + Sync>,
     pub timings: EngineTimings,
     pub compress_threshold_tokens: usize,
+    /// Opens the trace sink for one meeting; records nothing by default.
+    pub trace: Arc<dyn TraceOpener>,
 }
 
 impl EngineDeps {
@@ -89,6 +92,9 @@ impl EngineDeps {
             }),
             timings: EngineTimings::production(),
             compress_threshold_tokens: 90_000,
+            // The binary replaces this with its disk opener (D-test-isolation:
+            // nothing is recorded until a caller installs an opener).
+            trace: Arc::new(NoTrace),
         }
     }
 }
