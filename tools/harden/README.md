@@ -164,3 +164,18 @@ crates/a/src/lib.rs:69: warn: fn only_own_tests_2 only used by its own tests
 $ echo $?
 1
 ```
+
+## Ecosystem gauntlet checks (not scripted here)
+
+Used by the `ship` gauntlet on Rust sources; these tools run from their own
+binaries, this section pins how this repo invokes them:
+
+- Duplication: `npx -y jscpd@latest <in-scope files, minus *.lock and
+  fixtures/*.jsonl> --min-tokens 50 --reporters consoleFull` - exit 1 when any
+  clone above 50 tokens involves a diff-touched file.
+- Secrets: `gitleaks detect` (git mode, so build artifacts under `target/`
+  are naturally excluded; a `--no-git` working-tree scan reports false
+  positives from compiled dependencies).
+- Dependency vulnerabilities: `cargo audit` (installed via brew).
+- Static security rules: `semgrep scan --config p/rust --config p/generic
+  --metrics=off --error <in-scope files>`.
