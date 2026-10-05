@@ -1,0 +1,27 @@
+{"seq":1,"at_ms":0,"kind":"command","command":"start_meeting"}
+{"seq":2,"at_ms":10,"kind":"notes","text":"bring questions"}
+{"seq":3,"at_ms":20,"kind":"clock_started"}
+{"seq":4,"at_ms":30,"kind":"meeting_state","state":"running"}
+{"seq":5,"at_ms":40,"kind":"profile","profile":"interview"}
+{"seq":6,"at_ms":50,"kind":"status","source":"asr","level":"warn","text":"speech server quiet"}
+{"seq":7,"at_ms":60,"kind":"transcript_interim","speaker":"them","utterance":1,"text":"hel"}
+{"seq":8,"at_ms":70,"kind":"transcript_final","speaker":"them","utterance":1,"t0_ms":100,"t1_ms":900,"text":"hello there"}
+{"seq":9,"at_ms":80,"kind":"transcript_dropped","speaker":"me","utterance":2}
+{"seq":10,"at_ms":90,"kind":"suggestion_start","suggestion":5}
+{"seq":11,"at_ms":100,"kind":"suggestion_delta","suggestion":5,"text":"try asking"}
+{"seq":12,"at_ms":110,"kind":"suggestion_end","suggestion":5,"end":"failed","message":"boom"}
+{"seq":13,"at_ms":120,"kind":"clear_suggestion"}
+{"seq":14,"at_ms":130,"kind":"sources_drained"}
+{"seq":15,"at_ms":140,"kind":"segment","speaker":"me","utterance":3,"segment_kind":"final","t0_ms":1000,"t1_ms":1500,"samples":8000,"overlaps_prev":false}
+{"seq":16,"at_ms":150,"kind":"asr_call","speaker":"me","utterance":3,"segment_kind":"final","started_at_ms":1500,"duration_ms":220,"outcome":"text","raw_text":"hello there"}
+{"seq":17,"at_ms":160,"kind":"echo_check","utterance":3,"held_ms":700,"echo":false}
+{"seq":18,"at_ms":170,"kind":"utterance_dropped","speaker":"them","utterance":4,"reason":"queue_full"}
+{"seq":19,"at_ms":180,"kind":"piece_done","speaker":"me","chars":12}
+{"seq":20,"at_ms":190,"kind":"policy","outcome":"fired","profile":"interview","suggestion":6}
+{"seq":21,"at_ms":200,"kind":"llm_request","call":1,"purpose":"suggestion","suggestion":6,"origin":"auto","profile":"interview","body":{"model":"gpt-test","messages":[]}}
+{"seq":22,"at_ms":210,"kind":"llm_delta","call":1,"channel":"reasoning","text":"thinking"}
+{"seq":23,"at_ms":220,"kind":"llm_end","call":1,"outcome":"done","finish_reason":"stop","usage":{"prompt_tokens":100,"completion_tokens":5},"raw_text":"an answer","shown_text":"an answer","passed":true,"first_content_ms":410}
+{"seq":24,"at_ms":230,"kind":"summary_applied","call":2,"replaced":5}
+{"seq":25,"at_ms":240,"kind":"audio_anchor","speaker":"me","t_ms":1000,"sample_index":16000}
+{"seq":26,"at_ms":250,"kind":"records_lost","records":7,"audio_frames":3}
+{"seq":27,"at_ms":260,"kind":"end","reason":"stop"}

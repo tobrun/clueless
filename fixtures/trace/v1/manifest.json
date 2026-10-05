@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "started_at_ms": 1791209002000,
+  "origin": "live",
+  "speed": 1.0,
+  "app_version": "0.1.0",
+  "git_commit": "fixture",
+  "audio": true,
+  "session": {
+    "speakers": ["me", "them"],
+    "profile": "interview",
+    "llm": {
+      "base_url": "http://host:8000",
+      "model": "gpt-test",
+      "max_tokens": 220,
+      "temperature": 0.4
+    },
+    "speech": {
+      "base_url": "http://host:9000",
+      "model": "whisper-1"
+    },
+    "voice_detector": {
+      "start_threshold": 0.5,
+      "end_threshold": 0.35,
+      "end_silence_frames": 19,
+      "max_segment_ms": 15000
+    },
+    "timings_ms": {
+      "echo_hold_ms": 700,
+      "stop_wait_ms": 1500,
+      "health_timeout_ms": 2000,
+      "asr_timeout_ms": 15000,
+      "llm_connect_ms": 2000,
+      "llm_stall_ms": 10000
+    },
+    "compress_threshold_tokens": 90000
+  }
+}
