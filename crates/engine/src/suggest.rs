@@ -11,6 +11,17 @@ use clueless_types::events::{StatusSink, SuggestionEnd, UiEvent};
 use context::prompt::{PASS_TOKEN, PromptMessage};
 use llm::client::{LlmClient, LlmError};
 use llm::types::{ChatRequest, Message, StreamPart};
+use trace::record::{Body, Channel, LlmOutcome, Usage as TraceUsage};
+use trace::sink::TraceSink;
+
+/// Copy the client's token counts into the trace record's own type.
+pub(crate) fn trace_usage(usage: llm::types::Usage) -> TraceUsage {
+    TraceUsage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+    }
+}
 
 /// Convert the prompt builder's messages to the LLM client's type.
 pub fn to_llm_messages(messages: Vec<PromptMessage>) -> Vec<Message> {
@@ -107,7 +118,10 @@ fn stream_closed_end(cancel: &CancellationToken) -> SuggestionEnd {
 /// is this suggestion's own token: when it fires the run reports
 /// `Cancelled` whatever else was in flight. With `hold_pass` the start of
 /// the answer is held back while it could still be `PASS`; an answer that
-/// ends while held shows nothing.
+/// ends while held shows nothing. Every streamed text piece is recorded
+/// on the meeting trace under `call`, and the guard writes the call's
+/// `llm_end` when the run ends.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     id: u64,
     llm: Arc<LlmClient>,
@@ -116,31 +130,47 @@ pub async fn run(
     ui: StatusSink,
     hold_pass: bool,
     finished: tokio::sync::mpsc::UnboundedSender<Finished>,
+    trace: Arc<dyn TraceSink>,
+    call: u64,
 ) {
-    let guard = EndGuard {
+    let mut guard = EndGuard {
         id,
         ui: ui.clone(),
         finished,
         done: false,
+        trace,
+        call,
+        hold_pass,
+        raw: String::new(),
+        finish_reason: None,
+        usage: None,
+        first_content_ms: None,
+        first_reasoning_ms: None,
     };
     let mut stream = llm.stream(request, cancel.clone());
     let started = Instant::now();
     let mut first_delta = true;
     let mut filter = hold_pass.then(PassFilter::new);
     let mut shown = String::new();
+    let mut error_detail: Option<String> = None;
     let end = loop {
         match stream.next().await {
-            // Reasoning and Finish parts do not reach the UI; change set 6
-            // of the trace spec records them.
             Some(Ok(StreamPart::Content(text))) => {
                 if first_delta {
                     first_delta = false;
+                    guard.first_content_ms = Some(started.elapsed().as_millis() as u64);
                     tracing::info!(
                         suggestion = id,
                         llm_first_delta_ms = started.elapsed().as_millis(),
                         "time to first suggestion delta"
                     );
                 }
+                guard.raw.push_str(&text);
+                guard.trace.record(Body::LlmDelta {
+                    call: guard.call,
+                    channel: Channel::Content,
+                    text: text.clone(),
+                });
                 if cancel.is_cancelled() {
                     break SuggestionEnd::Cancelled;
                 }
@@ -150,27 +180,54 @@ pub async fn run(
                     ui(UiEvent::SuggestionDelta { id, text });
                 }
             }
-            Some(Ok(StreamPart::Reasoning(_))) | Some(Ok(StreamPart::Finish { .. })) => {}
-            Some(Err(error)) => break map_llm_error(&error),
+            Some(Ok(StreamPart::Reasoning(text))) => {
+                if guard.first_reasoning_ms.is_none() {
+                    guard.first_reasoning_ms = Some(started.elapsed().as_millis() as u64);
+                }
+                guard.trace.record(Body::LlmDelta {
+                    call: guard.call,
+                    channel: Channel::Reasoning,
+                    text,
+                });
+            }
+            Some(Ok(StreamPart::Finish { reason, usage })) => {
+                guard.finish_reason = reason.clone();
+                guard.usage = usage.clone().map(trace_usage);
+            }
+            Some(Err(error)) => {
+                error_detail = Some(error.detail());
+                break map_llm_error(&error);
+            }
             None => break stream_closed_end(&cancel),
         }
     };
-    guard.finish(end, shown);
+    guard.finish(end, shown, error_detail);
 }
 
 /// Reports the end of a run exactly once. If the task unwinds (a panic) before
 /// `finish`, dropping the guard reports an interrupted answer, so the engine
-/// never keeps a request open that no task is serving.
+/// never keeps a request open that no task is serving. The guard also carries
+/// what the stream produced (raw text, finish reason, usage, first-piece
+/// times) so either path can write the call's `llm_end` record.
 struct EndGuard {
     id: u64,
     ui: StatusSink,
     finished: tokio::sync::mpsc::UnboundedSender<Finished>,
     done: bool,
+    trace: Arc<dyn TraceSink>,
+    call: u64,
+    hold_pass: bool,
+    raw: String,
+    finish_reason: Option<String>,
+    usage: Option<TraceUsage>,
+    first_content_ms: Option<u64>,
+    first_reasoning_ms: Option<u64>,
 }
 
 impl EndGuard {
-    fn finish(mut self, end: SuggestionEnd, shown: String) {
+    fn finish(mut self, end: SuggestionEnd, shown: String, error: Option<String>) {
         self.done = true;
+        self.record_end(&end, &shown, error.as_deref());
         tracing::info!(
             suggestion = self.id,
             end = ?end,
@@ -187,6 +244,29 @@ impl EndGuard {
             shown,
         });
     }
+
+    /// Write this call's `llm_end`. `passed` marks the automatic answer
+    /// that held back as `PASS` to the very end (D-suggestion-detail).
+    fn record_end(&self, end: &SuggestionEnd, shown: &str, error: Option<&str>) {
+        let outcome = match end {
+            SuggestionEnd::Done => LlmOutcome::Done,
+            SuggestionEnd::Cancelled => LlmOutcome::Cancelled,
+            SuggestionEnd::Failed(_) | SuggestionEnd::Interrupted => LlmOutcome::Error,
+        };
+        let passed = self.hold_pass && *end == SuggestionEnd::Done && shown.is_empty();
+        self.trace.record(Body::LlmEnd {
+            call: self.call,
+            outcome,
+            error: error.map(str::to_owned),
+            finish_reason: self.finish_reason.clone(),
+            usage: self.usage.clone(),
+            raw_text: self.raw.clone(),
+            shown_text: shown.to_owned(),
+            passed,
+            first_content_ms: self.first_content_ms,
+            first_reasoning_ms: self.first_reasoning_ms,
+        });
+    }
 }
 
 impl Drop for EndGuard {
@@ -194,6 +274,11 @@ impl Drop for EndGuard {
         if self.done {
             return;
         }
+        self.record_end(
+            &SuggestionEnd::Interrupted,
+            "",
+            Some("task ended without a report"),
+        );
         tracing::error!(
             suggestion = self.id,
             "suggestion task ended without a report"
@@ -318,6 +403,14 @@ mod tests {
             ui: Arc::new(move |event| sink.lock().unwrap().push(event)),
             finished: tx,
             done: false,
+            trace: Arc::new(trace::sink::NoTrace),
+            call: 1,
+            hold_pass: false,
+            raw: String::new(),
+            finish_reason: None,
+            usage: None,
+            first_content_ms: None,
+            first_reasoning_ms: None,
         };
         (guard, events, rx)
     }
@@ -340,7 +433,7 @@ mod tests {
     #[test]
     fn a_finished_guard_reports_once_with_the_real_end() {
         let (guard, events, mut rx) = guard();
-        guard.finish(SuggestionEnd::Done, "text".to_owned());
+        guard.finish(SuggestionEnd::Done, "text".to_owned(), None);
         assert_eq!(events.lock().unwrap().len(), 1);
         let finished = rx.try_recv().expect("one report");
         assert_eq!(finished.shown, "text");
@@ -423,6 +516,8 @@ mod tests {
             ui,
             false,
             tx,
+            Arc::new(trace::sink::NoTrace),
+            1,
         )
         .await;
 

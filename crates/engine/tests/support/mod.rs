@@ -864,6 +864,9 @@ impl SourceFactory for ScriptedFactory {
 pub enum Step {
     Chunk(String),
     Sleep(Duration),
+    /// One raw SSE event body, sent as `data: <value>` (reasoning, finish
+    /// reason or usage chunks the scripted steps cannot express).
+    Event(serde_json::Value),
 }
 
 impl Step {
@@ -873,6 +876,32 @@ impl Step {
 
     pub fn sleep_ms(ms: u64) -> Self {
         Step::Sleep(Duration::from_millis(ms))
+    }
+
+    /// A delta carrying only `reasoning_content` (a thinking piece).
+    pub fn reasoning(text: &str) -> Self {
+        Step::Event(serde_json::json!(
+            { "choices": [{ "index": 0, "delta": { "reasoning_content": text } }] }
+        ))
+    }
+
+    /// A final delta naming the finish reason (no content).
+    pub fn finish(reason: &str) -> Self {
+        Step::Event(serde_json::json!(
+            { "choices": [{ "index": 0, "delta": {}, "finish_reason": reason }] }
+        ))
+    }
+
+    /// The usage-only chunk an `include_usage` stream ends with.
+    pub fn usage(prompt: u64, completion: u64, total: u64) -> Self {
+        Step::Event(serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+            },
+        }))
     }
 }
 
@@ -1086,6 +1115,15 @@ fn sse_response(steps: Vec<Step>, close_early: bool, guard: InflightGuard) -> Re
                     state.index += 1;
                     Some((Ok::<_, std::io::Error>(sse_chunk(&text)), state))
                 }
+                Some(Step::Event(event)) => {
+                    state.index += 1;
+                    Some((
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from(format!(
+                            "data: {event}\n\n"
+                        ))),
+                        state,
+                    ))
+                }
                 _ => {
                     state.finished = true;
                     if state.close_early {
@@ -1125,6 +1163,10 @@ pub struct MeetingOpts {
     /// Record meetings through this opener instead of nothing (a
     /// `MemoryOpener` in tests that assert on records).
     pub trace: Option<Arc<dyn TraceOpener>>,
+    /// Set the LLM API key in the config (recording must never leak it).
+    pub llm_api_key: Option<String>,
+    /// Set the ASR API key in the config (recording must never leak it).
+    pub asr_api_key: Option<String>,
 }
 
 impl Default for MeetingOpts {
@@ -1138,6 +1180,8 @@ impl Default for MeetingOpts {
             asr_model: None,
             llm_port: None,
             trace: None,
+            llm_api_key: None,
+            asr_api_key: None,
         }
     }
 }
@@ -1183,6 +1227,7 @@ impl MeetingHarness {
                 enable_thinking: Some(false),
                 // the production default (D-llm-usage)
                 include_usage: true,
+                api_key: opts.llm_api_key.clone(),
                 ..Default::default()
             },
             assist: AssistConfig {
@@ -1194,6 +1239,7 @@ impl MeetingHarness {
                     .asr_model
                     .clone()
                     .unwrap_or_else(|| "mock-model".into()),
+                api_key: opts.asr_api_key.clone(),
                 ..Default::default()
             },
             ..Default::default()
