@@ -3,7 +3,7 @@
 
 use futures_util::StreamExt;
 use llm::client::LlmClient;
-use llm::types::{ChatRequest, Message};
+use llm::types::{ChatRequest, Message, StreamPart};
 
 fn client(timeout_secs: u64) -> LlmClient {
     let base_url = dotenvy::var("LLM_BASE_URL").expect("LLM_BASE_URL required for live tests");
@@ -38,7 +38,10 @@ fn strip_tilde(path: &str) -> String {
 fn request(prompt: &str) -> ChatRequest {
     let mut messages = notes().map(Message::system).into_iter().collect::<Vec<_>>();
     messages.push(Message::user(prompt));
-    ChatRequest::new("ignored", messages, 220, 0.4, None)
+    let include_usage = dotenvy::var("LLM_INCLUDE_USAGE")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    ChatRequest::new("ignored", messages, 220, 0.4, None, include_usage)
 }
 
 #[tokio::test]
@@ -54,7 +57,10 @@ async fn real_prompt_fills_the_template_and_uses_the_profile() {
     );
     let mut content = String::new();
     while let Some(item) = stream.next().await {
-        content.push_str(&item.expect("live stream failed"));
+        match item.expect("live stream failed") {
+            StreamPart::Content(text) => content.push_str(&text),
+            StreamPart::Reasoning(_) | StreamPart::Finish { .. } => {}
+        }
     }
 
     println!("---- raw content ----\n{content}");
@@ -64,6 +70,82 @@ async fn real_prompt_fills_the_template_and_uses_the_profile() {
         content.to_lowercase().contains("lüdenscheid")
             || content.to_lowercase().contains("ludenscheid"),
         "answer does not mention the entry: {content}"
+    );
+}
+
+/// The recorded live stream, shared with the engine's replay tests.
+const ANSWER_STREAM_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/llm/answer-stream.jsonl"
+);
+
+/// One question answered by the real server, with every raw SSE payload line
+/// written to `fixtures/llm/answer-stream.jsonl` for the replay tests to use.
+/// The fixture is committed, so replay never needs the live server.
+#[tokio::test]
+#[ignore = "requires a live server: run with LIVE_SERVER=1"]
+async fn record_answer_stream_to_the_fixture() {
+    if dotenvy::var("LIVE_SERVER").is_err() {
+        eprintln!("skipping: set LIVE_SERVER=1 to run live tests");
+        return;
+    }
+    use futures_util::StreamExt;
+
+    let base_url = dotenvy::var("LLM_BASE_URL").expect("LLM_BASE_URL required for live tests");
+    let model = dotenvy::var("LLM_MODEL").expect("LLM_MODEL required for live tests");
+    let api_key = dotenvy::var("LLM_API_KEY").ok().filter(|k| !k.is_empty());
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "user", "content": "Name one town in North Rhine-Westphalia." },
+        ],
+        "max_tokens": 64,
+        "temperature": 0.4,
+        "chat_template_kwargs": { "enable_thinking": false },
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+    let mut request = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&body);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await.expect("live request failed");
+    assert!(
+        response.status().is_success(),
+        "live HTTP {}",
+        response.status()
+    );
+
+    let mut raw = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut lines: Vec<String> = Vec::new();
+    while let Some(chunk) = raw.next().await {
+        buffer.push_str(&String::from_utf8_lossy(
+            &chunk.expect("stream chunk failed"),
+        ));
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim_end().to_string();
+            buffer.drain(..=pos);
+            if let Some(payload) = line.strip_prefix("data:").map(str::trim) {
+                lines.push(payload.to_string());
+            }
+        }
+    }
+    assert!(
+        lines.iter().any(|l| l.contains("\"usage\"")),
+        "the live stream carried no usage chunk"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("[DONE]")),
+        "the live stream did not end with [DONE]"
+    );
+    std::fs::write(ANSWER_STREAM_FIXTURE, lines.join("\n") + "\n")
+        .expect("write the answer-stream fixture");
+    eprintln!(
+        "recorded {} SSE payloads to {ANSWER_STREAM_FIXTURE}",
+        lines.len()
     );
 }
 
