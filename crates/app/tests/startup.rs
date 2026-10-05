@@ -14,7 +14,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_clueless");
 const MARKER: &str = "startup failed: ";
 
 /// Runs the binary with an empty environment, `dir` as home and working
-/// directory, and the log in `dir/log.txt`.
+/// directory, and the log in `dir/log.txt`. The data directory is moved
+/// inside `dir` as well, so even a mode that reaches recording writes
+/// nothing outside the temp tree (D-test-isolation).
 fn run(dir: &TempDir, args: &[&Path]) -> Output {
     let home: &Path = dir;
     Command::new(BIN)
@@ -23,6 +25,8 @@ fn run(dir: &TempDir, args: &[&Path]) -> Output {
         .current_dir(home)
         .arg("--log-file")
         .arg(dir.join("log.txt"))
+        .arg("--data-dir")
+        .arg(dir.join("clueless-data"))
         .args(args)
         .output()
         .expect("binary runs")
