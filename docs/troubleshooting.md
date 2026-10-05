@@ -39,7 +39,7 @@ The suggest, clear and move keys are registered only while a meeting is running,
 
 ## No automatic answers
 
-The log has an info line with the profile and the outcome when the app decides to ask (`fired`) or to hold a request back (`waiting`), and a warning when a failed request starts the pause; none of them carry transcript text. A turn that is too short leaves no line at all. Check in this order.
+The log has an info line with the profile and the outcome when the app decides to ask (`fired`) or to hold a request back (`waiting`), and a warning when a failed request starts the pause; none of them carry transcript text (that text is on disk only in the meeting's trace files, see [trace-format.md](trace-format.md)). A turn that is too short leaves no line at all. Check in this order.
 
 - The profile is Manual: the status line starts with the profile name; press `ctrl+alt+KeyP` or pick one from the status icon menu, or set `assist.start_profile`.
 - The turn was too short: turns under 12 characters without a question mark start no request.
@@ -60,8 +60,21 @@ If a model ignores PASS and always answers, try a more instruction-following mod
 
 ## Where to look when something else misbehaves
 
-The log file is `~/Library/Logs/clueless/clueless.log` (transcript text only appears at debug level).
+The log file is `~/Library/Logs/clueless/clueless.log` (transcript text only appears at debug level; every meeting's full transcript and model traffic is in its trace files under `~/.clueless`, see [trace-format.md](trace-format.md)).
 Each transcribed utterance logs its latency fields, which usually tells you whether capture, the segmenter or the ASR server is the slow part.
+
+## The status line shows a `trace:` message
+
+A recorded meeting starts with one info line `recording to <path>` saying where the session is stored and whether it includes audio; that is normal, not an error.
+
+- `trace: cannot record this meeting: <error>` at meeting start means the trace could not be opened (usually an uncreatable or full data directory); the meeting runs unrecorded. Check the data directory (default `~/.clueless`, `--data-dir PATH` to move it) and free space on that disk.
+- `trace: recording stopped: <error>` mid-meeting means a write failed; the writer stops and the meeting goes on unrecorded from that point.
+- A session listed as `cut off` by `clueless --sessions` lost its `end` record to a kill or a crash; everything up to the last complete line is still readable.
+
+## The LLM server rejects streaming requests
+
+If chat requests start failing with an error naming `stream_options` (health checks stay fine), the server does not accept the usage option the app sends by default; set `LLM_INCLUDE_USAGE=false` in `.env`.
+Trace records then simply carry no token usage.
 
 ## The overlay is visible in a screen share
 

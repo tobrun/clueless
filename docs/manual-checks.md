@@ -77,6 +77,15 @@ Needs a real two-sided conversation (a second person or a video call with system
 - [ ] Save a frame on an external display, unplug it, launch and switch to hidden: the overlay is fully on the remaining screen.
 - [ ] Screenshot with `screencapture` in each mode: the standard window is in the image; the overlay is not (macOS below 15.4) or is noted as visible (15.4 and later).
 
+## Session traces
+
+- [ ] With `[trace] audio = true` in `config.toml`, start a live meeting: the status line shows one `recording to` line naming the session path and that audio is on, and `~/.clueless/sessions/<name>/` appears with `manifest.json`, `events.jsonl` and `audio/me.wav` plus `audio/them.wav` (mode 0600).
+- [ ] Speak a few sentences and press `Cmd+Enter` for one suggestion, then quit the app from the icon menu.
+- [ ] `clueless --sessions` lists the session with audio yes, the finals and suggestion counted, and no `cut off` (quitting wrote the `end` record); `tail -1 events.jsonl` shows `"kind":"end"`.
+- [ ] `clueless --show <name>` prints the finals as `[mm:ss] Me: text` with the suggestion under its `--- suggestion 1 (manual, manual) ---` line.
+- [ ] Both WAV files play and their content lines up with the `--show` times: your speech is heard in `me.wav` at its printed time.
+- [ ] With `[trace] enabled = false`, a meeting shows no `recording to` line and adds no session directory.
+
 ## Failure modes
 
 - [ ] Turn a server off before launch: the health status goes offline, no transcripts, and the app stays responsive; turning it back recovers transcripts without a restart.

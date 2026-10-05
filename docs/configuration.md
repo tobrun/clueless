@@ -34,11 +34,14 @@ The old TOML `[server]` and `[llm]` tables are rejected with an error naming the
 | `LLM_TEMPERATURE` | no | 0.4 | Sampling temperature |
 | `LLM_NOTES_PATH` | no | unset | Notes file placed in the system message, `~` is expanded |
 | `LLM_ENABLE_THINKING` | no | unset | `true`/`false`; unset omits the field from the request entirely |
+| `LLM_INCLUDE_USAGE` | no | `true` | `true`/`false`; ask streaming responses for token usage (`stream_options.include_usage`) so session traces carry the server's counts |
 
 `LLM_NOTES_PATH` replaces the older `LLM_PROFILE_PATH`; the word "profile" now means only the switchable assist profile.
 A set `LLM_PROFILE_PATH` is a startup error that names `LLM_NOTES_PATH`.
 
 `LLM_ENABLE_THINKING=false` sends `chat_template_kwargs: {"enable_thinking": false}`, which removes the reasoning delay on vLLM-hosted Qwen-family models; hosted APIs generally want it unset.
+
+`LLM_INCLUDE_USAGE=false` leaves the `stream_options` field out of every streaming request, for servers that reject it; usage counts then simply stay absent from `llm_end` trace records and answers are unaffected.
 
 ### ASR variables
 
@@ -113,6 +116,31 @@ Lookup order: the path given by `--config`, else `~/.config/clueless/config.toml
 
 See Profiles below.
 
+### `[trace]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | true | Write a trace directory per meeting under the data directory: transcript, commands, statuses and every model call as JSON lines |
+| `audio` | false | Also record both speaker WAVs into the session directory (~115 MB per recorded hour per speaker) |
+
+The data directory defaults to `~/.clueless`; `--data-dir PATH` moves it and is valid in every mode, including `--sessions`, `--show`, `--replay-session`, `--compare` and `--delete`.
+One session directory per meeting holds `manifest.json`, `events.jsonl`, the optional `audio/` WAVs and `runs/` for re-runs; the format is [trace-format.md](trace-format.md).
+A meeting whose trace cannot be opened or written still runs, with one `trace:` warning in the status line (see [troubleshooting.md](troubleshooting.md)).
+
+The new command line modes read and write this directory:
+
+| Mode | Effect |
+| --- | --- |
+| `--sessions` | list sessions newest first: length, origin, audio, finals, suggestions, runs |
+| `--show SESSION` | print a session's finals and suggestions in meeting time order |
+| `--replay-session SESSION [--speed N]` | re-run the session's audio and recorded presses through this build into `<session>/runs/<run id>/` |
+| `--compare A [B] [--no-judge]` | diff a session against one of its runs (default: the newest) and judge each suggestion pair on the LLM server |
+| `--delete SESSION [--yes]` | delete a session or run; without `--yes` it only prints the path and size |
+
+A `SESSION` value is a session directory name (`2026-10-05T14-03-22Z`) or a path to it.
+Only one mode flag per launch; two of them are a parse error.
+`--sessions`, `--show`, `--delete` and `--compare --no-judge` never contact a server and work with no `.env` file present.
+
 ### `[hotkeys]`
 
 All keys are global while their registration window is active; the syntax is `cmd|ctrl|alt|shift` plus a key name like `cmd+shift+KeyR`.
@@ -174,5 +202,6 @@ The bundled app and a bare `cargo run` binary have different bundle ids, so they
 ## Other inputs
 
 - `LLM_NOTES_PATH` points at a plain text file (the notes file) with your name, role and anything the answers should know; it is read at meeting start and placed in the system message.
-- Transcripts and suggestions are never written to disk; the only files the app writes are its log (`~/Library/Logs/clueless/clueless.log`) and a single-instance lock (`~/Library/Application Support/clueless/lock`).
+- The app writes its log (`~/Library/Logs/clueless/clueless.log`), a single-instance lock (`~/Library/Application Support/clueless/lock`) and, while `[trace] enabled` holds, a trace directory per meeting under the data directory (`~/.clueless` by default) with the transcript text, the model calls and, with `[trace] audio = true`, the audio; see [trace-format.md](trace-format.md).
+- No file under the data directory contains an API key: server URLs are stored redacted and keys are never written.
 - The one piece of state that survives a launch is the standard window's frame, kept by AppKit in the user defaults; the app owns no file for it.

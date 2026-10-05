@@ -37,7 +37,8 @@ Checks that need a real desktop session (permissions, overlay behavior, live aud
 - Unit tests live next to the code in `src` modules.
 - Integration tests per crate in `crates/*/tests/`, run against a local axum mock server that speaks the OpenAI-compatible routes.
 - `crates/app/tests/replay.rs` drives the full pipeline from WAV fixtures through mock servers (unit level, no network) and holds the live e2e replay suite.
-- `crates/types/tests/purity.rs` fails the build when a pure crate (types, segmenter, asr, llm, context, engine) pulls in a macOS-only dependency; the rules are in [dependencies.md](dependencies.md).
+- `crates/types/tests/purity.rs` fails the build when a pure crate (types, segmenter, asr, llm, context, engine, trace) pulls in a macOS-only dependency; the rules are in [dependencies.md](dependencies.md).
+- Binary tests never record into the real `~/.clueless`: without `--data-dir` the trace sink is a no-op in tests, and tests that exercise recording pass `--data-dir` a temp directory.
 
 ### Live tests
 
@@ -64,9 +65,28 @@ Regenerate with `scripts/make-fixtures.sh` (uses macOS voices, no network).
 | `scripts/smoke-llm.sh` | hit the configured `LLM_*` server once and show the streamed reply |
 | `scripts/smoke-asr.sh` | transcribe a WAV through the configured `ASR_*` server |
 
+## Session traces from fixtures
+
+Every mode run writes (and reads) its traces in one data directory, so you can build a corpus of fixture sessions and measure a change against it without touching `~/.clueless`:
+
+```sh
+TMP=/tmp/clueless-traces
+# record a session by replaying the fixtures through the current build
+cargo run -p clueless -- --replay fixtures/conv_me.wav fixtures/conv_them.wav --speed 4 --ask --data-dir $TMP
+# after changing the segmenter, prompt or model: re-run the session's audio and recorded presses
+SESSION=$(basename "$(ls -d $TMP/sessions/* | tail -1)")
+cargo run -p clueless -- --replay-session "$SESSION" --speed 4 --data-dir $TMP
+# diff the two traces and let the server judge each suggestion pair
+cargo run -p clueless -- --compare "$SESSION" --data-dir $TMP
+```
+
+The re-run lands in `$TMP/sessions/$SESSION/runs/`; `--sessions`, `--show` and `--delete` list, print and clean up there too.
+The format is [trace-format.md](trace-format.md).
+
 ## Repo layout
 
-Ten crates in one cargo workspace; the dependency edges and the pure-crate rule are in [dependencies.md](dependencies.md), the reasoning for the layout in [decisions.md](decisions.md).
+Eleven crates in one cargo workspace; the dependency edges and the pure-crate rule are in [dependencies.md](dependencies.md), the reasoning for the layout in [decisions.md](decisions.md).
+The newest member is `crates/trace/`, which owns the session trace format: record types, sink traits, disk writer, reader, compare, list and show; it depends only on types.
 
 ## CI
 

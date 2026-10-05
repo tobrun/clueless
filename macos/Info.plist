@@ -19,11 +19,11 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>clueless records your microphone so it can show what you said in the meeting transcript.</string>
+	<string>clueless records your microphone so it can show what you said in the meeting transcript and, when you switch audio recording on, to store it on this Mac.</string>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>clueless captures the audio this Mac plays so it can show what the others in the meeting said.</string>
+	<string>clueless captures the audio this Mac plays so it can show what the others in the meeting said and, when you switch audio recording on, to store it on this Mac.</string>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>clueless uses the screen capture API so it can pick up the meeting audio played by this Mac.</string>
+	<string>clueless uses the screen capture API so it can pick up the meeting audio played by this Mac and, when you switch audio recording on, to store it on this Mac.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>clueless talks to the speech-to-text and language models running on your local network.</string>
 	<key>NSHumanReadableCopyright</key>
