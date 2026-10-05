@@ -338,6 +338,29 @@ fn silence_pads_to_the_frame_time_and_anchors_there() {
 }
 
 #[test]
+fn a_forward_jump_anchors_only_where_the_audio_lands() {
+    let scratch = Scratch::new("anchor-jump-once");
+    let path = scratch.path().join("me.wav");
+    let mut file = AudioFile::create(&path).unwrap();
+    file.push(0, &frame()).unwrap();
+    let jump = file.push(1000, &frame()).unwrap();
+    let next = file.push(1032, &frame()).unwrap();
+    assert_eq!(
+        jump,
+        Some(trace::audio::Anchor {
+            t_ms: 1000,
+            sample_index: 16_000
+        }),
+        "the landing frame after the silence gets the anchor"
+    );
+    assert_eq!(
+        next, None,
+        "the frame continuing from the landing keeps the same mapping, no second anchor"
+    );
+    file.finalize().unwrap();
+}
+
+#[test]
 fn backwards_time_appends_and_anchors_once() {
     let scratch = Scratch::new("anchor-backwards");
     let path = scratch.path().join("me.wav");

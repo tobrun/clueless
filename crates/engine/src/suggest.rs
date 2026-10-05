@@ -81,6 +81,19 @@ impl PassFilter {
     }
 }
 
+/// True when `raw` is exactly the single word `PASS` (case-insensitive,
+/// optionally followed by `.`, `!` or whitespace): what an automatic answer
+/// that passed leaves behind. Empty or blank text is not a pass, so a stream
+/// that produced nothing is never mistaken for one.
+fn is_pass_text(raw: &str) -> bool {
+    let upper = raw.trim_start().to_uppercase();
+    upper.len() >= PASS_TOKEN.len()
+        && upper.strip_prefix(PASS_TOKEN).is_some_and(|rest| {
+            rest.chars()
+                .all(|c| c == '.' || c == '!' || c.is_whitespace())
+        })
+}
+
 /// How a suggestion run ended, reported to the engine loop after the UI got
 /// its `SuggestionEnd`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,7 +266,10 @@ impl EndGuard {
             SuggestionEnd::Cancelled => LlmOutcome::Cancelled,
             SuggestionEnd::Failed(_) | SuggestionEnd::Interrupted => LlmOutcome::Error,
         };
-        let passed = self.hold_pass && *end == SuggestionEnd::Done && shown.is_empty();
+        let passed = self.hold_pass
+            && *end == SuggestionEnd::Done
+            && shown.is_empty()
+            && is_pass_text(&self.raw);
         self.trace.record(Body::LlmEnd {
             call: self.call,
             outcome,
@@ -316,7 +332,9 @@ mod tests {
     use clueless_types::events::UiEvent;
     use serde_json::json;
 
-    use super::{EndGuard, Finished, PassFilter, release_chunk, run, stream_closed_end};
+    use super::{
+        EndGuard, Finished, PassFilter, is_pass_text, release_chunk, run, stream_closed_end,
+    };
 
     fn feed(chunks: &[&str]) -> Vec<Option<String>> {
         let mut filter = PassFilter::new();
@@ -413,6 +431,17 @@ mod tests {
             first_reasoning_ms: None,
         };
         (guard, events, rx)
+    }
+
+    #[test]
+    fn only_the_whole_word_pass_is_a_pass_text_and_empty_is_not() {
+        assert!(is_pass_text("PASS"));
+        assert!(is_pass_text("pass."));
+        assert!(is_pass_text("  Pass!\n"));
+        assert!(!is_pass_text(""), "an empty answer is not a pass");
+        assert!(!is_pass_text("   "), "blank text is not a pass");
+        assert!(!is_pass_text("PASSPORT"));
+        assert!(!is_pass_text("PAS"));
     }
 
     #[test]

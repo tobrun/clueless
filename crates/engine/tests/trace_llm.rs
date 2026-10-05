@@ -682,6 +682,32 @@ async fn an_automatic_answer_that_only_starts_like_pass_is_not_passed() {
     finish(&mut h).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_automatic_answer_that_said_nothing_is_not_passed() {
+    let asr = MockAsr::start().await;
+    let llm = MockLlm::start().await;
+    asr.enqueue_final(Respond::text("what is the release date?"));
+    llm.enqueue(LlmReply::stream(&[]));
+    let opener = opener();
+    let mut h = traced_them_turn_meeting(&asr, &llm, &opener).await;
+
+    assert!(
+        llm.wait_bodies(1, WAIT).await,
+        "the automatic request fires"
+    );
+    let (outcome, raw, shown, passed, _, _) = wait_end(&opener, 1).await;
+
+    assert_eq!(outcome, LlmOutcome::Done);
+    assert_eq!(raw, "");
+    assert_eq!(shown, "");
+    assert!(
+        !passed,
+        "an empty answer shows nothing but did not pass: it just said nothing"
+    );
+
+    finish(&mut h).await;
+}
+
 // ----------------------------------------------------------------- compression
 
 /// Eight long utterances; around 160 estimated tokens each, so the default
