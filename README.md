@@ -2,7 +2,8 @@
 
 A meeting copilot for macOS that runs entirely on your own infrastructure.
 It transcribes your meetings live - your microphone as `Me`, the computer's audio as `Them` - and on a hotkey asks a language model what you could say next, streaming the answer into the window.
-No account, no telemetry: the transcript lives in memory and dies with the app, and the only thing kept between launches is the window's position on screen.
+No account, no telemetry: the app talks only to the two servers you configure.
+Every meeting is kept on disk as a trace under `~/.clueless` - the transcript and every model call, plus both audio tracks when you switch `[trace] audio` on - so you can inspect it, re-run it through a newer build and compare the two; turn this off with `[trace] enabled = false` or delete a session with `clueless --delete NAME --yes`.
 The window shows both transcript streams as they finalize, with suggestions streaming in beneath them.
 
 You bring two OpenAI-compatible servers (a chat model and a speech-to-text model, local or hosted) and clueless pipes everything through them.
@@ -64,7 +65,7 @@ Then pick "Start Meeting" in the menu bar icon, talk, and press `Cmd+Enter` for 
 Everything lives in two small files, both documented in [docs/configuration.md](docs/configuration.md):
 
 - `.env` - servers, models, API keys: `LLM_BASE_URL`, `LLM_MODEL`, `ASR_BASE_URL`, `ASR_MODEL` plus optional keys and tuning knobs.
-- `~/.config/clueless/config.toml` - optional app behavior: audio backends, voice-detection thresholds, overlay and hotkey settings. A missing file means all defaults; [config.example.toml](config.example.toml) lists every key.
+- `~/.config/clueless/config.toml` - optional app behavior: audio backends, session recording, voice-detection thresholds, overlay and hotkey settings. A missing file means all defaults; [config.example.toml](config.example.toml) lists every key.
 
 ## Hotkeys
 
@@ -96,15 +97,32 @@ Replay stays hotkey-only unless you pass `--profile`:
 cargo run -p clueless -- --replay fixtures/conv_me.wav fixtures/conv_them.wav --speed 4 --profile interview
 ```
 
+## Recorded sessions
+
+Every meeting writes a trace to the data directory (default `~/.clueless`, override with `--data-dir PATH`): the transcript, the commands and hotkey presses, and every model call as JSON lines, plus the two speaker WAVs when `[trace] audio = true`.
+The format is [docs/trace-format.md](docs/trace-format.md).
+
+```sh
+cargo run -p clueless -- --sessions                              # list recorded sessions, newest first
+cargo run -p clueless -- --show 2026-10-05T14-03-22Z             # print one session's transcript and suggestions
+cargo run -p clueless -- --replay-session 2026-10-05T14-03-22Z --speed 4
+cargo run -p clueless -- --compare 2026-10-05T14-03-22Z          # the session against its newest re-run
+cargo run -p clueless -- --delete 2026-10-05T14-03-22Z --yes
+```
+
+`--replay-session` feeds a recorded session's audio and recorded hotkey presses through the current build and writes the result as a run under the session's `runs/` directory (it needs a session recorded with `[trace] audio = true`).
+`--compare` then diffs the two traces and asks the LLM server to judge each pair of suggestions, so a change to the segmenter, the prompt or the model can be measured against real meetings; `--no-judge` prints only the differences.
+
 ## Permissions
 
 clueless asks for Microphone (input) and Screen Recording (for the system-audio stream).
 Grants follow the app's code signature, which is why `scripts/make-dev-cert.sh` exists.
 The app needs no network access beyond the servers you point it at.
+With `[trace] audio = true` the microphone and system audio are additionally stored on this Mac under the data directory.
 
 ## Limitations
 
-- The transcript is not persisted: closing the app loses it; there is no history or export yet. Only the window's position survives a restart (see the Window modes section above).
+- Recorded sessions are kept until you delete them: there is no size limit, rotation or cleanup, and audio adds about 115 MB per recorded hour per speaker. List what you have with `clueless --sessions` and remove one with `clueless --delete NAME --yes`. Besides traces, the window's position also survives a restart (see the Window modes section above).
 - `hide_from_capture` (keeping the panel out of screen shares) is best effort; macOS 15.4+ ignores it for full-screen shares.
 - The shipped bundle is a debug build signed with a self-signed dev certificate; there is no notarized release.
 - Speaker diarization inside the Them stream is not attempted - it is one rolling `Them` voice.
@@ -112,11 +130,11 @@ The app needs no network access beyond the servers you point it at.
 ## Use it responsibly
 
 You are responsible for following the recording-consent laws that apply where you are, which in several places require informing or getting consent from everyone in the call.
-The app shows no indication to other participants.
+The app shows no indication to other participants, and with `[trace] audio = true` it keeps the audio of the conversation on this Mac.
 
 ## Docs
 
-The full index is [docs/README.md](docs/README.md): [configuration](docs/configuration.md), [servers](docs/servers.md), [architecture](docs/architecture.md), [development](docs/development.md), [troubleshooting](docs/troubleshooting.md), [design decisions](docs/decisions.md).
+The full index is [docs/README.md](docs/README.md): [configuration](docs/configuration.md), [servers](docs/servers.md), [architecture](docs/architecture.md), [trace format](docs/trace-format.md), [development](docs/development.md), [troubleshooting](docs/troubleshooting.md), [design decisions](docs/decisions.md).
 
 ## License
 

@@ -11,6 +11,7 @@ Start at the [repository README](../README.md) to run the app; this directory ex
 | [dependencies.md](dependencies.md) | allowed crate dependency edges and the pure-crate rule |
 | [contracts.md](contracts.md) | invariants between modules and the tests that verify them |
 | [system-audio.md](system-audio.md) | how the Them stream captures system audio, backends and caveats |
+| [trace-format.md](trace-format.md) | the session traces on disk: layout, manifest, record kinds, audio timeline, re-run and compare |
 | [decisions.md](decisions.md) | design records: question, chosen option with rationale, rejected options |
 | [development.md](development.md) | build, run, validation commands, tests, fixtures, scripts |
 | [manual-checks.md](manual-checks.md) | the pre-release checklist that needs a real desktop session |
