@@ -378,7 +378,7 @@ pub fn write_records(
         let written = match result {
             Ok(()) => true,
             Err(error) => {
-                on_error.fire(format!("trace: recording stopped: {error}"));
+                on_error.fire(error.to_string());
                 false
             }
         };
@@ -436,18 +436,14 @@ fn run_audio_worker(worker: AudioWorker) {
             }
             Ok(None) => {}
             Err(error) => {
-                worker
-                    .on_error
-                    .fire(format!("trace: recording stopped: {error}"));
+                worker.on_error.fire(error.to_string());
                 break;
             }
         }
     }
     for (_, file) in files {
         if let Err(error) = file.finalize() {
-            worker
-                .on_error
-                .fire(format!("trace: recording stopped: {error}"));
+            worker.on_error.fire(error.to_string());
         }
     }
     worker.done.store(true, Ordering::Release);

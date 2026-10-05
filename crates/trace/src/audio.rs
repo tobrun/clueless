@@ -39,7 +39,7 @@ pub struct AudioFile {
     written: u64,
     /// `written - target` of the previous frame; a change means the frame
     /// no longer sits where its time says it should.
-    last_gap: Option<i64>,
+    last_offset: Option<i64>,
     next_flush: u64,
 }
 
@@ -58,7 +58,7 @@ impl AudioFile {
         Ok(Self {
             writer,
             written: 0,
-            last_gap: None,
+            last_offset: None,
             next_flush: FLUSH_EVERY_SAMPLES,
         })
     }
@@ -66,18 +66,26 @@ impl AudioFile {
     /// Place `frame`, starting at meeting time `t_start_ms`. A target beyond
     /// the end is reached through zeros; a target at or before it (time moved
     /// backwards) is ignored and the frame is appended at the end. Returns an
-    /// [`Anchor`] at the first frame and whenever the frame stops sitting
-    /// where its time says it should.
+    /// [`Anchor`] at the first frame, whenever the frame lands away from its
+    /// time (a forward jump's landing or a backwards append starting new
+    /// drift), but never for a frame that continues an established mapping.
     pub fn push(&mut self, t_start_ms: u64, frame: &[f32]) -> io::Result<Option<Anchor>> {
         let target = t_start_ms * SAMPLES_PER_MS;
-        let gap = self.written as i64 - target as i64;
-        let position = if target > self.written {
+        let jumped_forward = target > self.written;
+        let position = if jumped_forward {
             self.pad_zeros(target - self.written)?;
             target
         } else {
             self.written
         };
-        let anchor = if self.last_gap != Some(gap) {
+        // The offset between where the frame actually sits and where its
+        // time says it should: 0 while the linear mapping holds, positive
+        // once backwards appends have pushed the stream ahead of time.
+        let offset = position as i64 - target as i64;
+        let anchor = if self.last_offset.is_none()
+            || jumped_forward
+            || offset != self.last_offset.unwrap_or(0)
+        {
             Some(Anchor {
                 t_ms: t_start_ms,
                 sample_index: position,
@@ -92,7 +100,7 @@ impl AudioFile {
                 .map_err(hound_error_to_io)?;
         }
         self.written += frame.len() as u64;
-        self.last_gap = Some(gap);
+        self.last_offset = Some(offset);
         while self.written >= self.next_flush {
             self.flush()?;
             self.next_flush += FLUSH_EVERY_SAMPLES;
