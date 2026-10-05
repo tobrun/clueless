@@ -39,6 +39,13 @@ C-server-read-only: the app sends only GET /v1/models, POST /v1/audio/transcript
   relied on by: the shared inference server (other users of it)
   (2026-10-02)
 
+## Session traces
+
+C-trace-audio-timeline: in audio/<speaker>.wav the sample at index i holds the audio of meeting time i / 16 ms, and every place where that does not hold is listed in an audio_anchor record
+  guaranteed by: AudioFile::push
+  relied on by: session re-run (per-speaker timeline position through WavSources; anchors are diagnostic for tools that cut an utterance from the file, and the inter-speaker offset after a backwards jump is uncorrected per D-audio-backwards-time)
+  (2026-10-05, D-audio-content)
+
 ## App startup
 
 C-startup-failure-marker: a startup failure after the logger is open (env file, config or lock setup) appears in the log file as a line containing `startup failed: ` followed by the full message, before the process exits with code 2

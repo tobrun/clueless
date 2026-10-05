@@ -32,6 +32,7 @@ D-persistence: Is anything written to disk?
   ⊘ not doing - the transcript lives in memory and is lost on quit or crash; reopen when the post-meeting summary is specced
   The one thing the app does store is the window frame, in the user defaults; see D-frame-store.
   (2026-10-02)
+  superseded 2026-10-05 by D-recording-default and D-trace-format (recorded-session-traces/spec.md) - the user asked for persistence directly; the reopen condition above was not what triggered it
 
 D-screen-context: Are screenshots sent to the model?
   ✗ screenshot hotkey - Phase 5
@@ -431,6 +432,240 @@ D-profile: How do the user's own notes get into the prompt?
   ✗ document upload UI - no settings window in this slice
   ✗ no profile - the answers would not know who the user is
   (2026-10-02)
+
+## Session traces
+
+Promoted from recorded-session-traces/spec.md on 2026-10-05, before the change was built.
+
+D-measure-approach: How do we get a way to tell whether a change made the product better? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ record real sessions, re-run them on the current build, compare the two traces - the request, and the only option that uses real meetings (user 2026-10-05) ⚠ a re-run talks to live servers, so two re-runs of the same session differ a little; compare a run against a second run to see how much
+  ✗ grow the hand-made WAV fixtures - eight scripted files exist (`fixtures/README.md`) and the ledger already records that synthetic speech is cleaner than a real meeting (`docs/decisions.md`, D-fixtures)
+  ✗ send traces to an outside observability tool - the product promise is that data stays on the user's own machines (`README.md`, "runs entirely on your own infrastructure"), and such tools do not store audio for a re-run
+
+D-recording-default: What is recorded without the user doing anything? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ text always, audio opt-in: text trace always, audio only with `[trace] audio = true` - the user's answer in their own words (user 2026-10-05) ⚠ a session without audio cannot be re-run in this slice, so only meetings where audio was switched on feed the comparison
+  ✗ everything on by default - rejected by the user; stores other people's voices without a decision per meeting
+  ✗ everything off by default - rejected by the user; the corpus would only hold meetings chosen in advance
+
+D-trace-tap: Where does the engine hand data to the trace? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ opener in EngineDeps: a trace opener in `EngineDeps`; the engine opens one sink per meeting, wraps the UI sink once so every `UiEvent` is also recorded, and calls the sink at the seams the UI never sees - `EngineDeps` is the existing injection point (`EngineDeps::production`), and every UI emitter reads `deps.ui` (`Engine::emit`, `StreamPipes`, `WorkerCtx`, `suggest::run`, `compress::run`) ⚠ an answer piece appears twice, once as it arrived and once as it was shown
+  ✗ wrap the UI sink only - the prompt, the unfiltered answer, drop reasons, policy outcomes, speech call timings and audio never pass through it (`UiEvent` has no such variants)
+  ✗ a tracing-subscriber layer - ties the file format to the wording of log lines, and log fields cannot carry audio
+
+D-trace-module: Which crate owns the record types, the writer, the reader and the compare? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ new pure crate: new pure crate `trace`, with edges `trace -> types`, `engine -> trace`, `app -> trace` - one owner for the on-disk format, usable by engine tests and by the binary; auto-applied at Confidence: 80% ⚠ the crate must be added to `docs/dependencies.md`, the purity test and the dependency checker
+  ✗ inside `engine` - the binary's list, show, delete and compare modes would pull the whole engine to read a file, and the format would sit next to thread code
+  ✗ record types in `types`, writer in `app` - engine tests could not write or read a trace without the binary
+
+D-trace-format: What is the on-disk format of one session? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ directory with JSON lines and WAV: a directory with `manifest.json`, `events.jsonl` (one JSON record per line, append only) and `audio/me.wav`, `audio/them.wav` - readable with `jq` and a text editor, an interrupted write damages at most the last line, and `serde_json` and `hound` are already workspace dependencies (`Cargo.toml`)
+  ✗ one SQLite file - a new dependency and a binary file for data that is only appended and read front to back
+  ✗ one binary container - needs a tool to read every time someone wants to look
+
+D-audio-content: Which audio is stored, and how is it laid out in time? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ 16 kHz on the meeting timeline: the 512-sample 16 kHz frames that come out of the resampler, one WAV per speaker, each frame placed at sample index `t_start_ms * 16`, zeros where no audio arrived - the file replays through the existing `WavSource` unchanged, both speakers stay aligned, a 16 kHz file passes through the resampler bit for bit (`Resampler16k::new`, test `input_at_16k_returns_frames_identical_to_the_input`), and the time range of any utterance can be cut from the file; auto-applied at Confidence: 78% ⚠ a change to the resampler cannot be evaluated; ⚠ a stretch with no samples becomes zeros, so on a re-run it takes the normal silence path instead of the `Empty` path that re-anchors the clock
+  ✗ raw device-rate samples plus anchor records - a device change gives a new sample rate mid-file (`SourceRead::Reset`), and a new replay source that re-creates gaps and resets would be needed
+  ✗ one WAV per segment sent to the speech server - the segmenter and voice detector could not be re-run, and audio between utterances is lost
+
+D-audio-backwards-time: What does the audio writer do when a frame's time is earlier than what is already written? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ append and anchor: append the frame anyway, never overwrite, and write an `audio_anchor` record when the distance between the frame's time and its place in the file changes - `StreamClock::anchor_now` can move time back after a backlog (`close_and_reanchor`), and the anchor records keep the exact mapping ⚠ after such a jump that speaker's file runs ahead of the other speaker's by the size of the jump, and the re-run does not correct for it
+  ✗ overwrite earlier samples - destroys audio that was fed to the pipeline
+  ✗ an anchor for every frame that is off - after one backwards jump every later frame is off, which would write 31 records per second
+
+D-audio-sample-format: 16-bit integers or 32-bit floats on disk? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ 16-bit: 16-bit - half the size (about 115 MB per hour per speaker), and the speech server already receives 16-bit audio (`encode_wav`); auto-applied at Confidence: 80% ⚠ the voice detector on a re-run sees samples rounded to 16 bits, not the exact floats of the live run
+  ✗ 32-bit float - exact, at about 230 MB per hour per speaker
+
+D-client-detail: How deep into the HTTP clients does the trace go? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ LLM full, speech per call: LLM in full: request body, every content piece and reasoning piece with its arrival time, finish reason, token usage, the unfiltered answer, the real error. Speech: one record per call with timing, raw text and outcome - the user's choice (user 2026-10-05) ⚠ `LlmClient::stream` and `LlmClient::complete` change their return types; ⚠ speech retries stay invisible
+  ✗ engine level only - rejected by the user; reasoning, finish reason and usage are thrown away inside `LlmClient::stream`
+  ✗ every speech attempt with status and raw body - rejected by the user for this slice
+
+D-llm-usage: How does token usage get into the stream? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ include_usage: requests send `stream_options: {"include_usage": true}` unless the new variable `LLM_INCLUDE_USAGE=false` is set; usage is read leniently, so a missing or odd usage object gives no usage and never an error - the configured server accepts the option and returns a last chunk with `usage` and an empty `choices` list (one request sent to `LLM_BASE_URL` on 2026-10-05: HTTP 200, usage chunk present); a server setting belongs in `.env`, next to `LLM_ENABLE_THINKING`, which is omitted for the same reason (`ChatRequest::new`); auto-applied at Confidence: 85% ⚠ a server that rejects the unknown field fails every request until the variable is set ? verify: no second server was tried
+  ✗ send it always with no switch - a strict server would break suggestions with no way out
+  ✗ retry once without the field on HTTP 400 - a second request the user did not ask for, and a 400 has other causes
+
+D-replay-meaning: What is a re-run in this slice? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ live re-run: the session's audio goes through the current build against the live servers and a new trace is written - the user's choice (user 2026-10-05) ⚠ not repeatable: server answers and thread timing differ between runs
+  ✗ offline replay from recorded server answers - see D-deterministic-replay (⊘ not doing)
+
+D-replay-inputs: Which recorded inputs does a re-run reuse, and which come from the current setup? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ audio, notes, profile, commands: from the session: audio, notes text, start profile, and the commands Suggest, ClearSuggestion, CycleProfile and SetProfile at their recorded meeting times. From the current setup: servers, models, prompt code, tuning - Manual is the default profile and asks only on the hotkey (`AssistProfile::default`, `run_replay`), so without the recorded presses a re-run has no suggestions to compare; auto-applied at Confidence: 85%
+  ✗ audio only - no suggestions in Manual sessions, and the prompt would miss the notes
+
+D-replay-end: When does a re-run end? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ drained, sent, closed: when the sources are drained, every recorded command has been sent, and no suggestion is open; commands still waiting when the sources drain are sent at once, in order - the existing `--ask` replay sends its Suggest after `SourcesDrained` (`replay_loop`), so that command is recorded after the end of the audio and a re-run that stopped at the drain would never send it
+  ✗ stop at `SourcesDrained` - loses every command recorded after the last audio
+
+D-replay-pacing: How fast does a session re-run go? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ real time, speed allowed: real time by default; `--speed N` is accepted and prints a warning - the echo hold, turn settling and minimum gap run on the real clock (`EngineTimings`), so only speed 1 keeps their meaning ⚠ a one hour meeting takes one hour to re-run
+  ✗ a virtual clock through the engine - see D-deterministic-replay (⊘ not doing)
+
+D-replay-limits: The replay stops after 900 s and loads each WAV into memory. What changes? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ limit from duration: a session re-run gets a limit of the longest audio file's length divided by speed plus 120 s; memory use is accepted - `REPLAY_LIMIT` is 900 s and `WavSource::open` decodes the whole file ⚠ about 230 MB of memory per speaker per recorded hour
+  ✗ a streaming replay source - no meeting longer than two hours has been recorded yet; reopen when a re-run uses more than 1 GB of memory
+
+D-replay-output: Where does the trace of a re-run go? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ runs directory: `<session>/runs/<run id>/` with its own `manifest.json` and `events.jsonl`, no audio copy - runs stay attached to the session they came from and the sessions list only shows real meetings; auto-applied at Confidence: 80%
+  ✗ a new top-level session naming its source - mixes re-runs into the corpus
+
+D-compare-metric: What does compare report? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ diff plus judge: per speaker: number of finals, number of words, word distance between the two transcripts and that distance divided by the baseline word count; drops by reason; speech call time and time to first answer piece (median and 95th percentile); suggestions paired and printed side by side with a judge verdict per pair and a tally - the user picked diff plus judge (user 2026-10-05) ⚠ transcript numbers say how different, not which is right
+  ✗ exact event equality - two runs of the same build already differ
+  ✗ a hand-corrected reference transcript per session - the user picked the judge instead (user 2026-10-05); reopen when a transcript difference cannot be explained by reading both sides
+
+D-judge: How are two suggestions judged? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ two requests per pair, both orders: each pair is sent twice to the configured LLM server through `LlmClient::complete`, one request at a time, temperature 0, with the same thinking setting as live requests; the judge sees the last 6000 characters of the baseline's transcript up to the suggestion (built from its `transcript_final` records as `Me:` and `Them:` lines) and the two answers labelled A and B, once in each order, and must answer with JSON `{"winner": "A" | "B" | "tie", "reason": "..."}`; the same winner in both orders is the verdict, anything else is a tie marked `order-dependent` - a model that prefers a position cannot produce a winner this way; one at a time stays inside the server's concurrency limit (C-server-read-only) ⚠ twice the requests; ⚠ the judge is the same model that wrote the answers ? verify: the judge agrees with the user's own pick on a sample of pairs; ⚠ the candidate's answer was written from the re-run's transcript but is judged against the baseline's, so a better transcript in the candidate can count against it; ⚠ compare needs the LLM server unless `--no-judge` is given
+  ✗ one request per pair with the order swapped on every second pair - balances a position preference only over many pairs, not for one pair
+  ✗ judge in parallel - breaks the concurrency cap of C-server-read-only
+  ✗ a numeric score per answer - scores from one model are not stable across calls; a forced choice is easier to check by hand
+  ✗ the tail of the recorded user message as context - it ends with the app's own instruction text, not the conversation (`prompt::build_for`)
+
+D-judge-home: Which crate holds the judge? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ engine: `engine`, as `engine::judge` - the engine already depends on `llm`, and no new edge is needed beyond `engine -> trace`; auto-applied at Confidence: 75%
+  ✗ add the edge `app -> llm` - the binary has no edge to a client crate today (`docs/dependencies.md`)
+  ✗ a new `eval` crate - a second new crate for one function
+
+D-inspect-tools: Which commands look at and manage sessions? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ list, show, delete: `--sessions` lists, `--show SESSION` prints a session as transcript with suggestions, `--delete SESSION --yes` removes one; they run before the config and the server settings are read - pulled in by the user (user 2026-10-05); `main` loads the env file and config before it looks at the mode today, and reading files must not need a server address ⚠ `--sessions` scans every `events.jsonl` line by line to count; reopen with a summary file written at close when listing takes more than 2 s
+  ✗ export to other formats - `events.jsonl` is already plain text; reopen when a second tool needs a different format
+
+D-delete-safety: What stops `--delete` from removing the wrong thing? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ `--yes`, manifest, lock: without `--yes` it prints the path and size and exits 1; it only removes a session or a run directory whose `manifest.json` parses as a trace manifest and which holds an `events.jsonl`; it refuses when that file, or the `events.jsonl` of any run below it, is locked by a running recorder - deleting is not reversible, and `manifest.json` alone is a common file name; auto-applied at Confidence: 85%
+  ✗ delete at once - one typo removes a meeting
+
+D-cli-surface: How are the new modes started? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ flags on the binary: flags on the `clueless` binary: `--data-dir PATH`, `--replay-session SESSION`, `--compare A [B] [--no-judge]`, `--sessions`, `--show SESSION`, `--delete SESSION [--yes]` - the binary already has a hand-written parser and a replay mode (`cli::parse`) ⚠ `Cli.replay: Option<Replay>` becomes a `Mode` enum, which changes the existing parser tests
+  ✗ xtask subcommands - xtask has no dependencies and talks to no crate (`docs/architecture.md` Components)
+  ✗ let `--replay` detect a directory - `--replay` takes up to two positional WAV paths (`take_wav_paths`); a directory there is ambiguous
+
+D-writer-threading: How do records get to disk without stalling audio threads? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ two bounded queues, visible drop: per session one thread writes records from a queue of 4096 and a second thread writes audio frames from a queue of 4096; callers use `try_send`; a full queue drops the message and counts it, and the record thread writes a `records_lost` record with both counts - the existing rule is never block the audio path and make the loss visible (`RingWriter::push`, `send_segment`); with separate queues a slow audio write cannot push out text records, which are the tier that is always on; 4096 frames are about one minute of audio for two speakers
+  ✗ one shared queue - 62 audio frames per second would fill it and text records would be dropped first
+  ✗ unbounded queue - memory grows without limit when the disk stalls
+  ✗ write on the calling thread - a slow disk would stall a stream thread and overflow the 5 s ring
+
+D-timestamps: Which clocks stamp a record? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ at_ms plus one wall-clock start: `at_ms` since the session opened on every record; a `clock_started` record marks when the meeting clock began; the manifest holds one wall-clock start as Unix milliseconds and the replay `speed` (1 for a live meeting); the meeting time of a record is `(at_ms - at_ms of clock_started) * speed`; utterance times stay in meeting milliseconds as the engine made them - the engine has no wall clock (`MeetingClock`), and a replay releases audio `speed` times faster than the wall clock (`WavSource::read`), so without the speed the two kinds of time cannot be compared
+  ✗ wall clock on every record - a clock adjustment mid-meeting would reorder records
+  ✗ a second time field on every record - the conversion is one multiplication
+
+D-crash-safety: What is left on disk when the app is killed mid-meeting? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ flush lines and header: every JSON line is flushed when written; the WAV header is flushed every 80,000 samples (5 s) - `WavWriter::flush` writes a valid header so the file is readable up to the last flush; a WAV never flushed reads as zero samples ⚠ no `fsync`, so a power loss can lose the last seconds
+  ✗ finalize at stop only - a kill would leave every audio file unreadable
+
+D-close-ordering: When is the trace closed? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ close before Idle: in `stop_meeting`, after the pipeline has stopped and before `MeetingState::Idle` is sent; the whole close, sending included, gives up after 2 s - the overlay exits the process once it sees `Idle`, with `std::process::exit(0)`, which runs no destructors; a close without a deadline could keep the engine from ever reporting `Idle` ⚠ the `Idle` event of a meeting is not in its trace; the `end` record stands for it; ⚠ on quit the overlay exits after 6 s whatever happens (`request_quit`, `QUIT_DEADLINE_SECS`), and a slow stop can take longer, so that session loses its `end` record and up to 5 s of audio and is shown as cut off
+  ✗ close in a destructor - never runs on a normal quit
+  ✗ write the `end` record at the start of `stop_meeting` - the finals flushed during the stop would come after the end
+
+D-session-end: What marks a session as finished cleanly? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ end record: a last `end` record with a reason: `stop`, `shutdown`, `panic`, `channel_closed` or `start_failed`; a trace without one is shown as cut off - there are five ways a meeting ends (`stop_meeting` callers and the no-sources return in `start_meeting`)
+  ✗ a marker file - a second thing to keep in step with the record file
+
+D-write-failure: What happens when the trace cannot be written? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ warn and continue: at open: one Warn status from `StatusSource::App`, and the meeting runs unrecorded. Mid-session: one Warn status, the writer stops, the meeting goes on. For `--replay-session` a trace that cannot be opened ends the command with exit code 1 - a meeting must not die because recording did (the notes file follows the same rule, `read_notes`); a re-run without a trace has no purpose
+  ✗ fail the meeting - loses the meeting to save its recording
+
+D-serde-types: How do engine types reach the file? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ own record types: the `trace` crate has its own record types with serde derives and converts from `UiEvent` and `EngineCommand`; a stored version 1 trace under `fixtures/trace/v1/` must keep parsing in a test - renaming an engine enum cannot change the file format without a failing test; auto-applied at Confidence: 78% ⚠ about 150 lines of conversion code to keep in step with `UiEvent`
+  ✗ serde derives on the types in `crates/types` - every refactor of an engine enum would silently change old traces' meaning
+
+D-schema-version: How does a later build read an old trace? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ version, tolerant reader: `schema: 1` in the manifest; the reader refuses a higher number, ignores unknown fields, maps an unknown record kind to `unknown`, and ignores a last line that does not parse - new record kinds can be added without breaking old readers
+  ✗ no version - the first format change makes old sessions unreadable without a way to tell
+
+D-drop-reason: How is the reason for a dropped utterance recorded? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ trace-only record: a trace-only `utterance_dropped` record with a reason: `cancelled`, `no_speech`, `asr_error`, `empty_after_overlap`, `echo` or `queue_full` - nine `drop_final` call sites and one in `send_segment` emit the same `TranscriptDropped` today
+  ✗ add the reason to `UiEvent::TranscriptDropped` - changes the overlay for data it does not show
+
+D-policy-trace: How much of the trigger policy is recorded? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ pieces and three outcomes: a `piece_done` record per finished piece and a `policy` record at the three outcomes the engine already logs (`waiting`, `fired`, `paused`) - these are computed today in `Engine::pump` and `log_pause`
+  ✗ a reason for every skip - `AutoPolicy::poll` returns no reason and changing it is a separate design; reopen when a missing automatic suggestion cannot be explained from the trace
+
+D-suggestion-detail: What extra facts are stored per LLM call? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ call facts: a call id, the purpose (`suggestion`, `compress`), the suggestion id, origin and profile on the request record; on the end record the outcome, the full error text with the first bytes of the server's answer, finish reason, usage, the raw text, the shown text, whether the answer was a PASS, the time to the first content piece and the time to the first reasoning piece - `suggest::run` knows neither origin nor profile, and `map_llm_error` folds three errors into `Interrupted`; the error detail goes to the trace only, the text shown to the user stays as it is
+  ✗ the `SuggestionEnd` event only - loses the PASS text and the real error
+  ✗ put the server's answer into the `LlmError` display text - the compression failure status would then show server text in the window
+
+D-compress-trace: What is recorded when the transcript is summarized? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ request, end, lines replaced: the request and end records of the call plus a `summary_applied` record with the number of lines replaced - `compress::run` emits nothing on success, and `set_summary` removes the old lines for good
+  ✗ nothing - a later prompt in the same trace could not be explained
+
+D-prompt-storage: Is the full LLM request stored on every call? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ full body: the full JSON body every time - each record can be read alone, and it is the exact body sent ⚠ in Brainstorm the transcript is stored again with every request, so the record file grows with the square of the meeting length ? verify: size of `events.jsonl` after a one hour Brainstorm meeting
+  ✗ store only what was added since the last request - C-prompt-prefix-stable would allow it; reopen when one session's `events.jsonl` passes 200 MB
+
+D-manifest-contents: What does the manifest hold? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ settings and commit: schema, session id, start as Unix milliseconds, origin (`live`, `replay_wav`, `rerun`), replay speed, source session for a re-run, app version, git commit, audio on or off, the speakers the source factory lists, start profile, LLM settings (base URL, model, max tokens, temperature, thinking switch, usage switch), speech settings (base URL, model, language), voice detector settings, every `EngineTimings` value in milliseconds, the compression threshold - a trace cannot be read correctly without the settings it ran with, and the commit pins the prompt text compiled into the build ⚠ a commit ending in `-dirty` does not pin anything
+  ✗ a `Debug` dump of `Config` - not parseable, and it changes whenever a field is renamed
+
+D-secrets: How are API keys kept out of the trace? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ no key field: the manifest type has no key field, request bodies never contain the key (it travels in a header set by `LlmClient::new`), user and password and the query string of a base URL are replaced by `***`, and a test searches every written file for both keys - the repo already forbids the key in `Debug` output (`LlmConfig` Debug impl)
+  ✗ rely on the redacting `Debug` impls - they protect log lines, not serde output
+
+D-session-identity: What is one session and how is its directory named? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ one meeting, UTC name: one meeting; `sessions/<UTC start as 2026-10-05T14-03-22Z>`, made with `create_dir`, with `-2`, `-3` appended when the name exists - sorts by time, needs no new dependency, and two processes cannot share a directory (replay mode takes no lock, `run_gui` does); auto-applied at Confidence: 85% ⚠ UTC, not local time, because local time needs a time zone library
+  ✗ one directory per app run - utterance numbers and line ids restart per meeting (`Machine`, `TranscriptStore::new`)
+  ✗ a uuid - a new dependency and names that do not sort
+
+D-trace-switches: Which switches exist? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ two TOML keys and a flag: `[trace] enabled = true` and `[trace] audio = false` in the TOML, and `--data-dir PATH` on the command line (default `~/.clueless`) - app behaviour belongs in TOML (`docs/configuration.md`), and a path override is a launch detail like `--log-file`; auto-applied at Confidence: 80%
+  ✗ environment variables - the `.env` file is reserved for servers, models and secrets
+
+D-audio-indicator: Does the user see that the meeting is being stored? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ one Info status: one Info status from `StatusSource::App` at every recorded meeting start, `recording to <session directory>`, with ` (with audio)` added when audio is written; the text comes from what the sink reports, not from the config - the user is responsible for consent (`README.md`, recording notice), and the text trace holds other people's words and the user's notes just as the audio holds their voices; auto-applied at Confidence: 80% ⚠ one more status line at each meeting start
+  ✗ a status only when audio is on - the text trace starts on the first launch after the upgrade with no sign at all
+  ✗ nothing - a forgotten config key would record every meeting unnoticed
+
+D-file-permissions: Who can read the trace files? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ 0700 and 0600: every directory the app creates is 0700 and every file 0600, through one helper used for the manifest, the record file, the audio files and the notes copy of a re-run - the files hold other people's words and voices; auto-applied at Confidence: 85% ⚠ a data directory that already exists with wider permissions is left as it is
+  ✗ process default - readable by every account on the Mac
+
+D-wav-replay-records: Does the existing `--replay ME.wav` mode write a session too? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ yes, origin replay_wav: yes, with origin `replay_wav` - it is the same engine, it lets a session be built from the fixtures, and it is how the binary tests reach the recorder
+  ✗ no - a second code path that behaves differently from a live meeting
+
+D-test-isolation: How do existing tests avoid writing into the real `~/.clueless`? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ no-op by default, `--data-dir` in tests: `EngineDeps::production` installs an opener that records nothing and the binary replaces it; engine tests record only when a test asks for the in-memory trace; the one helper that starts the binary in `crates/app/tests/replay.rs` sets `HOME` to a temp directory and passes `--data-dir` inside it, for the ignored live tests too - that helper sets neither today (`run_with_log`), and `EngineDeps` has three struct literals
+  ✗ switch recording off in tests through the config file - one forgotten test writes into the user's corpus
+
+D-health-trace: What is recorded for the server checks at meeting start? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ the status events they already produce - `health::check` returns `UiEvent::Status` values that pass through the wrapped sink
+  ✗ the model list and the check latency - no question so far needed them; reopen when a session with no transcript cannot be explained
+
+D-retention: Is old data ever deleted by the app? (2026-10-05, recorded-session-traces/spec.md)
+  ✗ a size limit with oldest-first cleanup - left out by the user (user 2026-10-05)
+  ⊘ not doing - audio is off by default and `--delete` exists; reopen when `~/.clueless` passes 20 GB
+
+D-discard-meeting: Is there a menu item to throw away the running session? (2026-10-05, recorded-session-traces/spec.md)
+  ✗ a status menu item - left out by the user (user 2026-10-05)
+  ⊘ not doing - `--delete` covers it after the meeting; reopen when a session has to be removed while the app keeps running
+
+D-tool-calls: What is recorded for tool calls? (2026-10-05, recorded-session-traces/spec.md)
+  ✗ a tool call record kind - `ChatRequest` has no `tools` field and `Role` is only system and user
+  ⊘ not doing - there is nothing to record; the full request body is stored, so a future `tools` field appears in the trace by itself; reopen when the LLM client gains tool calls
+
+D-deterministic-replay: Is offline, repeatable replay in this slice? (2026-10-05, recorded-session-traces/spec.md)
+  ✗ serve recorded server answers and run on a virtual clock - needs a clock passed through the engine (about ten direct `Instant::now()` calls) and raw speech answers
+  ⊘ not doing - the user picked the smaller slice (user 2026-10-05); reopen when run-to-run differences hide the effect of a change
+
+D-llm-only-rerun: Is re-asking the LLM from a recorded transcript in this slice? (2026-10-05, recorded-session-traces/spec.md)
+  ✗ a mode that rebuilds prompts from recorded transcript events - a third replay path
+  ⊘ not doing - the user picked the smaller slice (user 2026-10-05); reopen when most recorded sessions have no audio and a prompt change needs measuring
+
+D-vad-probabilities: Are the per-frame voice scores stored? (2026-10-05, recorded-session-traces/spec.md)
+  ✗ a side file of scores - about 31 values per second per speaker
+  ⊘ not doing - they can be computed again from the audio; reopen when two voice detector versions must be compared frame by frame
+
+D-ui-actions: Are overlay-only actions (mode switch, hide, move) recorded? (2026-10-05, recorded-session-traces/spec.md)
+  ✗ a path from the overlay to the recorder - the overlay may depend only on `types` (`docs/dependencies.md`)
+  ⊘ not doing - these actions never reach the engine and do not change transcript or suggestions; reopen when a UI study needs them
+
+D-plist-strings: Do the permission texts in `macos/Info.plist` change? (2026-10-05, recorded-session-traces/spec.md)
+  ✓ add storing: the microphone, audio capture and screen capture texts add "and, when you switch audio recording on, to store it on this Mac" - the current texts say the audio is used only to show the transcript, and Them audio arrives via ScreenCaptureKit by default (`audio.system_audio_backend = "sck"`, `docs/system-audio.md`), whose prompt is `NSScreenCaptureUsageDescription`
+  ✗ leave them - they would be untrue with `[trace] audio = true`
 
 ## Testing
 
