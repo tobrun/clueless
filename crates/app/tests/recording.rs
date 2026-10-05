@@ -371,14 +371,13 @@ async fn a_data_dir_below_a_regular_file_warns_and_the_replay_still_runs() {
     );
 }
 
-// ------------------------------------------------------ session stubs
+// ---------------------------------------------------- session modes
 
-/// The read-only modes work with no env file and no server variables and
-/// carry the fixed stub line until change set 9 (D-inspect-tools: they are
-/// dispatched before the environment is read).
+/// The read-only modes work with no env file and no server variables
+/// (D-inspect-tools: they are dispatched before the environment is read).
 #[tokio::test]
-async fn inspect_modes_run_without_environment_and_carry_the_stub_line() {
-    let dir = TempDir::new("rec-stubs");
+async fn inspect_modes_run_without_environment() {
+    let dir = TempDir::new("rec-inspect");
     for (args, name) in [
         (vec!["--sessions"], "sessions"),
         (vec!["--show", "nope"], "show"),
@@ -388,17 +387,15 @@ async fn inspect_modes_run_without_environment_and_carry_the_stub_line() {
         let paths: Vec<&Path> = args.iter().map(Path::new).collect();
         let run = replay(&dir, &paths);
         let run = run.await;
-        assert_eq!(
-            run.output.status.code(),
-            Some(2),
-            "{args:?} exits with the stub's code"
-        );
         let stderr = String::from_utf8_lossy(&run.output.stderr).to_string();
-        assert_eq!(
-            stderr.trim(),
-            format!("{name}: not implemented"),
-            "{args:?} prints the stub line"
-        );
+        let expected = match name {
+            // An empty data directory lists nothing and says nothing.
+            "sessions" => Some(0),
+            // Everything else names a session that is not there, which
+            // fails with the path in the message.
+            _ => Some(2),
+        };
+        assert_eq!(run.output.status.code(), expected, "{args:?} exit code");
         assert!(
             !stderr.contains("Missing required environment variables"),
             "{args:?} must not read the environment: {stderr}"
@@ -406,11 +403,11 @@ async fn inspect_modes_run_without_environment_and_carry_the_stub_line() {
     }
 }
 
-/// `--replay-session` parses, loads its settings and stops at the change
-/// set 9 stub.
+/// `--replay-session` on a name with no session behind it fails with the
+/// path in the message after the settings loaded.
 #[tokio::test]
-async fn replay_session_reaches_the_stub_after_the_settings_load() {
-    let dir = TempDir::new("rec-rerun-stub");
+async fn replay_session_names_the_missing_session() {
+    let dir = TempDir::new("rec-rerun-missing");
     let asr = spawn_asr_mock("unused").await;
     let llm = spawn_llm_mock(&["unused"]).await;
     common::write_mock_env(&dir, llm, asr);
@@ -418,5 +415,8 @@ async fn replay_session_reaches_the_stub_after_the_settings_load() {
     let run = replay(&dir, &[Path::new("--replay-session"), Path::new("nope")]).await;
     assert_eq!(run.output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&run.output.stderr);
-    assert_eq!(stderr.trim(), "replay-session: not implemented");
+    assert!(
+        stderr.contains("nope") && stderr.contains("sessions"),
+        "the message names the missing path: {stderr}"
+    );
 }
