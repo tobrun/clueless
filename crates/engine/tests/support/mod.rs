@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,9 +30,11 @@ use segmenter::machine::MachineParams;
 use segmenter::vad::SpeechProb;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use trace::manifest::SessionStart;
-use trace::sink::{FailureSink, NoTrace, TraceOpener, TraceSink};
+use trace::record::Body;
+use trace::sink::{FailureSink, MemoryOpener, MemoryTrace, NoTrace, TraceOpener, TraceSink};
 
 use engine::clock::MeetingClock;
 use engine::deps::{EngineDeps, EngineTimings};
@@ -239,6 +242,16 @@ pub struct RequestRec {
     pub arrival: Duration,
 }
 
+/// Bind a mock server on a free port and serve `app` on it.
+async fn spawn_mock(app: Router) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr
+}
+
 struct MockState {
     script_final: Mutex<VecDeque<Respond>>,
     script_interim: Mutex<VecDeque<Respond>>,
@@ -282,11 +295,7 @@ impl MockAsr {
             .route("/v1/audio/transcriptions", any(transcribe))
             .route("/v1/models", get(models))
             .with_state(state.clone());
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let addr = spawn_mock(app).await;
         Self {
             base_url: format!("http://{addr}"),
             port: addr.port(),
@@ -443,15 +452,17 @@ async fn play(state: &Arc<MockState>, mut response: Respond) -> Response {
     }
 }
 
-async fn models(State(state): State<Arc<MockState>>) -> Json<serde_json::Value> {
-    let data: Vec<serde_json::Value> = state
-        .models
-        .lock()
-        .unwrap()
+/// The `GET /v1/models` body both mocks serve.
+fn models_list(models: &[String]) -> Json<serde_json::Value> {
+    let data: Vec<serde_json::Value> = models
         .iter()
         .map(|id| serde_json::json!({ "id": id, "object": "model" }))
         .collect();
     Json(serde_json::json!({ "object": "list", "data": data }))
+}
+
+async fn models(State(state): State<Arc<MockState>>) -> Json<serde_json::Value> {
+    models_list(&state.models.lock().unwrap())
 }
 
 // ---------------------------------------------------------------- harness
@@ -511,6 +522,48 @@ pub struct Timed {
     pub event: UiEvent,
 }
 
+/// A recording UI sink and the list it appends to.
+fn event_sink() -> (Arc<Mutex<Vec<Timed>>>, StatusSink) {
+    let events: Arc<Mutex<Vec<Timed>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let ui: StatusSink = Arc::new(move |event| {
+        sink.lock().unwrap().push(Timed {
+            at: Instant::now(),
+            event,
+        });
+    });
+    (events, ui)
+}
+
+/// Cloned copy of every event recorded so far.
+fn snapshot_of(events: &Arc<Mutex<Vec<Timed>>>) -> Vec<UiEvent> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|timed| timed.event.clone())
+        .collect()
+}
+
+/// Poll until `pred` sees the recorded events, up to `timeout`.
+async fn poll_until(
+    events: &Arc<Mutex<Vec<Timed>>>,
+    timeout: Duration,
+    pred: impl Fn(&Vec<UiEvent>) -> bool,
+) -> Vec<UiEvent> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let events = snapshot_of(events);
+        if pred(&events) {
+            return events;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 pub struct Harness {
     events: Arc<Mutex<Vec<Timed>>>,
     pub store: Arc<Mutex<TranscriptStore>>,
@@ -521,14 +574,7 @@ pub struct Harness {
 }
 
 pub fn start(specs: Vec<StreamSpec>, mock: &MockAsr, opts: Opts) -> Harness {
-    let events: Arc<Mutex<Vec<Timed>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let ui: StatusSink = Arc::new(move |event| {
-        sink.lock().unwrap().push(Timed {
-            at: Instant::now(),
-            event,
-        });
-    });
+    let (events, ui) = event_sink();
     let vad = vad_factory(specs.iter().map(|spec| spec.probs.clone()).collect());
     let deps = EngineDeps {
         factory: Arc::new(EmptyFactory),
@@ -577,12 +623,7 @@ pub fn start(specs: Vec<StreamSpec>, mock: &MockAsr, opts: Opts) -> Harness {
 
 impl Harness {
     pub fn snapshot(&self) -> Vec<UiEvent> {
-        self.events
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|t| t.event.clone())
-            .collect()
+        snapshot_of(&self.events)
     }
 
     pub fn finals(&self) -> Vec<Utterance> {
@@ -645,17 +686,7 @@ impl Harness {
         timeout: Duration,
         pred: impl Fn(&Vec<UiEvent>) -> bool,
     ) -> Vec<UiEvent> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let events = self.snapshot();
-            if pred(&events) {
-                return events;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return events;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        poll_until(&self.events, timeout, pred).await
     }
 
     pub async fn wait_finals(&self, count: usize, timeout: Duration) -> Vec<Utterance> {
@@ -969,11 +1000,7 @@ impl MockLlm {
             .route("/v1/chat/completions", post(llm_chat))
             .route("/v1/models", get(llm_models))
             .with_state(state.clone());
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let addr = spawn_mock(app).await;
         Self {
             base_url: format!("http://{addr}"),
             port: addr.port(),
@@ -1029,14 +1056,7 @@ impl MockLlm {
 }
 
 async fn llm_models(State(state): State<Arc<LlmState>>) -> Json<serde_json::Value> {
-    let data: Vec<serde_json::Value> = state
-        .models
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|id| serde_json::json!({ "id": id, "object": "model" }))
-        .collect();
-    Json(serde_json::json!({ "object": "list", "data": data }))
+    models_list(&state.models.lock().unwrap())
 }
 
 async fn llm_chat(State(state): State<Arc<LlmState>>, body: axum::body::Bytes) -> Response {
@@ -1203,15 +1223,8 @@ impl MeetingHarness {
         vad: Vec<VadScript>,
         opts: MeetingOpts,
     ) -> Self {
-        let events: Arc<Mutex<Vec<Timed>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = events.clone();
+        let (events, ui) = event_sink();
         let started = Instant::now();
-        let ui: StatusSink = Arc::new(move |event| {
-            sink.lock().unwrap().push(Timed {
-                at: Instant::now(),
-                event,
-            });
-        });
         let config = Config {
             vad: VadConfig {
                 start_threshold: opts.machine.start_threshold,
@@ -1270,12 +1283,7 @@ impl MeetingHarness {
     }
 
     pub fn snapshot(&self) -> Vec<UiEvent> {
-        self.events
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|timed| timed.event.clone())
-            .collect()
+        snapshot_of(&self.events)
     }
 
     pub async fn wait_until(
@@ -1283,17 +1291,37 @@ impl MeetingHarness {
         timeout: Duration,
         pred: impl Fn(&Vec<UiEvent>) -> bool,
     ) -> Vec<UiEvent> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let events = self.snapshot();
-            if pred(&events) {
-                return events;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return events;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        poll_until(&self.events, timeout, pred).await
+    }
+
+    /// Wait (up to `WAIT`) for a transcript final to arrive.
+    pub async fn wait_final(&self) {
+        self.wait_until(WAIT, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, UiEvent::TranscriptFinal(_)))
+        })
+        .await;
+    }
+
+    /// Wait (up to `WAIT`) for a transcript interim to arrive.
+    pub async fn wait_interim(&self) {
+        self.wait_until(WAIT, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, UiEvent::TranscriptInterim { .. }))
+        })
+        .await;
+    }
+
+    /// Wait (up to `WAIT`) for a transcript drop to arrive.
+    pub async fn wait_dropped(&self) {
+        self.wait_until(WAIT, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, UiEvent::TranscriptDropped { .. }))
+        })
+        .await;
     }
 
     pub fn states(&self) -> Vec<MeetingState> {
@@ -1382,4 +1410,190 @@ pub async fn closed_port() -> u16 {
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
     port
+}
+
+// ------------------------------------------------------- trace test helpers
+
+/// How long recorded-session tests wait for meetings, records and mocks.
+pub const WAIT: Duration = Duration::from_secs(8);
+
+/// Start both mocks for one test.
+pub async fn start_mocks() -> (MockAsr, MockLlm) {
+    (MockAsr::start().await, MockLlm::start().await)
+}
+
+/// A fresh in-memory opener.
+pub fn opener() -> Arc<MemoryOpener> {
+    Arc::new(MemoryOpener::new())
+}
+
+/// `MeetingOpts` that record through `opener`.
+pub fn trace_opts(opener: &Arc<MemoryOpener>) -> MeetingOpts {
+    MeetingOpts {
+        trace: Some(opener.clone()),
+        ..MeetingOpts::default()
+    }
+}
+
+/// Shut the engine down and wait for its loop to finish.
+pub async fn finish(h: &mut MeetingHarness) {
+    h.cmd(EngineCommand::Shutdown);
+    timeout(WAIT, &mut h.engine)
+        .await
+        .expect("engine loop returns")
+        .expect("engine task does not panic");
+}
+
+/// The only trace `opener` opened.
+pub fn single_trace(opener: &Arc<MemoryOpener>) -> Arc<MemoryTrace> {
+    let traces = opener.traces();
+    assert_eq!(traces.len(), 1, "exactly one trace was opened");
+    traces[0].clone()
+}
+
+/// Every record body of `trace`, in order.
+pub fn last_bodies(trace: &Arc<MemoryTrace>) -> Vec<Body> {
+    trace.records().into_iter().map(|r| r.body).collect()
+}
+
+/// True when every check finds its body at or after the one before.
+pub fn ordered(bodies: &[Body], checks: &[&dyn Fn(&Body) -> bool]) -> bool {
+    let mut rest = bodies.iter();
+    checks.iter().all(|check| rest.any(check))
+}
+
+/// Poll the newest trace's bodies until `done` accepts them (or `WAIT` ends).
+pub async fn loop_bodies_until(
+    opener: &Arc<MemoryOpener>,
+    done: impl Fn(&Vec<Body>) -> bool,
+) -> Vec<Body> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let bodies = last_bodies(&single_trace(opener));
+        if done(&bodies) || tokio::time::Instant::now() >= deadline {
+            return bodies;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Start a Me meeting, wait until Running, and return the harness.
+pub async fn start_running(h: &MeetingHarness) {
+    h.cmd(EngineCommand::StartMeeting);
+    assert!(
+        h.wait_state(MeetingState::Running, WAIT).await,
+        "meeting reaches Running: {:?}",
+        h.states()
+    );
+}
+
+/// Stop a running meeting and wait for `Idle`.
+pub async fn stop_and_wait(h: &MeetingHarness) {
+    h.cmd(EngineCommand::StopMeeting);
+    assert!(
+        h.wait_state(MeetingState::Idle, WAIT).await,
+        "meeting returns to Idle"
+    );
+}
+
+/// An endless silent Me source, openable `plans` times (a live-like meeting).
+pub fn endless_me_factory(plans: usize) -> ScriptedFactory {
+    ScriptedFactory::new(vec![(
+        Speaker::Me,
+        (0..plans)
+            .map(|_| OpenPlan::Ok(SourcePlan::endless(200)))
+            .collect(),
+    )])
+}
+
+/// A vad script that scores silence forever.
+pub fn silence_vad() -> Vec<VadScript> {
+    vec![VadScript::Probs(Vec::new())]
+}
+
+/// A Them-only endless source scripted to end one turn, with its vad script.
+pub fn one_them_turn() -> (ScriptedFactory, Vec<VadScript>) {
+    let (frames, probs) = pattern(&[(11, 0.0), (20, 0.9), (25, 0.0)]);
+    (
+        ScriptedFactory::new(vec![(
+            Speaker::Them,
+            vec![OpenPlan::Ok(SourcePlan {
+                frames,
+                speed: 1000.0,
+                never_end: true,
+            })],
+        )]),
+        vec![VadScript::Probs(probs)],
+    )
+}
+
+/// A meeting harness with `opener` installed, not yet started.
+pub async fn tracing_meeting(
+    asr: &MockAsr,
+    llm: &MockLlm,
+    factory: ScriptedFactory,
+    vad: Vec<VadScript>,
+    opener: &Arc<MemoryOpener>,
+    opts: MeetingOpts,
+) -> MeetingHarness {
+    let opts = MeetingOpts {
+        trace: Some(opener.clone()),
+        ..opts
+    };
+    MeetingHarness::start(asr, llm, factory, vad, opts).await
+}
+
+/// `tracing_meeting` started up to Running.
+pub async fn running_tracing_meeting(
+    asr: &MockAsr,
+    llm: &MockLlm,
+    factory: ScriptedFactory,
+    vad: Vec<VadScript>,
+    opener: &Arc<MemoryOpener>,
+    opts: MeetingOpts,
+) -> MeetingHarness {
+    let h = tracing_meeting(asr, llm, factory, vad, opener, opts).await;
+    start_running(&h).await;
+    h
+}
+
+/// A traced, running Me-only meeting over an endless silent source.
+pub async fn traced_running_meeting(
+    asr: &MockAsr,
+    llm: &MockLlm,
+    opener: &Arc<MemoryOpener>,
+    opts: MeetingOpts,
+) -> MeetingHarness {
+    running_tracing_meeting(asr, llm, endless_me_factory(1), silence_vad(), opener, opts).await
+}
+
+/// A fresh opener and a running traced Me-only meeting over the default opts;
+/// the opener stays with the test so it can read the trace back.
+pub async fn traced_running(asr: &MockAsr, llm: &MockLlm) -> (Arc<MemoryOpener>, MeetingHarness) {
+    let opener = opener();
+    let h = traced_running_meeting(asr, llm, &opener, MeetingOpts::default()).await;
+    (opener, h)
+}
+
+/// Stop a running meeting and read back the bodies of the trace `opener` opened.
+pub async fn stopped_bodies(h: &MeetingHarness, opener: &Arc<MemoryOpener>) -> Vec<Body> {
+    stop_and_wait(h).await;
+    last_bodies(&single_trace(opener))
+}
+
+/// A traced, unstarted Me-only meeting over an endless silent source.
+pub async fn idle_tracing_meeting(
+    asr: &MockAsr,
+    llm: &MockLlm,
+    opener: &Arc<MemoryOpener>,
+    opts: MeetingOpts,
+) -> MeetingHarness {
+    tracing_meeting(asr, llm, endless_me_factory(1), silence_vad(), opener, opts).await
+}
+
+/// A running Me-only meeting over an endless silent source with `opts`.
+pub async fn running_me_with(asr: &MockAsr, llm: &MockLlm, opts: MeetingOpts) -> MeetingHarness {
+    let h = MeetingHarness::start(asr, llm, endless_me_factory(1), silence_vad(), opts).await;
+    start_running(&h).await;
+    h
 }

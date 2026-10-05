@@ -21,6 +21,8 @@ futures-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The shared trace test fixtures (Scratch, session_start, trace builders).
+trace = { workspace = true, features = ["testutil"] }
 axum.workspace = true
 serde_json.workspace = true
 tokio-stream.workspace = true

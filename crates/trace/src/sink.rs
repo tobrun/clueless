@@ -109,6 +109,21 @@ impl Default for Stamper {
     }
 }
 
+/// The [`TraceSink`] clock and call counter methods, for sinks that keep
+/// their shared [`Stamper`] in a `stamper` field and answer both questions
+/// straight from it.
+macro_rules! stamper_forwarding {
+    () => {
+        fn now_ms(&self) -> u64 {
+            self.stamper.now_ms()
+        }
+
+        fn next_call(&self) -> u64 {
+            self.stamper.next_call()
+        }
+    };
+}
+
 /// The sink for sessions with recording switched off, and the fallback
 /// when opening a trace failed: keeps nothing, reports no location.
 pub struct NoTrace;
@@ -214,13 +229,7 @@ impl TraceSink for MemoryTrace {
             .push(t_start_ms);
     }
 
-    fn now_ms(&self) -> u64 {
-        self.stamper.now_ms()
-    }
-
-    fn next_call(&self) -> u64 {
-        self.stamper.next_call()
-    }
+    stamper_forwarding!();
 
     fn location(&self) -> Option<Location> {
         self.location.clone()
@@ -293,41 +302,7 @@ impl TraceOpener for MemoryOpener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{LlmSettings, SessionStart, SpeechSettings, Timings, VoiceDetector};
-    use crate::record::Profile;
-
-    fn session_start() -> SessionStart {
-        SessionStart {
-            speakers: vec!["me".into(), "them".into()],
-            profile: Profile::Manual,
-            llm: LlmSettings {
-                base_url: "http://host:8000".into(),
-                model: "m".into(),
-                max_tokens: 220,
-                temperature: 0.4,
-            },
-            speech: SpeechSettings {
-                base_url: "http://host:9000".into(),
-                model: "w".into(),
-                language: None,
-            },
-            voice_detector: VoiceDetector {
-                start_threshold: 0.5,
-                end_threshold: 0.35,
-                end_silence_frames: 19,
-                max_segment_ms: 15000,
-            },
-            timings_ms: Timings {
-                echo_hold_ms: 700,
-                stop_wait_ms: 1500,
-                health_timeout_ms: 2000,
-                asr_timeout_ms: 15000,
-                llm_connect_ms: 2000,
-                llm_stall_ms: 10000,
-            },
-            compress_threshold_tokens: 90_000,
-        }
-    }
+    use crate::testutil::session_start;
 
     fn failure_sink() -> FailureSink {
         Arc::new(|_msg| {})

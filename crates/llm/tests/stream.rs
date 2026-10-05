@@ -3,31 +3,15 @@
 
 mod support;
 
-use std::time::Duration;
-
 use futures_util::StreamExt;
-use llm::client::{LlmClient, LlmError};
-use llm::types::{ChatRequest, Message, StreamPart, Usage};
+use llm::client::LlmError;
+use llm::types::{ChatRequest, StreamPart, Usage};
 use serde_json::json;
 use support::{Mock, Reply, Step};
 use tokio_util::sync::CancellationToken;
 
-const CONNECT: Duration = Duration::from_secs(2);
-const STALL: Duration = Duration::from_secs(10);
-
-fn client_for(base_url: &str) -> LlmClient {
-    LlmClient::new(base_url, "mock-model", None, CONNECT, STALL)
-}
-
 fn request(include_usage: bool) -> ChatRequest {
-    ChatRequest::new(
-        "mock-model",
-        vec![Message::user("hi")],
-        220,
-        0.4,
-        Some(false),
-        include_usage,
-    )
+    support::test_request(include_usage)
 }
 
 /// Drain a stream into its parts and the error that ended it, if any.
@@ -49,11 +33,17 @@ async fn drain_parts(
     (parts, error)
 }
 
+/// Stream the standard request against the mock with the default client and
+/// drain it into its parts and the error that ended it, if any.
+async fn stream_parts(mock: &Mock, include_usage: bool) -> (Vec<StreamPart>, Option<LlmError>) {
+    let client = support::test_client(&mock.base_url);
+    drain_parts(client.stream(request(include_usage), CancellationToken::new())).await
+}
+
 #[tokio::test]
 async fn content_chunks_then_done_yield_content_parts_and_an_empty_finish() {
     let mock = Mock::start(Reply::contents(&["Hel", "lo"])).await;
-    let client = client_for(&mock.base_url);
-    let (parts, error) = drain_parts(client.stream(request(false), CancellationToken::new())).await;
+    let (parts, error) = stream_parts(&mock, false).await;
     assert_eq!(
         parts,
         vec![
@@ -76,8 +66,7 @@ async fn reasoning_content_chunks_arrive_as_reasoning_parts_before_the_content()
         Step::Chunk("Hello".into()),
     ]))
     .await;
-    let client = client_for(&mock.base_url);
-    let (parts, error) = drain_parts(client.stream(request(false), CancellationToken::new())).await;
+    let (parts, error) = stream_parts(&mock, false).await;
     assert_eq!(
         parts,
         vec![
@@ -97,8 +86,7 @@ async fn reasoning_content_chunks_arrive_as_reasoning_parts_before_the_content()
 #[tokio::test]
 async fn reasoning_field_arrives_as_a_reasoning_part() {
     let mock = Mock::start(Reply::stream(vec![Step::Reasoning("pondering".into())])).await;
-    let client = client_for(&mock.base_url);
-    let (parts, error) = drain_parts(client.stream(request(false), CancellationToken::new())).await;
+    let (parts, error) = stream_parts(&mock, false).await;
     assert_eq!(
         parts,
         vec![
@@ -120,8 +108,7 @@ async fn finish_reason_and_usage_chunks_are_carried_in_the_finish_part() {
         Step::Usage(json!({"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20})),
     ]))
     .await;
-    let client = client_for(&mock.base_url);
-    let (parts, error) = drain_parts(client.stream(request(true), CancellationToken::new())).await;
+    let (parts, error) = stream_parts(&mock, true).await;
     assert_eq!(
         parts.last(),
         Some(&StreamPart::Finish {
@@ -144,8 +131,7 @@ async fn a_usage_without_total_tokens_keeps_the_two_counts_that_are_present() {
         "completion_tokens": 8,
     }))]))
     .await;
-    let client = client_for(&mock.base_url);
-    let (parts, error) = drain_parts(client.stream(request(true), CancellationToken::new())).await;
+    let (parts, error) = stream_parts(&mock, true).await;
     assert_eq!(
         parts.last(),
         Some(&StreamPart::Finish {
@@ -164,8 +150,7 @@ async fn a_usage_without_total_tokens_keeps_the_two_counts_that_are_present() {
 #[tokio::test]
 async fn an_unreadable_usage_object_yields_no_usage_and_no_error() {
     let mock = Mock::start(Reply::stream(vec![Step::Usage(json!("n/a"))])).await;
-    let client = client_for(&mock.base_url);
-    let (parts, error) = drain_parts(client.stream(request(true), CancellationToken::new())).await;
+    let (parts, error) = stream_parts(&mock, true).await;
     assert_eq!(
         parts.last(),
         Some(&StreamPart::Finish {
@@ -180,8 +165,7 @@ async fn an_unreadable_usage_object_yields_no_usage_and_no_error() {
 #[tokio::test]
 async fn include_usage_sends_stream_options_in_the_body() {
     let mock = Mock::start(Reply::contents(&["ok"])).await;
-    let client = client_for(&mock.base_url);
-    let _ = drain_parts(client.stream(request(true), CancellationToken::new())).await;
+    let _ = stream_parts(&mock, true).await;
     let bodies = mock.bodies();
     assert_eq!(bodies.len(), 1);
     assert!(
@@ -194,8 +178,7 @@ async fn include_usage_sends_stream_options_in_the_body() {
 #[tokio::test]
 async fn without_include_usage_the_body_has_no_stream_options_key() {
     let mock = Mock::start(Reply::contents(&["ok"])).await;
-    let client = client_for(&mock.base_url);
-    let _ = drain_parts(client.stream(request(false), CancellationToken::new())).await;
+    let _ = stream_parts(&mock, false).await;
     let bodies = mock.bodies();
     assert_eq!(bodies.len(), 1);
     assert!(
@@ -207,19 +190,9 @@ async fn without_include_usage_the_body_has_no_stream_options_key() {
 
 #[tokio::test]
 async fn cancelling_mid_stream_ends_without_further_items_and_without_finish() {
-    let mock = Mock::start(Reply::Stream(vec![
-        Step::Chunk("first".into()),
-        Step::Hold(Duration::from_secs(10)),
-    ]))
-    .await;
-    let client = client_for(&mock.base_url);
-    let cancel = CancellationToken::new();
-    let mut stream = Box::pin(client.stream(request(false), cancel.clone()));
-    assert_eq!(
-        stream.next().await,
-        Some(Ok(StreamPart::Content("first".into())))
-    );
-    cancel.cancel();
+    let run = support::cancel_run(false).await;
+    let mut stream = run.stream;
+    run.cancel.cancel();
     assert_eq!(
         stream.next().await,
         None,
@@ -234,8 +207,7 @@ async fn a_body_without_done_ends_as_closed_without_finish() {
         Step::Chunk(" answer.".into()),
     ]))
     .await;
-    let client = client_for(&mock.base_url);
-    let (parts, error) = drain_parts(client.stream(request(false), CancellationToken::new())).await;
+    let (parts, error) = stream_parts(&mock, false).await;
     assert_eq!(
         parts,
         vec![
@@ -256,7 +228,7 @@ async fn complete_returns_joined_text_and_the_usage() {
         Step::Usage(json!({"prompt_tokens": 30, "completion_tokens": 4, "total_tokens": 34})),
     ]))
     .await;
-    let client = client_for(&mock.base_url);
+    let client = support::test_client(&mock.base_url);
     let completion = client
         .complete(request(true))
         .await
@@ -276,9 +248,7 @@ async fn complete_returns_joined_text_and_the_usage() {
 #[tokio::test]
 async fn http_500_display_is_unchanged_and_detail_carries_the_body_start() {
     let mock = Mock::start(Reply::Status(500, "boom".to_string())).await;
-    let client = client_for(&mock.base_url);
-    let (_parts, error) =
-        drain_parts(client.stream(request(false), CancellationToken::new())).await;
+    let (_parts, error) = stream_parts(&mock, false).await;
     let error = error.expect("a 500 is an error item");
     // The text shown to users is exactly what it was before this change.
     assert_eq!(error.to_string(), "LLM error 500");
@@ -304,8 +274,7 @@ async fn the_recorded_live_stream_replays_with_content_usage_and_done() {
     assert!(!steps.is_empty(), "the recorded fixture is empty");
 
     let mock = Mock::start(Reply::Stream(steps)).await;
-    let client = client_for(&mock.base_url);
-    let (parts, error) = drain_parts(client.stream(request(true), CancellationToken::new())).await;
+    let (parts, error) = stream_parts(&mock, true).await;
     assert!(error.is_none(), "replay failed: {error:?}");
 
     let content: String = parts

@@ -4,131 +4,55 @@
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use trace::audio::AudioFile;
-use trace::manifest::{
-    LlmSettings, MANIFEST_FILE, Manifest, Origin, SessionStart, SpeechSettings, Timings,
-    VoiceDetector,
-};
+use trace::manifest::{MANIFEST_FILE, Origin};
 
 use trace::paths::{AUDIO_DIR, EVENTS_FILE, SESSIONS_DIR};
 use trace::record::{Body, EndReason, Record, Speaker};
-use trace::sink::{FailureSink, TraceOpener};
-use trace::writer::DiskOpener;
+use trace::sink::TraceOpener;
+use trace::testutil::{
+    Scratch, failure_sink, frame, session_start, silent_manifest, wav_samples, write_manifest,
+};
+use trace::writer::{DiskOpener, ThreadHook};
 
 // --- fixtures and helpers
 
-fn session_start() -> SessionStart {
-    SessionStart {
-        speakers: vec!["me".into(), "them".into()],
-        profile: trace::record::Profile::Manual,
-        llm: LlmSettings {
-            base_url: "http://host:8000".into(),
-            model: "m".into(),
-            max_tokens: 220,
-            temperature: 0.4,
-        },
-        speech: SpeechSettings {
-            base_url: "http://host:9000".into(),
-            model: "w".into(),
-            language: None,
-        },
-        voice_detector: VoiceDetector {
-            start_threshold: 0.5,
-            end_threshold: 0.35,
-            end_silence_frames: 19,
-            max_segment_ms: 15_000,
-        },
-        timings_ms: Timings {
-            echo_hold_ms: 700,
-            stop_wait_ms: 1500,
-            health_timeout_ms: 2000,
-            asr_timeout_ms: 15_000,
-            llm_connect_ms: 2000,
-            llm_stall_ms: 10_000,
-        },
-        compress_threshold_tokens: 90_000,
-    }
-}
-
-fn silent_manifest() -> Manifest {
-    Manifest {
-        schema: trace::manifest::SCHEMA,
-        started_at_ms: 1_791_209_002_000,
-        origin: Origin::Live,
-        speed: 1.0,
-        app_version: "0.1.0".into(),
-        git_commit: "test".into(),
-        audio: false,
-        session: session_start(),
-    }
-}
-
-fn write_manifest(dir: &Path, manifest: &Manifest) {
-    std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(
-        dir.join(MANIFEST_FILE),
-        serde_json::to_string(manifest).unwrap(),
-    )
-    .unwrap();
-}
-
-/// One speaker frame: 512 samples at 16 kHz, 32 meeting milliseconds.
-fn frame() -> Vec<f32> {
-    vec![0.1; 512]
-}
-
-/// Scratch directory per test, unique per process run.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "clueless-trace-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn failure_sink() -> (FailureSink, Arc<Mutex<Vec<String>>>) {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let sink = {
-        let seen = Arc::clone(&seen);
-        Arc::new(move |message: String| seen.lock().unwrap().push(message)) as FailureSink
-    };
-    (sink, seen)
-}
-
-fn open(data_dir: &Path, audio: bool) -> Arc<dyn trace::sink::TraceSink> {
-    let opener = DiskOpener::new(
+/// A live-like opener over `data_dir`, as every sink test opens with.
+fn disk_opener(data_dir: &Path, audio: bool) -> DiskOpener {
+    DiskOpener::new(
         data_dir,
         audio,
         Origin::Live,
         1.0,
         "0.1.0".into(),
         "test".into(),
-    );
-    opener.open(session_start(), failure_sink().0).unwrap()
+    )
+}
+
+/// A thread hook that reports entering and blocks until the returned
+/// release flag is set (for the never-block-the-meeting tests).
+fn stall_hook() -> (ThreadHook, Arc<AtomicBool>, Arc<AtomicBool>) {
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let (release_for_hook, entered_for_hook) = (Arc::clone(&release), Arc::clone(&entered));
+    let hook: ThreadHook = Arc::new(move || {
+        entered_for_hook.store(true, Ordering::SeqCst);
+        while !release_for_hook.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    (hook, release, entered)
+}
+
+fn open(data_dir: &Path, audio: bool) -> Arc<dyn trace::sink::TraceSink> {
+    disk_opener(data_dir, audio)
+        .open(session_start(), failure_sink().0)
+        .unwrap()
 }
 
 fn event_lines(dir: &Path) -> Vec<String> {
@@ -156,14 +80,6 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "condition never held: {what}");
         std::thread::sleep(Duration::from_millis(5));
     }
-}
-
-fn wav_samples(path: &Path) -> Vec<i16> {
-    hound::WavReader::open(path)
-        .unwrap()
-        .samples::<i16>()
-        .map(|s| s.unwrap())
-        .collect()
 }
 
 // --- session directories
@@ -257,14 +173,7 @@ fn a_data_dir_below_a_regular_file_fails_naming_the_path() {
     let scratch = Scratch::new("bad-dir");
     let blocker = scratch.path().join("a-file");
     std::fs::write(&blocker, b"not a directory").unwrap();
-    let opener = DiskOpener::new(
-        blocker.join("sub"),
-        false,
-        Origin::Live,
-        1.0,
-        "0.1.0".into(),
-        "test".into(),
-    );
+    let opener = disk_opener(&blocker.join("sub"), false);
     let error = match opener.open(session_start(), failure_sink().0) {
         Ok(_) => panic!("opening below a regular file must fail"),
         Err(error) => error,
@@ -461,24 +370,11 @@ fn audio_off_keeps_no_audio_directory() {
 #[test]
 fn a_stuck_audio_thread_cannot_push_out_text_records() {
     let scratch = Scratch::new("audio-flood");
-    let release = Arc::new(AtomicBool::new(false));
-    let entered = Arc::new(AtomicBool::new(false));
-    let (release_for_hook, entered_for_hook) = (release.clone(), entered.clone());
-    let opener = DiskOpener::new(
-        scratch.path(),
-        true,
-        Origin::Live,
-        1.0,
-        "0.1.0".into(),
-        "test".into(),
-    )
-    .with_audio_hook(Arc::new(move || {
-        entered_for_hook.store(true, Ordering::SeqCst);
-        while !release_for_hook.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }));
-    let sink = opener.open(session_start(), failure_sink().0).unwrap();
+    let (hook, release, entered) = stall_hook();
+    let sink = disk_opener(scratch.path(), true)
+        .with_audio_hook(hook)
+        .open(session_start(), failure_sink().0)
+        .unwrap();
     let dir = sink.location().unwrap().dir;
 
     sink.record(Body::ClockStarted);
@@ -530,24 +426,11 @@ fn a_stuck_audio_thread_cannot_push_out_text_records() {
 #[test]
 fn close_while_the_record_thread_is_held_returns_within_its_deadline() {
     let scratch = Scratch::new("close-deadline");
-    let release = Arc::new(AtomicBool::new(false));
-    let entered = Arc::new(AtomicBool::new(false));
-    let (release_for_hook, entered_for_hook) = (release.clone(), entered.clone());
-    let opener = DiskOpener::new(
-        scratch.path(),
-        false,
-        Origin::Live,
-        1.0,
-        "0.1.0".into(),
-        "test".into(),
-    )
-    .with_record_hook(Arc::new(move || {
-        entered_for_hook.store(true, Ordering::SeqCst);
-        while !release_for_hook.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }));
-    let sink = opener.open(session_start(), failure_sink().0).unwrap();
+    let (hook, release, entered) = stall_hook();
+    let sink = disk_opener(scratch.path(), false)
+        .with_record_hook(hook)
+        .open(session_start(), failure_sink().0)
+        .unwrap();
     sink.record(Body::ClockStarted);
     wait_until("the record thread entered the hook", || {
         entered.load(Ordering::SeqCst)

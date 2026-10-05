@@ -279,7 +279,9 @@ pub fn compare(a: &Trace, b: &Trace) -> Report {
     }
 }
 
-fn dir_name(dir: &Path) -> String {
+/// The last component of a directory path, for naming a trace in the
+/// report; also used by the session re-run's messages.
+pub fn dir_name(dir: &Path) -> String {
     dir.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.display().to_string())

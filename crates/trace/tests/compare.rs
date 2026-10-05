@@ -3,17 +3,13 @@
 //! `Record` values; only the `list` tests touch a scratch directory, and
 //! only their own temp directory.
 
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use trace::compare::{
     Latency, Outcome, Side, Verdict, compare, transcript_before, word_distance, words,
 };
 use trace::list::list;
-use trace::manifest::{
-    LlmSettings, MANIFEST_FILE, Manifest, Origin, SessionStart, SpeechSettings, Timings,
-    VoiceDetector,
-};
+use trace::manifest::Manifest;
 use trace::paths::RUNS_DIR;
 use trace::reader::Trace;
 use trace::record::{
@@ -21,69 +17,9 @@ use trace::record::{
     Speaker, SuggestionOrigin, SuggestionOutcome,
 };
 use trace::show::show;
+use trace::testutil::{self, Scratch, manifest_with_speed, push, trace_named};
 
 // --- in-memory trace builders
-
-fn session_start() -> SessionStart {
-    SessionStart {
-        speakers: vec!["me".into(), "them".into()],
-        profile: Profile::Manual,
-        llm: LlmSettings {
-            base_url: "http://host:8000".into(),
-            model: "m".into(),
-            max_tokens: 220,
-            temperature: 0.4,
-        },
-        speech: SpeechSettings {
-            base_url: "http://host:9000".into(),
-            model: "w".into(),
-            language: None,
-        },
-        voice_detector: VoiceDetector {
-            start_threshold: 0.5,
-            end_threshold: 0.35,
-            end_silence_frames: 19,
-            max_segment_ms: 15_000,
-        },
-        timings_ms: Timings {
-            echo_hold_ms: 700,
-            stop_wait_ms: 1500,
-            health_timeout_ms: 2000,
-            asr_timeout_ms: 15_000,
-            llm_connect_ms: 2000,
-            llm_stall_ms: 10_000,
-        },
-        compress_threshold_tokens: 90_000,
-    }
-}
-
-fn manifest_with_speed(speed: f64) -> Manifest {
-    Manifest {
-        schema: trace::manifest::SCHEMA,
-        started_at_ms: 1_791_209_002_000,
-        origin: Origin::Live,
-        speed,
-        app_version: "0.1.0".into(),
-        git_commit: "test".into(),
-        audio: false,
-        session: session_start(),
-    }
-}
-
-/// An in-memory trace: `seq` numbers itself from the push order.
-fn push(records: &mut Vec<Record>, at_ms: u64, body: Body) {
-    let seq = records.len() as u64 + 1;
-    records.push(Record { seq, at_ms, body });
-}
-
-fn trace_named(name: &str, speed: f64, records: Vec<Record>) -> Trace {
-    Trace {
-        dir: PathBuf::from("/nonexistent").join(name),
-        manifest: manifest_with_speed(speed),
-        records,
-        cut_off: false,
-    }
-}
 
 /// A meeting clock at `at_ms`, the start of every fixture trace.
 fn clock(records: &mut Vec<Record>, at_ms: u64) {
@@ -428,31 +364,26 @@ fn manual_suggestions_pair_first_with_first() {
     assert!(report.only_a.is_empty() && report.only_b.is_empty());
 }
 
+/// A trace with one automatic suggestion at `at_ms` (pairing tests).
+fn auto_suggestion_trace(name: &str, at_ms: u64, answer: Answer) -> Trace {
+    let mut records = Vec::new();
+    clock(&mut records, 0);
+    suggestion(
+        &mut records,
+        1,
+        at_ms,
+        SuggestionOrigin::Auto,
+        Profile::Interview,
+        answer,
+    );
+    trace_named(name, 1.0, records)
+}
+
 #[test]
 fn automatic_suggestions_four_seconds_apart_pair() {
-    let mut a_records = Vec::new();
-    clock(&mut a_records, 0);
-    suggestion(
-        &mut a_records,
-        1,
-        10_000,
-        SuggestionOrigin::Auto,
-        Profile::Interview,
-        Answer::Text("a"),
-    );
-    let mut b_records = Vec::new();
-    clock(&mut b_records, 0);
-    suggestion(
-        &mut b_records,
-        1,
-        14_000,
-        SuggestionOrigin::Auto,
-        Profile::Interview,
-        Answer::Text("b"),
-    );
     let report = compare(
-        &trace_named("A", 1.0, a_records),
-        &trace_named("B", 1.0, b_records),
+        &auto_suggestion_trace("A", 10_000, Answer::Text("a")),
+        &auto_suggestion_trace("B", 14_000, Answer::Text("b")),
     );
     assert_eq!(report.pairs.len(), 1);
     assert_eq!(report.pairs[0].a.meeting_ms, 10_000);
@@ -462,29 +393,9 @@ fn automatic_suggestions_four_seconds_apart_pair() {
 
 #[test]
 fn automatic_suggestions_fifteen_seconds_apart_stay_unpaired() {
-    let mut a_records = Vec::new();
-    clock(&mut a_records, 0);
-    suggestion(
-        &mut a_records,
-        1,
-        10_000,
-        SuggestionOrigin::Auto,
-        Profile::Interview,
-        Answer::Text("a"),
-    );
-    let mut b_records = Vec::new();
-    clock(&mut b_records, 0);
-    suggestion(
-        &mut b_records,
-        1,
-        25_000,
-        SuggestionOrigin::Auto,
-        Profile::Interview,
-        Answer::Text("b"),
-    );
     let report = compare(
-        &trace_named("A", 1.0, a_records),
-        &trace_named("B", 1.0, b_records),
+        &auto_suggestion_trace("A", 10_000, Answer::Text("a")),
+        &auto_suggestion_trace("B", 25_000, Answer::Text("b")),
     );
     assert!(report.pairs.is_empty());
     assert_eq!(report.only_a.len(), 1);
@@ -667,46 +578,15 @@ fn transcript_before_cuts_to_the_last_max_chars_characters() {
 
 // --- list
 
-/// Scratch directory per test, unique per process run; only these tests
-/// touch disk, each only inside its own directory.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "clueless-trace-list-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
+/// Write the fixture manifest started at `started_at_ms` into `dir`.
 fn write_manifest(dir: &Path, started_at_ms: u64) {
-    std::fs::create_dir_all(dir).unwrap();
-    let manifest = Manifest {
-        started_at_ms,
-        ..manifest_with_speed(1.0)
-    };
-    std::fs::write(
-        dir.join(MANIFEST_FILE),
-        serde_json::to_string(&manifest).unwrap(),
-    )
-    .unwrap();
+    testutil::write_manifest(
+        dir,
+        &Manifest {
+            started_at_ms,
+            ..manifest_with_speed(1.0)
+        },
+    );
 }
 
 fn write_events(dir: &Path, records: &[Record]) {

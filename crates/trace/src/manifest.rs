@@ -131,6 +131,7 @@ fn strip_query(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::session_start;
 
     #[test]
     fn redact_url_replaces_userinfo_with_stars() {
@@ -155,36 +156,13 @@ mod tests {
 
     #[test]
     fn manifest_round_trips_and_locks_the_schema() {
-        let session = SessionStart {
-            speakers: vec!["me".into(), "them".into()],
-            profile: Profile::Interview,
-            llm: LlmSettings {
-                base_url: "http://***@host:8000".into(),
-                model: "gpt-test".into(),
-                max_tokens: 220,
-                temperature: 0.4,
-            },
-            speech: SpeechSettings {
-                base_url: "http://host:9000".into(),
-                model: "whisper-1".into(),
-                language: None,
-            },
-            voice_detector: VoiceDetector {
-                start_threshold: 0.5,
-                end_threshold: 0.35,
-                end_silence_frames: 19,
-                max_segment_ms: 15000,
-            },
-            timings_ms: Timings {
-                echo_hold_ms: 700,
-                stop_wait_ms: 1500,
-                health_timeout_ms: 2000,
-                asr_timeout_ms: 15000,
-                llm_connect_ms: 2000,
-                llm_stall_ms: 10000,
-            },
-            compress_threshold_tokens: 90_000,
-        };
+        // The shared fixture with an Interview profile and a redacted
+        // base url, so round-tripping exercises those spellings too.
+        let mut session = session_start();
+        session.profile = Profile::Interview;
+        session.llm.base_url = "http://***@host:8000".into();
+        session.llm.model = "gpt-test".into();
+        session.speech.model = "whisper-1".into();
         let manifest = Manifest {
             schema: SCHEMA,
             started_at_ms: 1791209002000,

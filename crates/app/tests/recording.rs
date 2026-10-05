@@ -14,7 +14,7 @@ use trace::record::{Body, Record};
 mod common;
 
 use common::{
-    TempDir, fixture, run_with_log, spawn_asr_mock, spawn_counting_llm_mock, spawn_llm_mock,
+    TempDir, fixture, mock_home, run_with_log, spawn_asr_mock, spawn_counting_llm_mock,
     workspace_root,
 };
 
@@ -36,6 +36,33 @@ async fn replay(dir: &TempDir, args: &[&Path]) -> common::Run {
     let run = run_with_log(&workspace_root(), &full, &log, Duration::from_secs(120)).await;
     let _ = std::fs::remove_file(&log);
     run
+}
+
+/// Replay the question fixture at speed 10, with `extra` arguments added
+/// before the replay flags (so a later `--data-dir` still wins).
+async fn replay_question(dir: &TempDir, extra: &[&Path]) -> common::Run {
+    let wav = fixture("en_question.wav");
+    let mut args: Vec<&Path> = extra.to_vec();
+    args.extend([
+        Path::new("--replay"),
+        &wav,
+        Path::new("--speed"),
+        Path::new("10"),
+    ]);
+    replay(dir, &args).await
+}
+
+/// The same replay with `--ask` added.
+async fn replay_ask(dir: &TempDir) -> common::Run {
+    replay_question(dir, &[Path::new("--ask")]).await
+}
+
+/// Write a config with this `[trace]` body and replay the question fixture
+/// at speed 10 with it.
+async fn replay_with_trace(dir: &TempDir, trace_body: &str) -> common::Run {
+    let config = dir.join("config.toml");
+    std::fs::write(&config, format!("[trace]\n{trace_body}")).expect("config written");
+    replay_question(dir, &[Path::new("--config"), &config]).await
 }
 
 /// The session directories currently under `data_dir/sessions`.
@@ -86,22 +113,9 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
 /// that pins what ran, and an events file closed by an `end` record.
 #[tokio::test]
 async fn replay_records_one_session_dir_with_manifest_and_end_record() {
-    let dir = TempDir::new("rec-basic");
-    let asr = spawn_asr_mock("hello there").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
+    let m = mock_home("rec-basic", "hello there", &["unused"]).await;
 
-    let wav = fixture("en_question.wav");
-    let run = replay(
-        &dir,
-        &[
-            Path::new("--replay"),
-            &wav,
-            Path::new("--speed"),
-            Path::new("10"),
-        ],
-    )
-    .await;
+    let run = replay_question(&m.dir, &[]).await;
     let out = &run.output;
     assert_eq!(
         out.status.code(),
@@ -155,26 +169,10 @@ async fn replay_records_one_session_dir_with_manifest_and_end_record() {
 /// line says so.
 #[tokio::test]
 async fn audio_switch_on_writes_speaker_wavs_and_the_status_says_with_audio() {
-    let dir = TempDir::new("rec-audio");
-    let asr = spawn_asr_mock("hello there").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let config = dir.join("config.toml");
-    std::fs::write(&config, "[trace]\naudio = true\n").expect("config written");
+    let m = mock_home("rec-audio", "hello there", &["unused"]).await;
 
     let wav = fixture("en_question.wav");
-    let run = replay(
-        &dir,
-        &[
-            Path::new("--config"),
-            &config,
-            Path::new("--replay"),
-            &wav,
-            Path::new("--speed"),
-            Path::new("10"),
-        ],
-    )
-    .await;
+    let run = replay_with_trace(&m.dir, "audio = true\n").await;
     assert_eq!(run.output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&run.output.stderr);
     let line = stderr
@@ -201,26 +199,9 @@ async fn audio_switch_on_writes_speaker_wavs_and_the_status_says_with_audio() {
 /// `[trace] enabled = false` records nothing and says nothing about it.
 #[tokio::test]
 async fn trace_disabled_writes_no_session_and_no_recording_status() {
-    let dir = TempDir::new("rec-disabled");
-    let asr = spawn_asr_mock("hello there").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let config = dir.join("config.toml");
-    std::fs::write(&config, "[trace]\nenabled = false\n").expect("config written");
+    let m = mock_home("rec-disabled", "hello there", &["unused"]).await;
 
-    let wav = fixture("en_question.wav");
-    let run = replay(
-        &dir,
-        &[
-            Path::new("--config"),
-            &config,
-            Path::new("--replay"),
-            &wav,
-            Path::new("--speed"),
-            Path::new("10"),
-        ],
-    )
-    .await;
+    let run = replay_with_trace(&m.dir, "enabled = false\n").await;
     assert_eq!(run.output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&run.output.stderr);
     assert!(
@@ -241,25 +222,15 @@ async fn trace_disabled_writes_no_session_and_no_recording_status() {
 /// and end records under one call id.
 #[tokio::test]
 async fn ask_records_one_llm_request_and_one_llm_end() {
-    let dir = TempDir::new("rec-ask");
-    let asr = spawn_asr_mock("hello there").await;
-    let (llm, calls) = spawn_counting_llm_mock(&["mock ", "answer"]).await;
-    common::write_mock_env(&dir, llm, asr);
+    let m = mock_home("rec-ask", "hello there", &["mock ", "answer"]).await;
 
-    let wav = fixture("en_question.wav");
-    let run = replay(
-        &dir,
-        &[
-            Path::new("--replay"),
-            &wav,
-            Path::new("--speed"),
-            Path::new("10"),
-            Path::new("--ask"),
-        ],
-    )
-    .await;
+    let run = replay_ask(&m.dir).await;
     assert_eq!(run.output.status.code(), Some(0));
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "one chat request was sent");
+    assert_eq!(
+        m.llm_calls.load(Ordering::SeqCst),
+        1,
+        "one chat request was sent"
+    );
 
     let session = only_session(&run);
     let trace = reader::read(&session).expect("the session reads back");
@@ -306,18 +277,7 @@ async fn no_trace_file_contains_an_api_key() {
     )
     .expect("env file written");
 
-    let wav = fixture("en_question.wav");
-    let run = replay(
-        &dir,
-        &[
-            Path::new("--replay"),
-            &wav,
-            Path::new("--speed"),
-            Path::new("10"),
-            Path::new("--ask"),
-        ],
-    )
-    .await;
+    let run = replay_ask(&dir).await;
     assert_eq!(run.output.status.code(), Some(0));
     let files = files_under(&run.data_dir);
     assert!(!files.is_empty(), "the run wrote files");
@@ -336,28 +296,13 @@ async fn no_trace_file_contains_an_api_key() {
 /// status line; the meeting itself runs unrecorded (C-trace-failure-isolated).
 #[tokio::test]
 async fn a_data_dir_below_a_regular_file_warns_and_the_replay_still_runs() {
-    let dir = TempDir::new("rec-bad-dir");
-    let asr = spawn_asr_mock("hello there").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let blocker = dir.join("blocker");
+    let m = mock_home("rec-bad-dir", "hello there", &["unused"]).await;
+    let blocker = m.dir.join("blocker");
     std::fs::write(&blocker, "not a directory").expect("regular file");
     let bad = blocker.join("sub");
 
-    let wav = fixture("en_question.wav");
     // After the helper's own --data-dir, so this one wins.
-    let run = replay(
-        &dir,
-        &[
-            Path::new("--data-dir"),
-            &bad,
-            Path::new("--replay"),
-            &wav,
-            Path::new("--speed"),
-            Path::new("10"),
-        ],
-    )
-    .await;
+    let run = replay_question(&m.dir, &[Path::new("--data-dir"), &bad]).await;
     assert_eq!(run.output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&run.output.stderr);
     assert!(
@@ -407,12 +352,9 @@ async fn inspect_modes_run_without_environment() {
 /// path in the message after the settings loaded.
 #[tokio::test]
 async fn replay_session_names_the_missing_session() {
-    let dir = TempDir::new("rec-rerun-missing");
-    let asr = spawn_asr_mock("unused").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
+    let m = mock_home("rec-rerun-missing", "unused", &["unused"]).await;
 
-    let run = replay(&dir, &[Path::new("--replay-session"), Path::new("nope")]).await;
+    let run = replay(&m.dir, &[Path::new("--replay-session"), Path::new("nope")]).await;
     assert_eq!(run.output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&run.output.stderr);
     assert!(

@@ -5,18 +5,15 @@
 
 mod support;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use clueless_types::config::LlmConfig;
 use engine::judge::{JudgeConfig, judge_pair, judge_report, judge_report_from_config};
 use llm::client::LlmClient;
 use trace::compare::{JUDGE_CONTEXT_CHARS, Outcome, Pair, Report, Side, Suggestion, Verdict};
-use trace::manifest::{
-    LlmSettings, Manifest, Origin, SessionStart, SpeechSettings, Timings, VoiceDetector,
-};
 use trace::reader::Trace;
 use trace::record::{Body, Profile, Record, Speaker, SuggestionOrigin};
+use trace::testutil::{push, trace_named};
 
 use support::{LlmReply, MockLlm};
 
@@ -58,76 +55,25 @@ async fn judge(
 
 // ------------------------------------------------------ baseline traces
 
-fn session_start() -> SessionStart {
-    SessionStart {
-        speakers: vec!["me".into(), "them".into()],
-        profile: Profile::Manual,
-        llm: LlmSettings {
-            base_url: "http://host:8000".into(),
-            model: "m".into(),
-            max_tokens: 220,
-            temperature: 0.4,
-        },
-        speech: SpeechSettings {
-            base_url: "http://host:9000".into(),
-            model: "w".into(),
-            language: None,
-        },
-        voice_detector: VoiceDetector {
-            start_threshold: 0.5,
-            end_threshold: 0.35,
-            end_silence_frames: 19,
-            max_segment_ms: 15_000,
-        },
-        timings_ms: Timings {
-            echo_hold_ms: 700,
-            stop_wait_ms: 1500,
-            health_timeout_ms: 2000,
-            asr_timeout_ms: 15_000,
-            llm_connect_ms: 2000,
-            llm_stall_ms: 10_000,
-        },
-        compress_threshold_tokens: 90_000,
-    }
-}
-
 /// An in-memory baseline trace with `Me:` finals at the given meeting
 /// times; the judge only reads finals.
 fn baseline(finals: &[(u64, &str)]) -> Trace {
     let mut records: Vec<Record> = Vec::new();
-    records.push(Record {
-        seq: 1,
-        at_ms: 0,
-        body: Body::ClockStarted,
-    });
+    push(&mut records, 0, Body::ClockStarted);
     for (index, (t0_ms, text)) in finals.iter().enumerate() {
-        records.push(Record {
-            seq: index as u64 + 2,
-            at_ms: *t0_ms,
-            body: Body::TranscriptFinal {
+        push(
+            &mut records,
+            *t0_ms,
+            Body::TranscriptFinal {
                 speaker: Speaker::Me,
                 utterance: index as u64 + 1,
                 t0_ms: *t0_ms,
                 t1_ms: t0_ms + 500,
                 text: text.to_string(),
             },
-        });
+        );
     }
-    Trace {
-        dir: PathBuf::from("/nonexistent").join("baseline"),
-        manifest: Manifest {
-            schema: trace::manifest::SCHEMA,
-            started_at_ms: 1_791_209_002_000,
-            origin: Origin::Live,
-            speed: 1.0,
-            app_version: "0.1.0".into(),
-            git_commit: "test".into(),
-            audio: false,
-            session: session_start(),
-        },
-        records,
-        cut_off: false,
-    }
+    trace_named("baseline", 1.0, records)
 }
 
 // ------------------------------------------------------------- reports
@@ -219,40 +165,38 @@ async fn a_json_answer_wrapped_in_prose_is_read() {
     assert_eq!(verdict, Verdict::Winner(Side::B, "x".to_string()));
 }
 
-#[tokio::test]
-async fn an_answer_without_json_is_not_judged() {
+/// Mock one `reply`, judge a single pair and require the verdict to be
+/// `NotJudged` with a reason containing `needle`.
+async fn assert_not_judged(reply: LlmReply, needle: &str) {
     let mock = MockLlm::start().await;
-    mock.enqueue(answer("I cannot decide"));
+    mock.enqueue(reply);
     let verdict = judge(&mock, &cfg(), CONTEXT, "answer a", "answer b").await;
     match verdict {
-        Verdict::NotJudged(reason) => assert!(reason.contains("unreadable answer"), "{reason}"),
+        Verdict::NotJudged(reason) => assert!(reason.contains(needle), "{reason}"),
         other => panic!("expected NotJudged, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn an_answer_without_json_is_not_judged() {
+    assert_not_judged(answer("I cannot decide"), "unreadable answer").await;
 }
 
 #[tokio::test]
 async fn an_unknown_winner_is_not_judged() {
-    let mock = MockLlm::start().await;
-    mock.enqueue(answer(r#"{"winner":"C"}"#));
-    let verdict = judge(&mock, &cfg(), CONTEXT, "answer a", "answer b").await;
-    match verdict {
-        Verdict::NotJudged(reason) => assert!(reason.contains("unreadable answer"), "{reason}"),
-        other => panic!("expected NotJudged, got {other:?}"),
-    }
+    assert_not_judged(answer(r#"{"winner":"C"}"#), "unreadable answer").await;
 }
 
 #[tokio::test]
 async fn a_server_error_is_not_judged_and_names_the_status() {
-    let mock = MockLlm::start().await;
-    mock.enqueue(LlmReply::Http {
-        status: 500,
-        body: "boom".to_string(),
-    });
-    let verdict = judge(&mock, &cfg(), CONTEXT, "answer a", "answer b").await;
-    match verdict {
-        Verdict::NotJudged(reason) => assert!(reason.contains("500"), "{reason}"),
-        other => panic!("expected NotJudged, got {other:?}"),
-    }
+    assert_not_judged(
+        LlmReply::Http {
+            status: 500,
+            body: "boom".to_string(),
+        },
+        "500",
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------- pacing

@@ -8,14 +8,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use trace::compare::{word_distance, words};
 
 mod common;
 
 use common::{
-    TempDir, closed_port, fixture, run, run_with_log, spawn_asr_mock, spawn_counting_llm_mock,
-    spawn_llm_mock, stdout_lines, workspace_root, write_mock_env,
+    TempDir, closed_port, fixture, mock_home, run, run_with_log, spawn_llm_mock, stdout_lines,
+    write_mock_env,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_clueless");
@@ -60,6 +61,44 @@ fn write_live_env(dir: &TempDir) -> PathBuf {
     path
 }
 
+/// Replay `wavs` with the env file, `extra` flags after the wavs, and the
+/// run limit.
+async fn run_replay(
+    config: &Path,
+    wavs: &[&Path],
+    extra: &[&Path],
+    limit: Duration,
+) -> std::process::Output {
+    let mut args: Vec<&Path> = vec![Path::new("--env-file"), config, Path::new("--replay")];
+    args.extend_from_slice(wavs);
+    args.extend_from_slice(extra);
+    run(&args, limit).await
+}
+
+/// A mock replay at speed 20 with `extra` flags after the wavs, asserted to
+/// exit 0 (every mock-server scenario that reaches the end does).
+async fn run_replay_fast(config: &Path, wavs: &[&Path], extra: &[&Path]) -> std::process::Output {
+    let mut speed: Vec<&Path> = vec![Path::new("--speed"), Path::new("20")];
+    speed.extend_from_slice(extra);
+    let out = run_replay(config, wavs, &speed, Duration::from_secs(120)).await;
+    assert_eq!(out.status.code(), Some(0));
+    out
+}
+
+/// The binary directly (no temp HOME or data dir), with these arguments plus
+/// a throwaway `--log-file` inside `dir`.
+fn run_raw(dir: &TempDir, args: &[&Path]) -> std::process::Output {
+    let mut command = std::process::Command::new(BIN);
+    for arg in args {
+        command.arg(arg);
+    }
+    command
+        .arg("--log-file")
+        .arg(dir.join("log.txt"))
+        .output()
+        .expect("binary runs")
+}
+
 fn transcript_speaker(line: &str) -> &str {
     if line[8..].starts_with("Me: ") {
         "Me"
@@ -72,18 +111,21 @@ fn transcript_text(line: &str) -> &str {
     line[8..].split_once(": ").map_or("", |(_, text)| text)
 }
 
+/// Replay the conversation fixture at speed 10 with `extra` arguments added.
+async fn replay_conversation(env_file: &Path, extra: &[&Path]) -> std::process::Output {
+    let me = fixture("conv_me.wav");
+    let them = fixture("conv_them.wav");
+    let mut speed: Vec<&Path> = vec![Path::new("--speed"), Path::new("10")];
+    speed.extend_from_slice(extra);
+    run_replay(env_file, &[&me, &them], &speed, Duration::from_secs(120)).await
+}
+
 // ----------------------------------------------------------- integration
 
 #[test]
 fn config_pointing_at_a_missing_file_exits_2_naming_the_path() {
     let dir = TempDir::new("cfg-missing");
-    let out = std::process::Command::new(BIN)
-        .arg("--config")
-        .arg(dir.join("nope.toml"))
-        .arg("--log-file")
-        .arg(dir.join("log.txt"))
-        .output()
-        .expect("binary runs");
+    let out = run_raw(&dir, &[Path::new("--config"), &dir.join("nope.toml")]);
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("nope.toml"), "stderr: {stderr}");
@@ -93,16 +135,8 @@ fn config_pointing_at_a_missing_file_exits_2_naming_the_path() {
 async fn replay_with_a_missing_wav_exits_2_naming_the_file() {
     let dir = TempDir::new("wav-missing");
     let config = write_mock_env(&dir, 1, 1);
-    let out = run(
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &dir.join("missing.wav"),
-        ],
-        std::time::Duration::from_secs(30),
-    )
-    .await;
+    let missing = dir.join("missing.wav");
+    let out = run_replay(&config, &[&missing], &[], Duration::from_secs(30)).await;
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("missing.wav"), "stderr: {stderr}");
@@ -155,19 +189,8 @@ fn the_lock_helper_rejects_a_second_holder_naming_the_path() {
 async fn replay_with_only_a_me_file_never_mentions_system_audio() {
     let dir = TempDir::new("me-only");
     let config = write_mock_env(&dir, 1, closed_port().await);
-    let out = run(
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &fixture("conv_me.wav"),
-            std::path::Path::new("--speed"),
-            std::path::Path::new("20"),
-        ],
-        std::time::Duration::from_secs(120),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(0));
+    let me = fixture("conv_me.wav");
+    let out = run_replay_fast(&config, &[&me], &[]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("SystemAudio"),
@@ -177,21 +200,14 @@ async fn replay_with_only_a_me_file_never_mentions_system_audio() {
 
 #[tokio::test]
 async fn replay_of_the_conversation_prints_only_transcript_lines() {
-    let dir = TempDir::new("conv");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    let config = write_mock_env(&dir, llm, asr);
-    let out = run(
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &fixture("conv_me.wav"),
-            &fixture("conv_them.wav"),
-            std::path::Path::new("--speed"),
-            std::path::Path::new("10"),
-        ],
-        std::time::Duration::from_secs(120),
+    let m = mock_home("conv", "mock words", &["unused"]).await;
+    let me = fixture("conv_me.wav");
+    let them = fixture("conv_them.wav");
+    let out = run_replay(
+        &m.env,
+        &[&me, &them],
+        &[Path::new("--speed"), Path::new("10")],
+        Duration::from_secs(120),
     )
     .await;
     assert_eq!(out.status.code(), Some(0));
@@ -214,24 +230,9 @@ async fn replay_of_the_conversation_prints_only_transcript_lines() {
 
 #[tokio::test]
 async fn ask_appends_the_mock_suggestion_after_its_header() {
-    let dir = TempDir::new("ask");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["mock ", "answer"]).await;
-    let config = write_mock_env(&dir, llm, asr);
-    let out = run(
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &fixture("conv_me.wav"),
-            std::path::Path::new("--speed"),
-            std::path::Path::new("20"),
-            std::path::Path::new("--ask"),
-        ],
-        std::time::Duration::from_secs(120),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(0));
+    let m = mock_home("ask", "mock words", &["mock ", "answer"]).await;
+    let me = fixture("conv_me.wav");
+    let out = run_replay_fast(&m.env, &[&me], &[Path::new("--ask")]).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.ends_with("--- suggestion ---\nmock answer\n"),
@@ -242,26 +243,10 @@ async fn ask_appends_the_mock_suggestion_after_its_header() {
 /// A transcription answer the Interview profile treats as a real question.
 const QUESTION_TEXT: &str = "what is the status of the release?";
 
-/// Replay the conversation fixture at speed 10 with `extra` arguments added.
-async fn replay_conversation(env_file: &Path, extra: &[&Path]) -> std::process::Output {
-    let mut args: Vec<&Path> = vec![Path::new("--env-file"), env_file, Path::new("--replay")];
-    let me = fixture("conv_me.wav");
-    let them = fixture("conv_them.wav");
-    args.push(&me);
-    args.push(&them);
-    args.push(Path::new("--speed"));
-    args.push(Path::new("10"));
-    args.extend_from_slice(extra);
-    run(&args, std::time::Duration::from_secs(120)).await
-}
-
 #[tokio::test]
 async fn profile_interview_prints_automatic_answers_between_the_transcript_lines() {
-    let dir = TempDir::new("profile-interview");
-    let asr = spawn_asr_mock(QUESTION_TEXT).await;
-    let (llm, calls) = spawn_counting_llm_mock(&["mock ", "answer"]).await;
-    let config = write_mock_env(&dir, llm, asr);
-    let out = replay_conversation(&config, &[Path::new("--profile"), Path::new("interview")]).await;
+    let m = mock_home("profile-interview", QUESTION_TEXT, &["mock ", "answer"]).await;
+    let out = replay_conversation(&m.env, &[Path::new("--profile"), Path::new("interview")]).await;
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -299,7 +284,7 @@ async fn profile_interview_prints_automatic_answers_between_the_transcript_lines
         );
     }
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        m.llm_calls.load(Ordering::SeqCst),
         headers.len(),
         "one chat request per printed answer"
     );
@@ -307,13 +292,13 @@ async fn profile_interview_prints_automatic_answers_between_the_transcript_lines
 
 #[tokio::test]
 async fn profile_interview_with_a_pass_answer_prints_only_transcript_lines() {
-    let dir = TempDir::new("profile-pass");
-    let asr = spawn_asr_mock(QUESTION_TEXT).await;
-    let (llm, calls) = spawn_counting_llm_mock(&["PASS"]).await;
-    let config = write_mock_env(&dir, llm, asr);
-    let out = replay_conversation(&config, &[Path::new("--profile"), Path::new("interview")]).await;
+    let m = mock_home("profile-pass", QUESTION_TEXT, &["PASS"]).await;
+    let out = replay_conversation(&m.env, &[Path::new("--profile"), Path::new("interview")]).await;
     assert_eq!(out.status.code(), Some(0));
-    assert!(calls.load(Ordering::SeqCst) >= 1, "the profile did ask");
+    assert!(
+        m.llm_calls.load(Ordering::SeqCst) >= 1,
+        "the profile did ask"
+    );
     let lines = stdout_lines(&out);
     assert!(!lines.is_empty());
     for line in &lines {
@@ -326,12 +311,9 @@ async fn profile_interview_with_a_pass_answer_prints_only_transcript_lines() {
 
 #[tokio::test]
 async fn profile_interview_with_ask_ends_after_the_asked_answer() {
-    let dir = TempDir::new("profile-ask");
-    let asr = spawn_asr_mock(QUESTION_TEXT).await;
-    let (llm, calls) = spawn_counting_llm_mock(&["mock ", "answer"]).await;
-    let config = write_mock_env(&dir, llm, asr);
+    let m = mock_home("profile-ask", QUESTION_TEXT, &["mock ", "answer"]).await;
     let out = replay_conversation(
-        &config,
+        &m.env,
         &[
             Path::new("--profile"),
             Path::new("interview"),
@@ -346,7 +328,7 @@ async fn profile_interview_with_ask_ends_after_the_asked_answer() {
         "stdout ends with the asked answer: {stdout}"
     );
     assert!(
-        calls.load(Ordering::SeqCst) >= 2,
+        m.llm_calls.load(Ordering::SeqCst) >= 2,
         "at least one automatic request plus the asked one"
     );
 }
@@ -354,15 +336,15 @@ async fn profile_interview_with_ask_ends_after_the_asked_answer() {
 #[test]
 fn an_unknown_profile_exits_2_and_names_the_three_valid_ones() {
     let dir = TempDir::new("profile-unknown");
-    let out = std::process::Command::new(BIN)
-        .arg("--replay")
-        .arg(fixture("conv_me.wav"))
-        .arg("--profile")
-        .arg("coach")
-        .arg("--log-file")
-        .arg(dir.join("log.txt"))
-        .output()
-        .expect("binary runs");
+    let out = run_raw(
+        &dir,
+        &[
+            Path::new("--replay"),
+            fixture("conv_me.wav").as_path(),
+            Path::new("--profile"),
+            Path::new("coach"),
+        ],
+    );
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     for name in ["manual", "interview", "brainstorm"] {
@@ -372,15 +354,16 @@ fn an_unknown_profile_exits_2_and_names_the_three_valid_ones() {
 
 #[tokio::test]
 async fn the_config_files_start_profile_does_not_apply_to_replay() {
-    let dir = TempDir::new("profile-config");
-    let asr = spawn_asr_mock(QUESTION_TEXT).await;
-    let (llm, calls) = spawn_counting_llm_mock(&["mock answer"]).await;
-    let env = write_mock_env(&dir, llm, asr);
-    let toml = dir.join("config.toml");
+    let m = mock_home("profile-config", QUESTION_TEXT, &["mock answer"]).await;
+    let toml = m.dir.join("config.toml");
     std::fs::write(&toml, "[assist]\nstart_profile = \"interview\"\n").expect("config written");
-    let out = replay_conversation(&env, &[Path::new("--config"), &toml]).await;
+    let out = replay_conversation(&m.env, &[Path::new("--config"), &toml]).await;
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "replay runs in Manual");
+    assert_eq!(
+        m.llm_calls.load(Ordering::SeqCst),
+        0,
+        "replay runs in Manual"
+    );
     for line in stdout_lines(&out) {
         assert!(
             common::is_transcript_line(&line),
@@ -394,20 +377,9 @@ async fn replay_with_the_asr_server_down_exits_zero_with_an_offline_status() {
     let dir = TempDir::new("asr-down");
     let llm = spawn_llm_mock(&["unused"]).await;
     let config = write_mock_env(&dir, llm, closed_port().await);
-    let out = run(
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &fixture("conv_me.wav"),
-            &fixture("conv_them.wav"),
-            std::path::Path::new("--speed"),
-            std::path::Path::new("20"),
-        ],
-        std::time::Duration::from_secs(120),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(0));
+    let me = fixture("conv_me.wav");
+    let them = fixture("conv_them.wav");
+    let out = run_replay_fast(&config, &[&me, &them], &[]).await;
     assert!(
         String::from_utf8_lossy(&out.stdout).is_empty(),
         "no transcript lines without ASR"
@@ -425,26 +397,46 @@ fn live_enabled() -> bool {
     std::env::var("LIVE_SERVER").is_ok_and(|value| value == "1")
 }
 
+/// Live-replay `wavs`, assert exit 0, and hand back the output.
+async fn live_replay(tag: &str, wavs: &[&Path], limit: Duration) -> std::process::Output {
+    let dir = TempDir::new(tag);
+    let config = write_live_env(&dir);
+    let out = run_replay(&config, wavs, &[], limit).await;
+    assert_eq!(out.status.code(), Some(0));
+    out
+}
+
+/// The same for scenarios that also read the binary's log file; returns the
+/// output and the log text.
+async fn live_replay_logged(
+    tag: &str,
+    wavs: &[&Path],
+    extra: &[&Path],
+    limit: Duration,
+) -> (std::process::Output, String) {
+    let dir = TempDir::new(tag);
+    let config = write_live_env(&dir);
+    let log = dir.join("clueless.log");
+    let mut args: Vec<&Path> = vec![Path::new("--env-file"), &config, Path::new("--replay")];
+    args.extend_from_slice(wavs);
+    args.extend_from_slice(extra);
+    let out = run_with_log(&common::workspace_root(), &args, &log, limit)
+        .await
+        .output;
+    assert_eq!(out.status.code(), Some(0));
+    let log_text = std::fs::read_to_string(&log).expect("the log file exists");
+    (out, log_text)
+}
+
 #[tokio::test]
 #[ignore = "needs reachable servers; run with LIVE_SERVER=1"]
 async fn live_replay_reproduces_every_expected_conversation_line() {
     if !live_enabled() {
         return;
     }
-    let dir = TempDir::new("e2e-conv");
-    let config = write_live_env(&dir);
-    let out = run(
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &fixture("conv_me.wav"),
-            &fixture("conv_them.wav"),
-        ],
-        std::time::Duration::from_secs(420),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(0));
+    let me = fixture("conv_me.wav");
+    let them = fixture("conv_them.wav");
+    let out = live_replay("e2e-conv", &[&me, &them], Duration::from_secs(420)).await;
     let lines = stdout_lines(&out);
     for (speaker, expected) in expected_lines("conv.txt") {
         let same_speaker: Vec<&String> = lines
@@ -473,19 +465,8 @@ async fn live_monologue_yields_finals_without_repeated_joins() {
     if !live_enabled() {
         return;
     }
-    let dir = TempDir::new("e2e-mono");
-    let config = write_live_env(&dir);
-    let out = run(
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &fixture("monologue_40s.wav"),
-        ],
-        std::time::Duration::from_secs(300),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(0));
+    let mono = fixture("monologue_40s.wav");
+    let out = live_replay("e2e-mono", &[&mono], Duration::from_secs(300)).await;
     let texts: Vec<String> = stdout_lines(&out)
         .iter()
         .map(|line| transcript_text(line).to_string())
@@ -514,20 +495,9 @@ async fn live_echo_of_them_never_transcribes_as_me() {
     if !live_enabled() {
         return;
     }
-    let dir = TempDir::new("e2e-echo");
-    let config = write_live_env(&dir);
-    let out = run(
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &fixture("echo_me.wav"),
-            &fixture("conv_them.wav"),
-        ],
-        std::time::Duration::from_secs(420),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(0));
+    let echo = fixture("echo_me.wav");
+    let them = fixture("conv_them.wav");
+    let out = live_replay("e2e-echo", &[&echo, &them], Duration::from_secs(420)).await;
     let lines = stdout_lines(&out);
     assert!(
         lines.iter().any(|line| transcript_speaker(line) == "Them"),
@@ -545,24 +515,15 @@ async fn live_ask_on_french_answers_and_logs_the_first_delta() {
     if !live_enabled() {
         return;
     }
-    let dir = TempDir::new("e2e-fr");
-    let config = write_live_env(&dir);
-    let log = dir.join("clueless.log");
-    let out = run_with_log(
-        &workspace_root(),
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &fixture("fr_question.wav"),
-            std::path::Path::new("--ask"),
-        ],
-        &log,
-        std::time::Duration::from_secs(180),
+    let question = fixture("fr_question.wav");
+    let (_out, log_text) = live_replay_logged(
+        "e2e-fr",
+        &[&question],
+        &[Path::new("--ask")],
+        Duration::from_secs(180),
     )
-    .await
-    .output;
-    assert_eq!(out.status.code(), Some(0));
+    .await;
+    let out = _out;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let suggestion = stdout
         .split_once("--- suggestion ---\n")
@@ -575,7 +536,6 @@ async fn live_ask_on_french_answers_and_logs_the_first_delta() {
         !suggestion.to_lowercase().contains("think"),
         "no thinking text in: {suggestion}"
     );
-    let log_text = std::fs::read_to_string(&log).expect("the log file exists");
     assert!(
         log_text.contains("llm_first_delta_ms"),
         "the log shows the first-delta timing"
@@ -588,28 +548,13 @@ async fn live_silence_yields_no_lines_and_no_asr_request() {
     if !live_enabled() {
         return;
     }
-    let dir = TempDir::new("e2e-silence");
-    let config = write_live_env(&dir);
-    let log = dir.join("clueless.log");
-    let out = run_with_log(
-        &workspace_root(),
-        &[
-            std::path::Path::new("--env-file"),
-            &config,
-            std::path::Path::new("--replay"),
-            &fixture("silence_5s.wav"),
-        ],
-        &log,
-        std::time::Duration::from_secs(120),
-    )
-    .await
-    .output;
-    assert_eq!(out.status.code(), Some(0));
+    let silence = fixture("silence_5s.wav");
+    let (out, log_text) =
+        live_replay_logged("e2e-silence", &[&silence], &[], Duration::from_secs(120)).await;
     assert!(
         String::from_utf8_lossy(&out.stdout).is_empty(),
         "silence yields no transcript lines"
     );
-    let log_text = std::fs::read_to_string(&log).expect("the log file exists");
     assert!(
         !log_text.contains("asr_sent_ms"),
         "silence must never trigger an ASR request"
