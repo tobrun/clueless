@@ -15,5 +15,8 @@ pub mod paths;
 pub mod reader;
 pub mod record;
 pub mod show;
+#[macro_use]
 pub mod sink;
+#[cfg(feature = "testutil")]
+pub mod testutil;
 pub mod writer;

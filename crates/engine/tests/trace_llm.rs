@@ -8,69 +8,14 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::timeout;
-
 use clueless_types::UiEvent;
-use clueless_types::events::{EngineCommand, MeetingState, Speaker};
+use clueless_types::events::{EngineCommand, Speaker};
 use clueless_types::profile::AssistProfile;
 use engine::deps::EngineTimings;
 use trace::record::{Body, Channel, EndReason, LlmOutcome, Profile, Purpose, SuggestionOrigin};
-use trace::sink::{MemoryOpener, MemoryTrace};
+use trace::sink::MemoryOpener;
 
 use support::*;
-
-const WAIT: Duration = Duration::from_secs(8);
-
-async fn finish(h: &mut MeetingHarness) {
-    h.cmd(EngineCommand::Shutdown);
-    timeout(WAIT, &mut h.engine)
-        .await
-        .expect("engine loop returns")
-        .expect("engine task does not panic");
-}
-
-fn opener() -> Arc<MemoryOpener> {
-    Arc::new(MemoryOpener::new())
-}
-
-/// `MeetingOpts` that record through `opener`.
-fn trace_opts(opener: &Arc<MemoryOpener>) -> MeetingOpts {
-    MeetingOpts {
-        trace: Some(opener.clone()),
-        ..MeetingOpts::default()
-    }
-}
-
-fn single_trace(opener: &Arc<MemoryOpener>) -> Arc<MemoryTrace> {
-    let traces = opener.traces();
-    assert_eq!(traces.len(), 1, "exactly one trace was opened");
-    traces[0].clone()
-}
-
-fn last_bodies(trace: &Arc<MemoryTrace>) -> Vec<Body> {
-    trace.records().into_iter().map(|r| r.body).collect()
-}
-
-/// Poll the meeting's records until `done` accepts them (or the wait ends).
-async fn loop_bodies_until(
-    opener: &Arc<MemoryOpener>,
-    done: impl Fn(&Vec<Body>) -> bool,
-) -> Vec<Body> {
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let bodies = last_bodies(&single_trace(opener));
-        if done(&bodies) || tokio::time::Instant::now() >= deadline {
-            return bodies;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// True when every check finds its body at or after the one before.
-fn ordered(bodies: &[Body], checks: &[&dyn Fn(&Body) -> bool]) -> bool {
-    let mut rest = bodies.iter();
-    checks.iter().all(|check| rest.any(check))
-}
 
 fn is_request(purpose: Purpose, call: u64) -> impl Fn(&Body) -> bool {
     move |body| matches!(body, Body::LlmRequest { purpose: p, call: c, .. } if *p == purpose && *c == call)
@@ -123,6 +68,38 @@ async fn wait_end(
     }
 }
 
+/// Poll until the `llm_end` for call 1 records an `Error`, and return
+/// (outcome, error, text kept so far, all bodies seen).
+async fn wait_failed_end(
+    opener: &Arc<MemoryOpener>,
+) -> (LlmOutcome, Option<String>, String, Vec<Body>) {
+    let bodies = loop_bodies_until(opener, |bodies| {
+        bodies.iter().any(|b| {
+            matches!(
+                b,
+                Body::LlmEnd {
+                    call: 1,
+                    outcome: LlmOutcome::Error,
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+    match bodies
+        .iter()
+        .find(|b| matches!(b, Body::LlmEnd { call: 1, .. }))
+    {
+        Some(Body::LlmEnd {
+            outcome,
+            error,
+            raw_text,
+            ..
+        }) => (*outcome, error.clone(), raw_text.clone(), bodies),
+        _ => unreachable!("the poll just found the error end"),
+    }
+}
+
 fn content_deltas(bodies: &[Body], call: u64) -> Vec<String> {
     bodies
         .iter()
@@ -137,37 +114,6 @@ fn content_deltas(bodies: &[Body], call: u64) -> Vec<String> {
         .collect()
 }
 
-/// A traced, running Me-only meeting over an endless silent source.
-async fn traced_running_meeting(
-    asr: &MockAsr,
-    llm: &MockLlm,
-    opener: &Arc<MemoryOpener>,
-    opts: MeetingOpts,
-) -> MeetingHarness {
-    let opts = MeetingOpts {
-        trace: Some(opener.clone()),
-        ..opts
-    };
-    let h = MeetingHarness::start(
-        asr,
-        llm,
-        ScriptedFactory::new(vec![(
-            Speaker::Me,
-            vec![OpenPlan::Ok(SourcePlan::endless(200))],
-        )]),
-        vec![VadScript::Probs(Vec::new())],
-        opts,
-    )
-    .await;
-    h.cmd(EngineCommand::StartMeeting);
-    assert!(
-        h.wait_state(MeetingState::Running, WAIT).await,
-        "meeting reaches Running: {:?}",
-        h.states()
-    );
-    h
-}
-
 /// Send `Suggest` and wait until the mock received request number `count`.
 async fn suggest_and_wait(h: &MeetingHarness, llm: &MockLlm, count: usize) {
     h.cmd(EngineCommand::Suggest);
@@ -177,15 +123,74 @@ async fn suggest_and_wait(h: &MeetingHarness, llm: &MockLlm, count: usize) {
     );
 }
 
+/// Suggest once, wait for call 1 to end, and read back the recorded bodies.
+async fn suggested_bodies(
+    h: &MeetingHarness,
+    llm: &MockLlm,
+    opener: &Arc<MemoryOpener>,
+) -> Vec<Body> {
+    suggest_and_wait(h, llm, 1).await;
+    wait_end(opener, 1).await;
+    last_bodies(&single_trace(opener))
+}
+
+/// A traced running meeting on one speaker scripted to end one Them turn.
+async fn traced_them_turn_meeting(
+    asr: &MockAsr,
+    llm: &MockLlm,
+    opener: &Arc<MemoryOpener>,
+) -> MeetingHarness {
+    let (factory, vad) = one_them_turn();
+    let opts = MeetingOpts {
+        start_profile: AssistProfile::Interview,
+        ..MeetingOpts::default()
+    };
+    running_tracing_meeting(asr, llm, factory, vad, opener, opts).await
+}
+
+/// Wait for the automatic request to fire and take the answer fields of its
+/// `llm_end` record: (outcome, raw text, shown text, passed).
+async fn auto_answer_end(
+    llm: &MockLlm,
+    opener: &Arc<MemoryOpener>,
+) -> (LlmOutcome, String, String, bool) {
+    assert!(
+        llm.wait_bodies(1, WAIT).await,
+        "the automatic request fires"
+    );
+    let (outcome, raw, shown, passed, _, _) = wait_end(opener, 1).await;
+    (outcome, raw, shown, passed)
+}
+
+/// A fresh opener and a traced Them-turn meeting, for the automatic-answer tests.
+async fn traced_auto(asr: &MockAsr, llm: &MockLlm) -> (Arc<MemoryOpener>, MeetingHarness) {
+    let opener = opener();
+    let h = traced_them_turn_meeting(asr, llm, &opener).await;
+    (opener, h)
+}
+
+/// A traced Them-turn meeting right after its automatic answer ended, with the
+/// opener and the answer fields: (outcome, raw text, shown text, passed).
+async fn auto_answered(
+    asr: &MockAsr,
+    llm: &MockLlm,
+) -> (
+    Arc<MemoryOpener>,
+    MeetingHarness,
+    (LlmOutcome, String, String, bool),
+) {
+    let (opener, h) = traced_auto(asr, llm).await;
+    let answer = auto_answer_end(llm, &opener).await;
+    (opener, h, answer)
+}
+
 // ------------------------------------------------------------- suggestion calls
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_manual_suggestion_records_request_deltas_and_end() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     llm.enqueue(LlmReply::stream(&["Say ", "hello"]));
-    let opener = opener();
-    let mut h = traced_running_meeting(&asr, &llm, &opener, MeetingOpts::default()).await;
+    let (opener, mut h) = traced_running(&asr, &llm).await;
 
     suggest_and_wait(&h, &llm, 1).await;
     let (outcome, raw, shown, passed, finish_reason, usage) = wait_end(&opener, 1).await;
@@ -252,12 +257,10 @@ async fn a_manual_suggestion_records_request_deltas_and_end() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_call_number_ties_a_request_to_its_end_and_differs_between_suggestions() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     llm.enqueue(LlmReply::stream(&["first"]));
     llm.enqueue(LlmReply::stream(&["second"]));
-    let opener = opener();
-    let mut h = traced_running_meeting(&asr, &llm, &opener, MeetingOpts::default()).await;
+    let (opener, mut h) = traced_running(&asr, &llm).await;
 
     suggest_and_wait(&h, &llm, 1).await;
     wait_end(&opener, 1).await;
@@ -294,18 +297,14 @@ async fn one_call_number_ties_a_request_to_its_end_and_differs_between_suggestio
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reasoning_is_recorded_but_never_shown_and_timed_first() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     llm.enqueue(LlmReply::Stream(vec![
         Step::reasoning("think"),
         Step::chunk("ok"),
     ]));
-    let opener = opener();
-    let mut h = traced_running_meeting(&asr, &llm, &opener, MeetingOpts::default()).await;
+    let (opener, mut h) = traced_running(&asr, &llm).await;
 
-    suggest_and_wait(&h, &llm, 1).await;
-    wait_end(&opener, 1).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    let bodies = suggested_bodies(&h, &llm, &opener).await;
 
     assert!(
         bodies.iter().any(|b| matches!(
@@ -350,11 +349,9 @@ async fn reasoning_is_recorded_but_never_shown_and_timed_first() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_content_only_answer_has_no_first_reasoning_time() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     llm.enqueue(LlmReply::stream(&["only content"]));
-    let opener = opener();
-    let mut h = traced_running_meeting(&asr, &llm, &opener, MeetingOpts::default()).await;
+    let (opener, mut h) = traced_running(&asr, &llm).await;
 
     suggest_and_wait(&h, &llm, 1).await;
     let bodies = loop_bodies_until(&opener, |bodies| {
@@ -383,15 +380,13 @@ async fn a_content_only_answer_has_no_first_reasoning_time() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finish_reason_and_usage_land_in_the_end_record() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     llm.enqueue(LlmReply::Stream(vec![
         Step::chunk("the answer"),
         Step::finish("stop"),
         Step::usage(100, 5, 105),
     ]));
-    let opener = opener();
-    let mut h = traced_running_meeting(&asr, &llm, &opener, MeetingOpts::default()).await;
+    let (opener, mut h) = traced_running(&asr, &llm).await;
 
     suggest_and_wait(&h, &llm, 1).await;
     let (outcome, raw, _shown, _passed, finish_reason, usage) = wait_end(&opener, 1).await;
@@ -413,15 +408,11 @@ async fn finish_reason_and_usage_land_in_the_end_record() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_request_record_carries_exactly_the_body_the_mock_received() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     llm.enqueue(LlmReply::stream(&["answered"]));
-    let opener = opener();
-    let mut h = traced_running_meeting(&asr, &llm, &opener, MeetingOpts::default()).await;
+    let (opener, mut h) = traced_running(&asr, &llm).await;
 
-    suggest_and_wait(&h, &llm, 1).await;
-    wait_end(&opener, 1).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    let bodies = suggested_bodies(&h, &llm, &opener).await;
     let recorded = bodies
         .iter()
         .find_map(|b| match b {
@@ -437,14 +428,12 @@ async fn the_request_record_carries_exactly_the_body_the_mock_received() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_manual_suggestion_cancels_the_first_and_is_recorded_after_it() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     llm.enqueue(LlmReply::slow_stream(
         &["first ", "second ", "third"],
         Duration::from_millis(400),
     ));
-    let opener = opener();
-    let mut h = traced_running_meeting(&asr, &llm, &opener, MeetingOpts::default()).await;
+    let (opener, mut h) = traced_running(&asr, &llm).await;
 
     suggest_and_wait(&h, &llm, 1).await;
     h.wait_until(WAIT, |events| {
@@ -486,8 +475,7 @@ async fn a_second_manual_suggestion_cancels_the_first_and_is_recorded_after_it()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stalled_stream_records_an_error_naming_the_stall() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     llm.enqueue(LlmReply::Stream(vec![
         Step::chunk("half an "),
         Step::sleep_ms(2500),
@@ -504,80 +492,35 @@ async fn a_stalled_stream_records_an_error_naming_the_stall() {
     let mut h = traced_running_meeting(&asr, &llm, &opener, opts).await;
 
     suggest_and_wait(&h, &llm, 1).await;
-    let bodies = loop_bodies_until(&opener, |bodies| {
-        bodies.iter().any(|b| {
-            matches!(
-                b,
-                Body::LlmEnd {
-                    call: 1,
-                    outcome: LlmOutcome::Error,
-                    ..
-                }
-            )
-        })
-    })
-    .await;
-    match bodies
-        .iter()
-        .find(|b| matches!(b, Body::LlmEnd { call: 1, .. }))
-    {
-        Some(Body::LlmEnd {
-            outcome,
-            error,
-            raw_text,
-            ..
-        }) => {
-            assert_eq!(*outcome, LlmOutcome::Error);
-            let error = error.clone().expect("the error is named");
-            assert!(
-                error.contains("stall"),
-                "the error names the stall: {error}"
-            );
-            assert_eq!(raw_text, "half an ", "the text so far is kept");
-        }
-        _ => unreachable!(),
-    }
+    let (outcome, error, raw, _bodies) = wait_failed_end(&opener).await;
+
+    assert_eq!(outcome, LlmOutcome::Error);
+    let error = error.expect("the error is named");
+    assert!(
+        error.contains("stall"),
+        "the error names the stall: {error}"
+    );
+    assert_eq!(raw, "half an ", "the text so far is kept");
 
     finish(&mut h).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_error_records_the_backend_body_and_fails_the_suggestion() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     llm.enqueue(LlmReply::Http {
         status: 500,
         body: r#"{"error":"boom"}"#.to_owned(),
     });
-    let opener = opener();
-    let mut h = traced_running_meeting(&asr, &llm, &opener, MeetingOpts::default()).await;
+    let (opener, mut h) = traced_running(&asr, &llm).await;
 
     suggest_and_wait(&h, &llm, 1).await;
-    let bodies = loop_bodies_until(&opener, |bodies| {
-        bodies.iter().any(|b| {
-            matches!(
-                b,
-                Body::LlmEnd {
-                    call: 1,
-                    outcome: LlmOutcome::Error,
-                    ..
-                }
-            )
-        })
-    })
-    .await;
-    match bodies
-        .iter()
-        .find(|b| matches!(b, Body::LlmEnd { call: 1, .. }))
-    {
-        Some(Body::LlmEnd { outcome, error, .. }) => {
-            assert_eq!(*outcome, LlmOutcome::Error);
-            let error = error.clone().expect("the error text");
-            assert!(error.contains("500"), "the status is named: {error}");
-            assert!(error.contains("boom"), "the backend body is kept: {error}");
-        }
-        _ => unreachable!(),
-    }
+    let (outcome, error, _raw, bodies) = wait_failed_end(&opener).await;
+
+    assert_eq!(outcome, LlmOutcome::Error);
+    let error = error.expect("the error text");
+    assert!(error.contains("500"), "the status is named: {error}");
+    assert!(error.contains("boom"), "the backend body is kept: {error}");
     assert!(
         bodies.iter().any(|b| matches!(
             b,
@@ -600,49 +543,12 @@ async fn a_server_error_records_the_backend_body_and_fails_the_suggestion() {
 
 // -------------------------------------------------- automatic answers and PASS
 
-/// A traced running meeting on one speaker scripted to end one Them turn.
-async fn traced_them_turn_meeting(
-    asr: &MockAsr,
-    llm: &MockLlm,
-    opener: &Arc<MemoryOpener>,
-) -> MeetingHarness {
-    let (frames, probs) = pattern(&[(11, 0.0), (20, 0.9), (25, 0.0)]);
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Them,
-        vec![OpenPlan::Ok(SourcePlan {
-            frames,
-            speed: 1000.0,
-            never_end: true,
-        })],
-    )]);
-    let opts = MeetingOpts {
-        start_profile: AssistProfile::Interview,
-        ..trace_opts(opener)
-    };
-    let h = MeetingHarness::start(asr, llm, factory, vec![VadScript::Probs(probs)], opts).await;
-    h.cmd(EngineCommand::StartMeeting);
-    assert!(
-        h.wait_state(MeetingState::Running, WAIT).await,
-        "meeting reaches Running: {:?}",
-        h.states()
-    );
-    h
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_automatic_pass_shows_nothing_and_is_recorded_as_passed() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.enqueue_final(Respond::text("what is the release date?"));
     llm.enqueue(LlmReply::stream(&["PASS"]));
-    let opener = opener();
-    let mut h = traced_them_turn_meeting(&asr, &llm, &opener).await;
-
-    assert!(
-        llm.wait_bodies(1, WAIT).await,
-        "the automatic request fires"
-    );
-    let (outcome, raw, shown, passed, _, _) = wait_end(&opener, 1).await;
+    let (opener, mut h, (outcome, raw, shown, passed)) = auto_answered(&asr, &llm).await;
 
     assert_eq!(outcome, LlmOutcome::Done);
     assert_eq!(raw, "PASS");
@@ -661,18 +567,10 @@ async fn an_automatic_pass_shows_nothing_and_is_recorded_as_passed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_automatic_answer_that_only_starts_like_pass_is_not_passed() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.enqueue_final(Respond::text("can we skip the migration?"));
     llm.enqueue(LlmReply::stream(&["Passing", " is fine"]));
-    let opener = opener();
-    let mut h = traced_them_turn_meeting(&asr, &llm, &opener).await;
-
-    assert!(
-        llm.wait_bodies(1, WAIT).await,
-        "the automatic request fires"
-    );
-    let (outcome, raw, shown, passed, _, _) = wait_end(&opener, 1).await;
+    let (_opener, mut h, (outcome, raw, shown, passed)) = auto_answered(&asr, &llm).await;
 
     assert_eq!(outcome, LlmOutcome::Done);
     assert_eq!(raw, "Passing is fine");
@@ -684,18 +582,10 @@ async fn an_automatic_answer_that_only_starts_like_pass_is_not_passed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_automatic_answer_that_said_nothing_is_not_passed() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.enqueue_final(Respond::text("what is the release date?"));
     llm.enqueue(LlmReply::stream(&[]));
-    let opener = opener();
-    let mut h = traced_them_turn_meeting(&asr, &llm, &opener).await;
-
-    assert!(
-        llm.wait_bodies(1, WAIT).await,
-        "the automatic request fires"
-    );
-    let (outcome, raw, shown, passed, _, _) = wait_end(&opener, 1).await;
+    let (_opener, mut h, (outcome, raw, shown, passed)) = auto_answered(&asr, &llm).await;
 
     assert_eq!(outcome, LlmOutcome::Done);
     assert_eq!(raw, "");
@@ -719,14 +609,19 @@ fn long_utterances(asr: &MockAsr) {
     }
 }
 
-fn many_utterance_factory(n: usize) -> ScriptedFactory {
+/// `(frames, probs)` for `n` back-to-back utterances.
+fn many_utterances(n: usize) -> (usize, Vec<f32>) {
     let mut runs = vec![];
     for _ in 0..n {
         runs.push((11usize, 0.0f32));
         runs.push((20, 0.9));
         runs.push((25, 0.0));
     }
-    let (frames, _) = pattern(&runs);
+    pattern(&runs)
+}
+
+fn many_utterance_factory(n: usize) -> ScriptedFactory {
+    let (frames, _) = many_utterances(n);
     ScriptedFactory::new(vec![(
         Speaker::Me,
         vec![OpenPlan::Ok(SourcePlan::new(frames))],
@@ -734,50 +629,41 @@ fn many_utterance_factory(n: usize) -> ScriptedFactory {
 }
 
 fn many_utterance_probs(n: usize) -> Vec<f32> {
-    let mut runs = vec![];
-    for _ in 0..n {
-        runs.push((11usize, 0.0f32));
-        runs.push((20, 0.9));
-        runs.push((25, 0.0));
-    }
-    let (_, probs) = pattern(&runs);
-    probs
+    many_utterances(n).1
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compression_records_request_end_and_the_applied_range() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
-    long_utterances(&asr);
-    llm.enqueue(LlmReply::stream(&["early summary of the discussion"]));
-    let opener = opener();
+/// A traced running Me meeting whose eight long utterances cross the
+/// 1000-token compression threshold.
+async fn compression_meeting(
+    asr: &MockAsr,
+    llm: &MockLlm,
+    opener: &Arc<MemoryOpener>,
+) -> MeetingHarness {
     let opts = MeetingOpts {
         compress_threshold_tokens: 1000,
-        ..trace_opts(&opener)
+        ..MeetingOpts::default()
     };
-    let mut h = MeetingHarness::start(
-        &asr,
-        &llm,
+    running_tracing_meeting(
+        asr,
+        llm,
         many_utterance_factory(8),
         vec![VadScript::Probs(many_utterance_probs(8))],
+        opener,
         opts,
     )
-    .await;
-    h.cmd(EngineCommand::StartMeeting);
-    assert!(
-        h.wait_state(MeetingState::Running, WAIT).await,
-        "meeting reaches Running: {:?}",
-        h.states()
-    );
+    .await
+}
 
-    let bodies = loop_bodies_until(&opener, |bodies| {
-        bodies
-            .iter()
-            .any(|b| matches!(b, Body::SummaryApplied { .. }))
-    })
-    .await;
+/// A fresh opener and a compression-ready meeting, for the compression tests.
+async fn traced_compression(asr: &MockAsr, llm: &MockLlm) -> (Arc<MemoryOpener>, MeetingHarness) {
+    let opener = opener();
+    let h = compression_meeting(asr, llm, &opener).await;
+    (opener, h)
+}
 
-    let call = match bodies.iter().find(|b| {
+/// The call number and recorded body of the compress request in `bodies`.
+fn compress_request(bodies: &[Body]) -> (u64, serde_json::Value) {
+    match bodies.iter().find(|b| {
         matches!(
             b,
             Body::LlmRequest {
@@ -786,13 +672,31 @@ async fn compression_records_request_end_and_the_applied_range() {
             }
         )
     }) {
-        Some(Body::LlmRequest { call, body, .. }) => {
-            assert_eq!(body["model"], "mock-model");
-            assert_eq!(body["max_tokens"], 1500, "summary requests stay small");
-            *call
-        }
+        Some(Body::LlmRequest { call, body, .. }) => (*call, body.clone()),
         other => panic!("a compress request was recorded: {other:?}"),
-    };
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compression_records_request_end_and_the_applied_range() {
+    let (asr, llm) = start_mocks().await;
+    long_utterances(&asr);
+    llm.enqueue(LlmReply::stream(&["early summary of the discussion"]));
+    let (opener, mut h) = traced_compression(&asr, &llm).await;
+
+    let bodies = loop_bodies_until(&opener, |bodies| {
+        bodies
+            .iter()
+            .any(|b| matches!(b, Body::SummaryApplied { .. }))
+    })
+    .await;
+
+    let (call, request_body) = compress_request(&bodies);
+    assert_eq!(request_body["model"], "mock-model");
+    assert_eq!(
+        request_body["max_tokens"], 1500,
+        "summary requests stay small"
+    );
     assert!(
         ordered(
             &bodies,
@@ -831,32 +735,13 @@ async fn compression_records_request_end_and_the_applied_range() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_compression_records_the_error_and_no_summary_applied() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     long_utterances(&asr);
     llm.enqueue(LlmReply::Http {
         status: 500,
         body: r#"{"error":"boom"}"#.to_owned(),
     });
-    let opener = opener();
-    let opts = MeetingOpts {
-        compress_threshold_tokens: 1000,
-        ..trace_opts(&opener)
-    };
-    let mut h = MeetingHarness::start(
-        &asr,
-        &llm,
-        many_utterance_factory(8),
-        vec![VadScript::Probs(many_utterance_probs(8))],
-        opts,
-    )
-    .await;
-    h.cmd(EngineCommand::StartMeeting);
-    assert!(
-        h.wait_state(MeetingState::Running, WAIT).await,
-        "meeting reaches Running: {:?}",
-        h.states()
-    );
+    let (opener, mut h) = traced_compression(&asr, &llm).await;
 
     let bodies = loop_bodies_until(&opener, |bodies| {
         bodies.iter().any(|b| {
@@ -871,18 +756,7 @@ async fn a_failed_compression_records_the_error_and_no_summary_applied() {
     })
     .await;
 
-    let call = match bodies.iter().find(|b| {
-        matches!(
-            b,
-            Body::LlmRequest {
-                purpose: Purpose::Compress,
-                ..
-            }
-        )
-    }) {
-        Some(Body::LlmRequest { call, .. }) => *call,
-        other => panic!("a compress request was recorded: {other:?}"),
-    };
+    let (call, _request_body) = compress_request(&bodies);
     match bodies
         .iter()
         .find(|b| matches!(b, Body::LlmEnd { call: c, .. } if *c == call))
@@ -916,8 +790,7 @@ async fn a_failed_compression_records_the_error_and_no_summary_applied() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_keys_never_appear_in_any_record() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.set_default_final(Respond::text("what is the release date?"));
     llm.enqueue(LlmReply::stream(&["Friday"]));
     let opener = opener();
@@ -927,13 +800,8 @@ async fn api_keys_never_appear_in_any_record() {
         ..trace_opts(&opener)
     };
     let mut h = traced_running_meeting(&asr, &llm, &opener, opts).await;
-    h.cmd(EngineCommand::Suggest);
-    assert!(llm.wait_bodies(1, WAIT).await, "the suggestion fires");
-    h.cmd(EngineCommand::StopMeeting);
-    assert!(
-        h.wait_state(MeetingState::Idle, WAIT).await,
-        "meeting returns to Idle"
-    );
+    suggest_and_wait(&h, &llm, 1).await;
+    stop_and_wait(&h).await;
     finish(&mut h).await;
     assert_eq!(
         single_trace(&opener).closed(),

@@ -13,25 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 const CONNECT: Duration = Duration::from_secs(2);
 
-fn client_for(base_url: &str) -> LlmClient {
-    LlmClient::new(
-        base_url,
-        "mock-model",
-        None,
-        CONNECT,
-        Duration::from_secs(10),
-    )
-}
-
 fn request() -> ChatRequest {
-    ChatRequest::new(
-        "mock-model",
-        vec![Message::user("hi")],
-        220,
-        0.4,
-        Some(false),
-        true,
-    )
+    support::test_request(true)
 }
 
 /// Drain a suggestion stream into its content items and the error that ended
@@ -54,12 +37,23 @@ async fn drain(
     (items, error)
 }
 
+/// Stream the standard request against the mock with the default client and
+/// drain it into its content items and the error that ended it, if any.
+async fn stream_content(mock: &Mock) -> (Vec<String>, Option<LlmError>) {
+    let client = support::test_client(&mock.base_url);
+    drain(Box::pin(client.stream(request(), CancellationToken::new()))).await
+}
+
+/// Stream once and list models, so both endpoints have been seen.
+async fn hit_both_endpoints(client: &LlmClient) {
+    let _ = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
+    client.models().await.expect("models request");
+}
+
 #[tokio::test]
 async fn stream_yields_non_empty_content_deltas_and_ends_at_done() {
     let mock = Mock::start(Reply::contents(&["", "Hel", "lo"])).await;
-    let client = client_for(&mock.base_url);
-    let stream = client.stream(request(), CancellationToken::new());
-    let (items, error) = drain(Box::pin(stream)).await;
+    let (items, error) = stream_content(&mock).await;
     assert_eq!(items, vec!["Hel".to_string(), "lo".to_string()]);
     assert_eq!(error, None);
     // The thinking-off body really crossed the HTTP boundary.
@@ -75,7 +69,7 @@ async fn stream_yields_non_empty_content_deltas_and_ends_at_done() {
 #[tokio::test]
 async fn unset_enable_thinking_omits_chat_template_kwargs_from_the_body() {
     let mock = Mock::start(Reply::contents(&["ok"])).await;
-    let client = client_for(&mock.base_url);
+    let client = support::test_client(&mock.base_url);
     let request = ChatRequest::new(
         "mock-model",
         vec![Message::user("hi")],
@@ -104,8 +98,7 @@ async fn an_api_key_becomes_a_bearer_header_on_both_endpoints() {
         CONNECT,
         Duration::from_secs(10),
     );
-    let _ = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
-    client.models().await.expect("models request");
+    hit_both_endpoints(&client).await;
     assert_eq!(
         mock.authorizations(),
         vec![
@@ -118,9 +111,8 @@ async fn an_api_key_becomes_a_bearer_header_on_both_endpoints() {
 #[tokio::test]
 async fn no_api_key_sends_no_authorization_header() {
     let mock = Mock::start(Reply::contents(&["ok"])).await;
-    let client = client_for(&mock.base_url);
-    let _ = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
-    client.models().await.expect("models request");
+    let client = support::test_client(&mock.base_url);
+    hit_both_endpoints(&client).await;
     assert_eq!(mock.authorizations(), vec![None, None]);
 }
 
@@ -133,8 +125,7 @@ async fn reasoning_deltas_before_content_never_show_up_as_content() {
         Step::Chunk("!".into()),
     ]))
     .await;
-    let client = client_for(&mock.base_url);
-    let (items, error) = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
+    let (items, error) = stream_content(&mock).await;
     assert_eq!(items, vec!["Hello".to_string(), "!".to_string()]);
     assert_eq!(error, None);
 }
@@ -146,8 +137,7 @@ async fn reasoning_content_deltas_yield_no_content() {
         Step::ReasoningContent("still hidden".into()),
     ]))
     .await;
-    let client = client_for(&mock.base_url);
-    let (items, error) = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
+    let (items, error) = stream_content(&mock).await;
     assert!(
         items.is_empty(),
         "reasoning_content must never be yielded, got {items:?}"
@@ -185,8 +175,7 @@ async fn silent_connection_past_the_stall_timeout_ends_as_stalled() {
 #[tokio::test]
 async fn connection_closed_before_done_ends_as_closed() {
     let mock = Mock::start(Reply::Stream(vec![Step::Chunk("Only piece.".into())])).await;
-    let client = client_for(&mock.base_url);
-    let (items, error) = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
+    let (items, error) = stream_content(&mock).await;
     assert_eq!(items, vec!["Only piece.".to_string()]);
     assert_eq!(error, Some(LlmError::Closed));
 }
@@ -197,29 +186,18 @@ async fn event_data_that_is_not_json_ends_as_decode() {
         "data: <<not json>>\n\n".into(),
     )]))
     .await;
-    let client = client_for(&mock.base_url);
-    let (items, error) = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
+    let (items, error) = stream_content(&mock).await;
     assert!(items.is_empty());
     assert_eq!(error, Some(LlmError::Decode));
 }
 
 #[tokio::test]
 async fn cancelling_after_a_delta_ends_the_stream_and_closes_the_connection() {
-    let mock = Mock::start(Reply::Stream(vec![
-        Step::Chunk("first".into()),
-        Step::Hold(Duration::from_secs(10)),
-    ]))
-    .await;
-    let client = client_for(&mock.base_url);
-    let cancel = CancellationToken::new();
-    let mut stream = Box::pin(client.stream(request(), cancel.clone()));
-    assert_eq!(
-        stream.next().await,
-        Some(Ok(StreamPart::Content("first".to_string())))
-    );
+    let run = support::cancel_run(true).await;
+    let mut stream = run.stream;
 
     let started = std::time::Instant::now();
-    cancel.cancel();
+    run.cancel.cancel();
     assert_eq!(
         stream.next().await,
         None,
@@ -233,7 +211,7 @@ async fn cancelling_after_a_delta_ends_the_stream_and_closes_the_connection() {
     drop(stream);
 
     assert!(
-        mock.wait_disconnected(Duration::from_secs(2)).await,
+        run.mock.wait_disconnected(Duration::from_secs(2)).await,
         "the mock never saw the connection close"
     );
 }
@@ -249,8 +227,7 @@ async fn http_400_with_json_error_body_reports_status_and_body_start() {
         body.len()
     );
     let mock = Mock::start(Reply::error(400, message)).await;
-    let client = client_for(&mock.base_url);
-    let (items, error) = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
+    let (items, error) = stream_content(&mock).await;
     assert!(items.is_empty());
     let Some(LlmError::Http { status, body_start }) = error else {
         panic!("expected an Http error, got {error:?}");
@@ -268,7 +245,7 @@ async fn nothing_listening_ends_as_connect() {
         .expect("free port");
     let addr = listener.local_addr().expect("addr");
     drop(listener);
-    let client = client_for(&format!("http://{addr}"));
+    let client = support::test_client(&format!("http://{addr}"));
     let (items, error) = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
     assert!(items.is_empty());
     assert_eq!(error, Some(LlmError::Connect));
@@ -277,7 +254,7 @@ async fn nothing_listening_ends_as_connect() {
 #[tokio::test]
 async fn complete_returns_the_concatenated_content() {
     let mock = Mock::start(Reply::contents(&["Hello", ", ", "world"])).await;
-    let client = client_for(&mock.base_url);
+    let client = support::test_client(&mock.base_url);
     let completion = client.complete(request()).await.expect("complete succeeds");
     assert_eq!(completion.text, "Hello, world");
     assert_eq!(completion.reasoning, "");
@@ -295,8 +272,7 @@ async fn one_event_split_across_two_tcp_writes_is_one_delta() {
         Step::Done,
     ]))
     .await;
-    let client = client_for(&mock.base_url);
-    let (items, error) = drain(Box::pin(client.stream(request(), CancellationToken::new()))).await;
+    let (items, error) = stream_content(&mock).await;
     assert_eq!(items, vec!["SplitHello".to_string()]);
     assert_eq!(error, None);
 }

@@ -6,12 +6,23 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Test fixtures for integration tests (this crate's own and dependents');
+# never enabled by production builds.
+testutil = []
+
 [dependencies]
 clueless-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hound.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Self-dependency: enables `testutil` when building this crate's own
+# integration tests (a dev-dependency cannot add features to its own crate
+# any other way).
+trace = { path = ".", features = ["testutil"] }
 
 [lints]
 workspace = true

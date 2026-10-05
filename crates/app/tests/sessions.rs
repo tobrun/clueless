@@ -166,6 +166,74 @@ fn stderr_of(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
+/// A fresh directory with a mock env file: the ASR mock always answers
+/// "mock words", the LLM mock streams `llm_parts`. The ASR port comes back
+/// for tests that re-point the env file later.
+async fn mock_env(tag: &str, llm_parts: &[&str]) -> (TempDir, u16) {
+    let dir = TempDir::new(tag);
+    let asr = spawn_asr_mock("mock words").await;
+    let llm = spawn_llm_mock(llm_parts).await;
+    common::write_mock_env(&dir, llm, asr);
+    (dir, asr)
+}
+
+/// The standard mocks plus one recorded session.
+async fn one_session(tag: &str) -> (TempDir, PathBuf) {
+    let (dir, _asr) = mock_env(tag, &["unused"]).await;
+    let session = record_session(&dir, &[]).await;
+    (dir, session)
+}
+
+/// The standard mocks plus one recorded session and one re-run of it.
+async fn session_with_run(tag: &str, extra: &[&Path]) -> (TempDir, PathBuf) {
+    let (dir, _asr) = mock_env(tag, &["unused"]).await;
+    let session = recorded_and_rerun(&dir, extra).await;
+    (dir, session)
+}
+
+/// `--compare <name> --no-judge`, without any env file.
+async fn compare_no_judge(dir: &TempDir, session: &Path) -> std::process::Output {
+    let name = session_name(session);
+    clueless_env(
+        dir,
+        &[
+            Path::new("--compare"),
+            Path::new(&name),
+            Path::new("--no-judge"),
+        ],
+        false,
+    )
+    .await
+}
+
+/// `--compare <name>` with judging on, asserted to exit 0; returns the
+/// report text.
+async fn compare_judged(dir: &TempDir, session: &Path) -> String {
+    let name = session_name(session);
+    let out = clueless(dir, &[Path::new("--compare"), Path::new(&name)]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// `--delete <target> --yes`, without any env file.
+async fn delete_yes(dir: &TempDir, target: &str) -> std::process::Output {
+    clueless_env(
+        dir,
+        &[Path::new("--delete"), Path::new(target), Path::new("--yes")],
+        false,
+    )
+    .await
+}
+
+/// A re-run (no `--speed`, so it fails before any audio plays) that must
+/// exit 2; returns the stderr.
+async fn rerun_rejected(dir: &TempDir, session: &Path) -> String {
+    let name = session_name(session);
+    let out = clueless(dir, &[Path::new("--replay-session"), Path::new(&name)]).await;
+    assert_eq!(out.status.code(), Some(2));
+    stderr_of(&out)
+}
+
 // ------------------------------------------------------------ mock servers
 
 /// An SSE chat response with properly escaped parts.
@@ -244,11 +312,7 @@ async fn spawn_judge_mock(answer: &str) -> (u16, Arc<AtomicUsize>) {
 /// and lands as a run below the session.
 #[tokio::test]
 async fn rerun_writes_a_run_named_rerun_below_the_session() {
-    let dir = TempDir::new("ses-rerun");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let session = record_session(&dir, &[]).await;
+    let (dir, session) = one_session("ses-rerun").await;
 
     let out = rerun(&dir, &session).await;
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
@@ -280,10 +344,7 @@ async fn rerun_writes_a_run_named_rerun_below_the_session() {
 /// run holds exactly one manual suggestion call, closed before `end`.
 #[tokio::test]
 async fn rerun_replays_the_recorded_suggest_after_the_drain() {
-    let dir = TempDir::new("ses-rerun-ask");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["mock answer"]).await;
-    common::write_mock_env(&dir, llm, asr);
+    let (dir, _asr) = mock_env("ses-rerun-ask", &["mock answer"]).await;
     let session = record_session(&dir, &[Path::new("--ask")]).await;
 
     let out = rerun(&dir, &session).await;
@@ -415,10 +476,7 @@ async fn rerun_hands_the_recorded_notes_to_the_prompt() {
 /// A session recorded without audio cannot re-run and says how to fix it.
 #[tokio::test]
 async fn rerun_of_a_session_without_audio_says_so() {
-    let dir = TempDir::new("ses-rerun-no-audio");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
+    let (dir, _asr) = mock_env("ses-rerun-no-audio", &["unused"]).await;
     let me = fixture("conv_me.wav");
     let out = clueless(
         &dir,
@@ -433,10 +491,7 @@ async fn rerun_of_a_session_without_audio_says_so() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     let session = session_dirs(&data(&dir)).remove(0);
 
-    let name = session_name(&session);
-    let out = clueless(&dir, &[Path::new("--replay-session"), Path::new(&name)]).await;
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = stderr_of(&out);
+    let stderr = rerun_rejected(&dir, &session).await;
     assert!(
         stderr.contains("has no audio") && stderr.contains("audio = true"),
         "the message names the audio switch: {stderr}"
@@ -446,10 +501,7 @@ async fn rerun_of_a_session_without_audio_says_so() {
 /// A name with no session behind it fails with the path in the message.
 #[tokio::test]
 async fn rerun_of_an_unknown_session_names_the_path() {
-    let dir = TempDir::new("ses-rerun-missing");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
+    let (dir, _asr) = mock_env("ses-rerun-missing", &["unused"]).await;
     let out = clueless(&dir, &[Path::new("--replay-session"), Path::new("nope")]).await;
     assert_eq!(out.status.code(), Some(2));
     let stderr = stderr_of(&out);
@@ -462,21 +514,14 @@ async fn rerun_of_an_unknown_session_names_the_path() {
 /// A manifest from a newer format is refused, not guessed at.
 #[tokio::test]
 async fn rerun_refuses_a_newer_schema() {
-    let dir = TempDir::new("ses-rerun-schema");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let session = record_session(&dir, &[]).await;
+    let (dir, session) = one_session("ses-rerun-schema").await;
 
     let path = session.join("manifest.json");
     let mut value = manifest_value(&session);
     value["schema"] = serde_json::json!(2);
     std::fs::write(&path, serde_json::to_string_pretty(&value).expect("JSON")).expect("written");
 
-    let name = session_name(&session);
-    let out = clueless(&dir, &[Path::new("--replay-session"), Path::new(&name)]).await;
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = stderr_of(&out);
+    let stderr = rerun_rejected(&dir, &session).await;
     assert!(
         stderr.contains("newer than this build reads"),
         "the message explains the schema: {stderr}"
@@ -509,17 +554,7 @@ async fn compare_no_judge_prints_the_diff_without_requests() {
     let session = recorded_and_rerun(&dir, &[]).await;
     let calls_after_replay = calls.load(Ordering::SeqCst);
 
-    let name = session_name(&session);
-    let out = clueless_env(
-        &dir,
-        &[
-            Path::new("--compare"),
-            Path::new(&name),
-            Path::new("--no-judge"),
-        ],
-        false,
-    )
-    .await;
+    let out = compare_no_judge(&dir, &session).await;
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     let report = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
@@ -565,19 +600,13 @@ async fn compare_no_judge_prints_the_diff_without_requests() {
 /// a tie answer lands in the tally.
 #[tokio::test]
 async fn compare_judge_tallies_a_judged_pair() {
-    let dir = TempDir::new("ses-compare-judge");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["mock answer"]).await;
-    common::write_mock_env(&dir, llm, asr);
+    let (dir, asr) = mock_env("ses-compare-judge", &["mock answer"]).await;
     let session = recorded_and_rerun(&dir, &[Path::new("--ask")]).await;
 
     let (judge_port, judge_calls) =
         spawn_judge_mock("{\"winner\":\"tie\",\"reason\":\"same\"}").await;
     common::write_mock_env(&dir, judge_port, asr);
-    let name = session_name(&session);
-    let out = clueless(&dir, &[Path::new("--compare"), Path::new(&name)]).await;
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
-    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    let report = compare_judged(&dir, &session).await;
     assert!(
         report.contains("tie 1"),
         "the tally counts the judged pair: {report}"
@@ -592,17 +621,11 @@ async fn compare_judge_tallies_a_judged_pair() {
 /// Judging without a reachable server marks every pair and still exits 0.
 #[tokio::test]
 async fn compare_without_a_reachable_llm_marks_pairs_not_judged() {
-    let dir = TempDir::new("ses-compare-offline");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["mock answer"]).await;
-    common::write_mock_env(&dir, llm, asr);
+    let (dir, asr) = mock_env("ses-compare-offline", &["mock answer"]).await;
     let session = recorded_and_rerun(&dir, &[Path::new("--ask")]).await;
 
     common::write_mock_env(&dir, common::closed_port().await, asr);
-    let name = session_name(&session);
-    let out = clueless(&dir, &[Path::new("--compare"), Path::new(&name)]).await;
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
-    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    let report = compare_judged(&dir, &session).await;
     assert!(
         report.contains("not judged"),
         "the pairs are not judged: {report}"
@@ -616,23 +639,9 @@ async fn compare_without_a_reachable_llm_marks_pairs_not_judged() {
 /// With no run to compare against the command says so and fails.
 #[tokio::test]
 async fn compare_without_runs_says_so() {
-    let dir = TempDir::new("ses-compare-empty");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let session = record_session(&dir, &[]).await;
+    let (dir, session) = one_session("ses-compare-empty").await;
 
-    let name = session_name(&session);
-    let out = clueless_env(
-        &dir,
-        &[
-            Path::new("--compare"),
-            Path::new(&name),
-            Path::new("--no-judge"),
-        ],
-        false,
-    )
-    .await;
+    let out = compare_no_judge(&dir, &session).await;
     assert_eq!(out.status.code(), Some(2));
     let stderr = stderr_of(&out);
     assert!(
@@ -644,24 +653,10 @@ async fn compare_without_runs_says_so() {
 /// Paths work like names (D-session-arg): the report is the same.
 #[tokio::test]
 async fn compare_by_path_prints_the_same_report() {
-    let dir = TempDir::new("ses-compare-path");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let session = recorded_and_rerun(&dir, &[]).await;
+    let (dir, session) = session_with_run("ses-compare-path", &[]).await;
     let run = only_run(&session);
 
-    let name = session_name(&session);
-    let by_name = clueless_env(
-        &dir,
-        &[
-            Path::new("--compare"),
-            Path::new(&name),
-            Path::new("--no-judge"),
-        ],
-        false,
-    )
-    .await;
+    let by_name = compare_no_judge(&dir, &session).await;
     let session_arg = session.display().to_string();
     let run_arg = run.display().to_string();
     let by_path = clueless_env(
@@ -685,10 +680,7 @@ async fn compare_by_path_prints_the_same_report() {
 /// Two recordings and one re-run: two lines, newest first, runs counted.
 #[tokio::test]
 async fn sessions_lists_two_sessions_newest_first_with_runs() {
-    let dir = TempDir::new("ses-list");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
+    let (dir, _asr) = mock_env("ses-list", &["unused"]).await;
     let first = record_session(&dir, &[]).await;
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     let second = record_session(&dir, &[]).await;
@@ -726,11 +718,7 @@ async fn sessions_on_an_empty_data_dir_prints_nothing() {
 /// `--show` prints the recorded finals with speaker and time.
 #[tokio::test]
 async fn show_prints_the_finals_of_a_session() {
-    let dir = TempDir::new("ses-show");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let session = record_session(&dir, &[]).await;
+    let (dir, session) = one_session("ses-show").await;
 
     let name = session_name(&session);
     let out = clueless_env(&dir, &[Path::new("--show"), Path::new(&name)], false).await;
@@ -755,11 +743,7 @@ async fn show_prints_the_finals_of_a_session() {
 /// Without `--yes` the command only previews path and size (D-delete-safety).
 #[tokio::test]
 async fn delete_previews_path_and_size_without_yes() {
-    let dir = TempDir::new("ses-delete-preview");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let session = record_session(&dir, &[]).await;
+    let (dir, session) = one_session("ses-delete-preview").await;
 
     let name = session_name(&session);
     let out = clueless_env(&dir, &[Path::new("--delete"), Path::new(&name)], false).await;
@@ -775,19 +759,9 @@ async fn delete_previews_path_and_size_without_yes() {
 /// With `--yes` the session is gone and the list no longer shows it.
 #[tokio::test]
 async fn delete_yes_removes_the_session_and_it_leaves_the_list() {
-    let dir = TempDir::new("ses-delete-yes");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let session = record_session(&dir, &[]).await;
+    let (dir, session) = one_session("ses-delete-yes").await;
 
-    let name = session_name(&session);
-    let out = clueless_env(
-        &dir,
-        &[Path::new("--delete"), Path::new(&name), Path::new("--yes")],
-        false,
-    )
-    .await;
+    let out = delete_yes(&dir, &session_name(&session)).await;
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     assert!(!session.exists(), "the session is gone");
 
@@ -800,24 +774,11 @@ async fn delete_yes_removes_the_session_and_it_leaves_the_list() {
 /// leaves the session standing.
 #[tokio::test]
 async fn delete_yes_removes_only_a_run() {
-    let dir = TempDir::new("ses-delete-run");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let session = recorded_and_rerun(&dir, &[]).await;
+    let (dir, session) = session_with_run("ses-delete-run", &[]).await;
     let run = only_run(&session);
 
     let target = format!("{}/runs/{}", session_name(&session), common_os(&run));
-    let out = clueless_env(
-        &dir,
-        &[
-            Path::new("--delete"),
-            Path::new(&target),
-            Path::new("--yes"),
-        ],
-        false,
-    )
-    .await;
+    let out = delete_yes(&dir, &target).await;
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     assert!(!run.exists(), "the run is gone");
     assert!(session.is_dir(), "the session stays");
@@ -841,12 +802,7 @@ async fn delete_refuses_a_directory_that_is_not_a_trace() {
     std::fs::write(stranger.join("manifest.json"), "{\"app\":\"mine\"}").expect("manifest");
 
     let path = stranger.display().to_string();
-    let out = clueless_env(
-        &dir,
-        &[Path::new("--delete"), Path::new(&path), Path::new("--yes")],
-        false,
-    )
-    .await;
+    let out = delete_yes(&dir, &path).await;
     assert_eq!(out.status.code(), Some(2));
     assert!(stranger.is_dir(), "the directory is still there");
     assert!(stranger.join("manifest.json").is_file(), "and untouched");
@@ -856,11 +812,7 @@ async fn delete_refuses_a_directory_that_is_not_a_trace() {
 /// records is refused.
 #[tokio::test]
 async fn delete_refuses_a_session_being_recorded() {
-    let dir = TempDir::new("ses-delete-locked");
-    let asr = spawn_asr_mock("mock words").await;
-    let llm = spawn_llm_mock(&["unused"]).await;
-    common::write_mock_env(&dir, llm, asr);
-    let session = record_session(&dir, &[]).await;
+    let (dir, session) = one_session("ses-delete-locked").await;
 
     let events = session.join("events.jsonl");
     let held = std::fs::OpenOptions::new()
@@ -871,13 +823,7 @@ async fn delete_refuses_a_session_being_recorded() {
     held.try_lock()
         .expect("no recorder holds it after the meeting");
 
-    let name = session_name(&session);
-    let out = clueless_env(
-        &dir,
-        &[Path::new("--delete"), Path::new(&name), Path::new("--yes")],
-        false,
-    )
-    .await;
+    let out = delete_yes(&dir, &session_name(&session)).await;
     drop(held);
     assert_eq!(out.status.code(), Some(1), "a locked session stays");
     let stderr = stderr_of(&out);

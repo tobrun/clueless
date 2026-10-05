@@ -20,7 +20,7 @@ use trace::sink::TraceSink;
 
 use crate::asr_worker::LatestSlot;
 use crate::clock::StreamClock;
-use crate::pipeline::Drain;
+use crate::pipeline::{Drain, panic_text};
 
 /// What the stream thread writes into: segment channels and the shared state
 /// its dispatch decisions touch.
@@ -101,16 +101,6 @@ pub fn spawn_stream(
     StreamHandle {
         thread: Some(thread),
         shutdown,
-    }
-}
-
-fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_owned()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic payload".to_owned()
     }
 }
 

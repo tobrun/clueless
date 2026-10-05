@@ -99,7 +99,8 @@ impl Drain {
     }
 }
 
-fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
+/// Best-effort text of a caught panic payload, shared with the stream threads.
+pub(crate) fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_owned()
     } else if let Some(s) = payload.downcast_ref::<String>() {

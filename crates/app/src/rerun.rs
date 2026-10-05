@@ -17,12 +17,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::replay_print;
+use clueless_types::audio::SourceFactory;
 use clueless_types::config::Config;
-use clueless_types::events::{EngineCommand, MeetingState, Speaker, UiEvent};
+use clueless_types::events::{EngineCommand, MeetingState, Speaker, StatusSink, UiEvent};
 use clueless_types::profile::AssistProfile;
 use engine::deps::EngineDeps;
 use engine::meeting;
 use engine::replay::WavSources;
+use trace::compare::dir_name;
 use trace::paths::{self, NOTES_FILE, create_private_file};
 use trace::reader::{self, Trace};
 use trace::record::{Body, CommandName, Profile, Speaker as TraceSpeaker};
@@ -105,12 +107,9 @@ pub fn run(config: Config, data_dir: &Path, session: &str, speed: f64) -> ExitCo
     // minutes for server latency and the commands recorded after the drain.
     let audio_ms = session_trace.audio_ms().unwrap_or(0);
     let limit = Duration::from_millis((audio_ms as f64 / speed) as u64 + 120_000);
-    let runtime = match tokio::runtime::Runtime::new() {
+    let runtime = match replay_runtime() {
         Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("replay: cannot start a tokio runtime: {error}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     match runtime.block_on(rerun_loop(
         config,
@@ -186,25 +185,36 @@ fn assist_profile(profile: Profile) -> AssistProfile {
     }
 }
 
-fn dir_name(dir: &Path) -> String {
-    dir.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.display().to_string())
+/// A fresh tokio runtime to drive a headless run in blocking mode; on
+/// failure the error is already on stderr and the value is the exit code to
+/// return, shared by `--replay` and the session re-run.
+pub fn replay_runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
+    tokio::runtime::Runtime::new().map_err(|error| {
+        eprintln!("replay: cannot start a tokio runtime: {error}");
+        ExitCode::FAILURE
+    })
 }
 
-/// The meeting loop: same printing as `--replay`, plus the recorded
-/// commands at their due seconds. Ends per D-replay-end: the sources
-/// drained, every recorded command sent, and no suggestion open; commands
-/// still waiting when the sources drain go at once, in order.
-async fn rerun_loop(
+/// A production engine running for a headless meeting: the command sender
+/// the event loop drives, the event receiver it prints, and the engine's
+/// task to join at the end.
+pub struct RunningMeeting {
+    pub commands: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    pub events: tokio::sync::mpsc::UnboundedReceiver<UiEvent>,
+    pub running: tokio::task::JoinHandle<()>,
+}
+
+/// Start a production engine on the current runtime with `factory` and
+/// `trace_opener` and send `StartMeeting`; shared by `--replay` and the
+/// session re-run (both meetings are configured identically). `Err` when
+/// the engine loop exited before the meeting started.
+pub fn start_meeting(
     config: Config,
-    factory: Arc<dyn clueless_types::audio::SourceFactory>,
+    factory: Arc<dyn SourceFactory>,
     trace_opener: Arc<dyn TraceOpener>,
-    mut pending: VecDeque<Scheduled>,
-    limit: Duration,
-) -> Result<(), String> {
-    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
-    let ui = Arc::new(move |event| {
+) -> Result<RunningMeeting, String> {
+    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
+    let ui: StatusSink = Arc::new(move |event| {
         let _ = events_tx.send(event);
     });
     let (commands, receiver) = meeting::command_channel();
@@ -215,6 +225,66 @@ async fn rerun_loop(
     commands
         .send(EngineCommand::StartMeeting)
         .map_err(|_| "the engine loop exited before the meeting started".to_string())?;
+    Ok(RunningMeeting {
+        commands,
+        events,
+        running,
+    })
+}
+
+/// Tell the engine to shut down, wait for its task, and turn the outcome of
+/// the timed meeting loop into the run's result, reporting
+/// `timeout_message` when the limit expired.
+pub async fn finish_meeting(
+    commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    running: tokio::task::JoinHandle<()>,
+    outcome: Result<(), tokio::time::error::Elapsed>,
+    timeout_message: &str,
+) -> Result<(), String> {
+    let _ = commands.send(EngineCommand::Shutdown);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    outcome.map_err(|_| timeout_message.to_string())
+}
+
+/// Print what `--replay` and the session re-run print identically: finals
+/// and statuses, and suggestion deltas and ends through `printer`; every
+/// other event is left to the caller's own loop handling.
+pub fn print_meeting_event(printer: &mut replay_print::SuggestionPrinter, event: &UiEvent) {
+    match event {
+        UiEvent::TranscriptFinal(final_) => replay_print::print_final(final_),
+        UiEvent::Status {
+            source,
+            level,
+            text,
+        } => replay_print::print_status(*source, *level, text),
+        UiEvent::SuggestionDelta { id, text } => {
+            let mut out = std::io::stdout();
+            printer.delta(*id, text, &mut out);
+            let _ = out.flush();
+        }
+        UiEvent::SuggestionEnd { id, end } => {
+            printer.end(*id, end, &mut std::io::stdout(), &mut std::io::stderr());
+        }
+        _ => {}
+    }
+}
+
+/// The meeting loop: same printing as `--replay`, plus the recorded
+/// commands at their due seconds. Ends per D-replay-end: the sources
+/// drained, every recorded command sent, and no suggestion open; commands
+/// still waiting when the sources drain go at once, in order.
+async fn rerun_loop(
+    config: Config,
+    factory: Arc<dyn SourceFactory>,
+    trace_opener: Arc<dyn TraceOpener>,
+    mut pending: VecDeque<Scheduled>,
+    limit: Duration,
+) -> Result<(), String> {
+    let RunningMeeting {
+        commands,
+        mut events,
+        running,
+    } = start_meeting(config, factory, trace_opener)?;
 
     let outcome = tokio::time::timeout(limit, async {
         let mut printer = replay_print::SuggestionPrinter::default();
@@ -226,25 +296,14 @@ async fn rerun_loop(
         // them to hold quietly for a moment before calling it an end.
         let mut quiet_since: Option<Instant> = None;
         loop {
-            while let Ok(event) = events_rx.try_recv() {
+            while let Ok(event) = events.try_recv() {
+                print_meeting_event(&mut printer, &event);
                 match event {
                     UiEvent::MeetingState(MeetingState::Running) if started.is_none() => {
                         started = Some(Instant::now());
                     }
-                    UiEvent::TranscriptFinal(final_) => replay_print::print_final(&final_),
-                    UiEvent::Status {
-                        source,
-                        level,
-                        text,
-                    } => replay_print::print_status(source, level, &text),
                     UiEvent::SuggestionStart { .. } => open_suggestions += 1,
-                    UiEvent::SuggestionDelta { id, text } => {
-                        let mut out = std::io::stdout();
-                        printer.delta(id, &text, &mut out);
-                        let _ = out.flush();
-                    }
-                    UiEvent::SuggestionEnd { id, end } => {
-                        printer.end(id, &end, &mut std::io::stdout(), &mut std::io::stderr());
+                    UiEvent::SuggestionEnd { .. } => {
                         open_suggestions = open_suggestions.saturating_sub(1);
                     }
                     UiEvent::SourcesDrained => {
@@ -285,7 +344,11 @@ async fn rerun_loop(
     })
     .await;
 
-    let _ = commands.send(EngineCommand::Shutdown);
-    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
-    outcome.map_err(|_| format!("the re-run did not finish within {} s", limit.as_secs()))
+    finish_meeting(
+        &commands,
+        running,
+        outcome,
+        &format!("the re-run did not finish within {} s", limit.as_secs()),
+    )
+    .await
 }

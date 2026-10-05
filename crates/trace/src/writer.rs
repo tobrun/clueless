@@ -529,13 +529,7 @@ impl TraceSink for DiskTrace {
         }
     }
 
-    fn now_ms(&self) -> u64 {
-        self.stamper.now_ms()
-    }
-
-    fn next_call(&self) -> u64 {
-        self.stamper.next_call()
-    }
+    stamper_forwarding!();
 
     fn location(&self) -> Option<Location> {
         Some(Location {

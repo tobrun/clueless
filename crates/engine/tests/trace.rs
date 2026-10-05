@@ -19,86 +19,9 @@ use trace::record::{
     AsrOutcome, Body, CommandName, DropReason, EndReason, MeetingState as TraceState,
     PolicyOutcome, Profile, SegmentKind, Speaker as TraceSpeaker,
 };
-use trace::sink::{Location, MemoryOpener, MemoryTrace};
+use trace::sink::{Location, MemoryOpener};
 
 use support::*;
-
-const WAIT: Duration = Duration::from_secs(8);
-
-async fn finish(h: &mut MeetingHarness) {
-    h.cmd(EngineCommand::Shutdown);
-    timeout(WAIT, &mut h.engine)
-        .await
-        .expect("engine loop returns")
-        .expect("engine task does not panic");
-}
-
-fn opener() -> Arc<MemoryOpener> {
-    Arc::new(MemoryOpener::new())
-}
-
-/// `MeetingOpts` that record through `opener`.
-fn trace_opts(opener: &Arc<MemoryOpener>) -> MeetingOpts {
-    MeetingOpts {
-        trace: Some(opener.clone()),
-        ..MeetingOpts::default()
-    }
-}
-
-/// A meeting harness with `opener` installed and one Me meeting queued.
-async fn tracing_meeting(
-    asr: &MockAsr,
-    llm: &MockLlm,
-    factory: ScriptedFactory,
-    vad: Vec<VadScript>,
-    opener: &Arc<MemoryOpener>,
-    opts: MeetingOpts,
-) -> MeetingHarness {
-    let opts = MeetingOpts {
-        trace: Some(opener.clone()),
-        ..opts
-    };
-    MeetingHarness::start(asr, llm, factory, vad, opts).await
-}
-
-fn last_bodies(trace: &Arc<MemoryTrace>) -> Vec<Body> {
-    trace.records().into_iter().map(|r| r.body).collect()
-}
-
-fn single_trace(opener: &Arc<MemoryOpener>) -> Arc<MemoryTrace> {
-    let traces = opener.traces();
-    assert_eq!(traces.len(), 1, "exactly one trace was opened");
-    traces[0].clone()
-}
-
-/// True when every check finds its body at or after the one before.
-fn ordered(bodies: &[Body], checks: &[&dyn Fn(&Body) -> bool]) -> bool {
-    let mut rest = bodies.iter();
-    checks.iter().all(|check| rest.any(check))
-}
-
-fn is_state(state: TraceState) -> impl Fn(&Body) -> bool {
-    move |body| *body == Body::MeetingState { state }
-}
-
-/// Start a Me meeting, wait until Running, and return the harness.
-async fn start_running(h: &MeetingHarness) {
-    h.cmd(EngineCommand::StartMeeting);
-    assert!(
-        h.wait_state(MeetingState::Running, WAIT).await,
-        "meeting reaches Running: {:?}",
-        h.states()
-    );
-}
-
-/// Stop a running meeting and wait for `Idle`.
-async fn stop_and_wait(h: &MeetingHarness) {
-    h.cmd(EngineCommand::StopMeeting);
-    assert!(
-        h.wait_state(MeetingState::Idle, WAIT).await,
-        "meeting returns to Idle"
-    );
-}
 
 /// One closed Me utterance on a single speaker.
 fn one_utterance() -> (ScriptedFactory, Vec<VadScript>) {
@@ -112,24 +35,68 @@ fn one_utterance() -> (ScriptedFactory, Vec<VadScript>) {
     )
 }
 
+/// One Me source streaming the `runs` loudness pattern at `speed`, with its
+/// vad script.
+fn me_source(
+    runs: &[(usize, f32)],
+    speed: f64,
+    never_end: bool,
+) -> (ScriptedFactory, Vec<VadScript>) {
+    let (frames, probs) = pattern(runs);
+    (
+        ScriptedFactory::new(vec![(
+            Speaker::Me,
+            vec![OpenPlan::Ok(SourcePlan {
+                frames,
+                speed,
+                never_end,
+            })],
+        )]),
+        vec![VadScript::Probs(probs)],
+    )
+}
+
+/// Run one utterance through a traced meeting until its drop is recorded, stop
+/// the meeting, and return the harness with the recorded bodies.
+async fn dropped_once(asr: &MockAsr, llm: &MockLlm) -> (MeetingHarness, Vec<Body>) {
+    let opener = opener();
+    let (factory, vad) = one_utterance();
+    let h = running_tracing_meeting(asr, llm, factory, vad, &opener, MeetingOpts::default()).await;
+    h.wait_dropped().await;
+    stop_and_wait(&h).await;
+    (h, last_bodies(&single_trace(&opener)))
+}
+
+fn is_state(state: TraceState) -> impl Fn(&Body) -> bool {
+    move |body| *body == Body::MeetingState { state }
+}
+
+/// A memory opener announcing the session directory, with audio or without.
+fn location_opener(audio: bool) -> Arc<MemoryOpener> {
+    Arc::new(MemoryOpener::with_location(Location {
+        dir: PathBuf::from("/tmp/clueless-session"),
+        audio,
+    }))
+}
+
+/// True when an App Info status announces exactly `text`.
+fn announces(statuses: &[(StatusSource, StatusLevel, String)], text: &str) -> bool {
+    statuses.iter().any(|(source, level, t)| {
+        *source == StatusSource::App && *level == StatusLevel::Info && t == text
+    })
+}
+
 // ------------------------------------------------------------------ happy path
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_recorded_meeting_leaves_the_transcription_side_in_order() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.set_default_final(Respond::text("mock words"));
     let opener = opener();
     let (factory, vad) = one_utterance();
-    let h = tracing_meeting(&asr, &llm, factory, vad, &opener, MeetingOpts::default()).await;
-    start_running(&h).await;
-    let finals = h
-        .wait_until(WAIT, |e| {
-            e.iter()
-                .any(|e| matches!(e, clueless_types::events::UiEvent::TranscriptFinal(_)))
-        })
-        .await;
-    let _ = finals;
+    let h =
+        running_tracing_meeting(&asr, &llm, factory, vad, &opener, MeetingOpts::default()).await;
+    h.wait_final().await;
     stop_and_wait(&h).await;
     let trace = single_trace(&opener);
     let bodies = last_bodies(&trace);
@@ -194,12 +161,11 @@ async fn a_recorded_meeting_leaves_the_transcription_side_in_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_trace_is_closed_by_the_time_idle_arrives() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
     let (factory, vad) = one_utterance();
-    let h = tracing_meeting(&asr, &llm, factory, vad, &opener, MeetingOpts::default()).await;
-    start_running(&h).await;
+    let h =
+        running_tracing_meeting(&asr, &llm, factory, vad, &opener, MeetingOpts::default()).await;
     stop_and_wait(&h).await;
     // The harness has received `Idle`; the trace was closed before it.
     let trace = single_trace(&opener);
@@ -218,20 +184,9 @@ async fn the_trace_is_closed_by_the_time_idle_arrives() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_speech_records_its_call_and_drop_reason() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.set_default_final(Respond::text("   "));
-    let opener = opener();
-    let (factory, vad) = one_utterance();
-    let h = tracing_meeting(&asr, &llm, factory, vad, &opener, MeetingOpts::default()).await;
-    start_running(&h).await;
-    h.wait_until(WAIT, |e| {
-        e.iter()
-            .any(|e| matches!(e, clueless_types::events::UiEvent::TranscriptDropped { .. }))
-    })
-    .await;
-    stop_and_wait(&h).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    let (mut h, bodies) = dropped_once(&asr, &llm).await;
     assert!(
         ordered(
             &bodies,
@@ -255,28 +210,17 @@ async fn no_speech_records_its_call_and_drop_reason() {
         ),
         "no_speech call and drop: {bodies:#?}"
     );
-    finish(&mut { h }).await;
+    finish(&mut h).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_permanently_failing_asr_records_error_and_drop_reason() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     // Three 500s exhaust the final worker's retries in one call.
     for _ in 0..3 {
         asr.enqueue_final(Respond::Status(500));
     }
-    let opener = opener();
-    let (factory, vad) = one_utterance();
-    let h = tracing_meeting(&asr, &llm, factory, vad, &opener, MeetingOpts::default()).await;
-    start_running(&h).await;
-    h.wait_until(WAIT, |e| {
-        e.iter()
-            .any(|e| matches!(e, clueless_types::events::UiEvent::TranscriptDropped { .. }))
-    })
-    .await;
-    stop_and_wait(&h).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    let (mut h, bodies) = dropped_once(&asr, &llm).await;
     let call = bodies
         .iter()
         .find_map(|b| match b {
@@ -310,13 +254,12 @@ async fn a_permanently_failing_asr_records_error_and_drop_reason() {
         1,
         "one record for the whole call, not one per retry"
     );
-    finish(&mut { h }).await;
+    finish(&mut h).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_echo_me_final_records_the_verdict_and_the_drop() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.set_default_final(Respond::text("hello there"));
     let opener = opener();
     // Same shape as the pipeline-level echo test: Them ends first, Me's copy
@@ -341,7 +284,7 @@ async fn an_echo_me_final_records_the_verdict_and_the_drop() {
             })],
         ),
     ]);
-    let h = tracing_meeting(
+    let h = running_tracing_meeting(
         &asr,
         &llm,
         factory,
@@ -350,19 +293,16 @@ async fn an_echo_me_final_records_the_verdict_and_the_drop() {
         MeetingOpts::default(),
     )
     .await;
-    start_running(&h).await;
-    let finals = h.wait_until(WAIT, |e| {
+    h.wait_until(WAIT, |e| {
         matches!(
-            e.iter().find(|e| matches!(e, clueless_types::events::UiEvent::TranscriptFinal(_))),
-            Some(clueless_types::events::UiEvent::TranscriptFinal(u)) if u.id.speaker == Speaker::Them
+            e.iter().find(|e| matches!(e, UiEvent::TranscriptFinal(_))),
+            Some(UiEvent::TranscriptFinal(u)) if u.id.speaker == Speaker::Them
         )
     })
     .await;
-    let _ = finals;
     // Me's final lands ~0.4 s later; give it room, then stop.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    stop_and_wait(&h).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    let bodies = stopped_bodies(&h, &opener).await;
     assert!(
         bodies
             .iter()
@@ -395,8 +335,7 @@ async fn an_echo_me_final_records_the_verdict_and_the_drop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_me_final_without_them_overlap_records_echo_false() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.set_default_final(Respond::text("only me"));
     let opener = opener();
     let (frames, probs) = pattern(&[(11, 0.0), (10, 0.9), (25, 0.0)]);
@@ -405,7 +344,7 @@ async fn a_me_final_without_them_overlap_records_echo_false() {
         (Speaker::Them, vec![OpenPlan::Ok(SourcePlan::endless(200))]),
     ]);
     // The Them detector scores the endless silence as silence forever.
-    let h = tracing_meeting(
+    let h = running_tracing_meeting(
         &asr,
         &llm,
         factory,
@@ -414,14 +353,8 @@ async fn a_me_final_without_them_overlap_records_echo_false() {
         MeetingOpts::default(),
     )
     .await;
-    start_running(&h).await;
-    h.wait_until(WAIT, |e| {
-        e.iter()
-            .any(|e| matches!(e, clueless_types::events::UiEvent::TranscriptFinal(_)))
-    })
-    .await;
-    stop_and_wait(&h).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    h.wait_final().await;
+    let bodies = stopped_bodies(&h, &opener).await;
     assert!(
         bodies
             .iter()
@@ -433,8 +366,7 @@ async fn a_me_final_without_them_overlap_records_echo_false() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_full_final_queue_records_the_queue_full_drop() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.block();
     asr.enqueue_final(Respond::Blocked(Box::new(Respond::text("first"))));
     asr.set_default_final(Respond::text("q"));
@@ -445,32 +377,10 @@ async fn a_full_final_queue_records_the_queue_full_drop() {
         runs.push((10, 0.9));
         runs.push((20, 0.0));
     }
-    let (frames, probs) = pattern(&runs);
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Me,
-        vec![OpenPlan::Ok(SourcePlan {
-            frames,
-            speed: 10.0,
-            never_end: true,
-        })],
-    )]);
-    let h = tracing_meeting(
-        &asr,
-        &llm,
-        factory,
-        vec![VadScript::Probs(probs)],
-        &opener,
-        MeetingOpts::default(),
-    )
-    .await;
-    start_running(&h).await;
-    let dropped = h
-        .wait_until(WAIT, |e| {
-            e.iter()
-                .any(|e| matches!(e, clueless_types::events::UiEvent::TranscriptDropped { .. }))
-        })
-        .await;
-    let _ = dropped;
+    let (factory, vad) = me_source(&runs, 10.0, true);
+    let h =
+        running_tracing_meeting(&asr, &llm, factory, vad, &opener, MeetingOpts::default()).await;
+    h.wait_dropped().await;
     let bodies = last_bodies(&single_trace(&opener));
     assert!(
         bodies.iter().any(|b| matches!(
@@ -489,30 +399,13 @@ async fn a_full_final_queue_records_the_queue_full_drop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopping_while_a_final_is_blocked_records_the_cancelled_drop() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.block();
     asr.enqueue_final(Respond::Blocked(Box::new(Respond::text("late"))));
     let opener = opener();
-    let (frames, probs) = pattern(&[(11, 0.0), (10, 0.9), (25, 0.0)]);
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Me,
-        vec![OpenPlan::Ok(SourcePlan {
-            frames,
-            speed: 20.0,
-            never_end: true,
-        })],
-    )]);
-    let h = tracing_meeting(
-        &asr,
-        &llm,
-        factory,
-        vec![VadScript::Probs(probs)],
-        &opener,
-        MeetingOpts::default(),
-    )
-    .await;
-    start_running(&h).await;
+    let (factory, vad) = me_source(&[(11, 0.0), (10, 0.9), (25, 0.0)], 20.0, true);
+    let h =
+        running_tracing_meeting(&asr, &llm, factory, vad, &opener, MeetingOpts::default()).await;
     assert!(
         asr.wait_requests(1, WAIT).await,
         "the final request reaches the mock"
@@ -551,8 +444,7 @@ async fn stopping_while_a_final_is_blocked_records_the_cancelled_drop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_overlap_strip_leaving_no_text_records_empty_after_overlap() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     // The forced-cut second piece repeats the first one whole, so the strip
     // removes everything.
     asr.set_final_min_ms(2_048);
@@ -575,7 +467,7 @@ async fn an_overlap_strip_leaving_no_text_records_empty_after_overlap() {
         },
         ..MeetingOpts::default()
     };
-    let h = tracing_meeting(
+    let h = running_tracing_meeting(
         &asr,
         &llm,
         factory,
@@ -584,14 +476,8 @@ async fn an_overlap_strip_leaving_no_text_records_empty_after_overlap() {
         opts,
     )
     .await;
-    start_running(&h).await;
-    h.wait_until(WAIT, |e| {
-        e.iter()
-            .any(|e| matches!(e, clueless_types::events::UiEvent::TranscriptDropped { .. }))
-    })
-    .await;
-    stop_and_wait(&h).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    h.wait_dropped().await;
+    let bodies = stopped_bodies(&h, &opener).await;
     assert!(
         bodies.iter().any(|b| matches!(
             b,
@@ -609,8 +495,7 @@ async fn an_overlap_strip_leaving_no_text_records_empty_after_overlap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_answered_interim_records_its_call_and_text() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     // At 20x speed the 1984 ms interim is sent and answered ~3.1 s in, long
     // before the final segment queues at ~4.6 s (their transcribe.rs twin);
     // the final itself is held at the mock so its watermark cannot pass the
@@ -620,38 +505,13 @@ async fn an_answered_interim_records_its_call_and_text() {
     asr.enqueue_interim(Respond::text("hel"));
     asr.enqueue_final(Respond::Blocked(Box::new(Respond::text("hello"))));
     let opener = opener();
-    let (frames, probs) = pattern(&[(11, 0.0), (80, 0.9), (20, 0.0)]);
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Me,
-        vec![OpenPlan::Ok(SourcePlan {
-            frames,
-            speed: 20.0,
-            never_end: false,
-        })],
-    )]);
-    let h = tracing_meeting(
-        &asr,
-        &llm,
-        factory,
-        vec![VadScript::Probs(probs)],
-        &opener,
-        MeetingOpts::default(),
-    )
-    .await;
-    start_running(&h).await;
-    h.wait_until(WAIT, |e| {
-        e.iter()
-            .any(|e| matches!(e, clueless_types::events::UiEvent::TranscriptInterim { .. }))
-    })
-    .await;
+    let (factory, vad) = me_source(&[(11, 0.0), (80, 0.9), (20, 0.0)], 20.0, false);
+    let h =
+        running_tracing_meeting(&asr, &llm, factory, vad, &opener, MeetingOpts::default()).await;
+    h.wait_interim().await;
     asr.release();
-    h.wait_until(WAIT, |e| {
-        e.iter()
-            .any(|e| matches!(e, clueless_types::events::UiEvent::TranscriptFinal(_)))
-    })
-    .await;
-    stop_and_wait(&h).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    h.wait_final().await;
+    let bodies = stopped_bodies(&h, &opener).await;
     assert_eq!(
         bodies
             .iter()
@@ -679,22 +539,20 @@ async fn an_answered_interim_records_its_call_and_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_seconds_of_audio_record_a_frame_time_every_32_ms() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
     // 62 frames of 512 samples at 16 kHz = 1.984 s of meeting audio.
     let factory =
         ScriptedFactory::new(vec![(Speaker::Me, vec![OpenPlan::Ok(SourcePlan::new(62))])]);
-    let h = tracing_meeting(
+    let h = running_tracing_meeting(
         &asr,
         &llm,
         factory,
-        vec![VadScript::Probs(Vec::new())],
+        silence_vad(),
         &opener,
         MeetingOpts::default(),
     )
     .await;
-    start_running(&h).await;
     stop_and_wait(&h).await;
     let trace = single_trace(&opener);
     let times = trace.audio_times(TraceSpeaker::Me);
@@ -712,8 +570,7 @@ async fn two_seconds_of_audio_record_a_frame_time_every_32_ms() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commands_received_while_running_are_recorded_in_order() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
     let opts = MeetingOpts {
         start_profile: AssistProfile::Manual,
@@ -752,22 +609,9 @@ async fn commands_received_while_running_are_recorded_in_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_suggestion_while_idle_opens_no_trace() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Me,
-        vec![OpenPlan::Ok(SourcePlan::endless(200))],
-    )]);
-    let mut h = tracing_meeting(
-        &asr,
-        &llm,
-        factory,
-        vec![VadScript::Probs(Vec::new())],
-        &opener,
-        MeetingOpts::default(),
-    )
-    .await;
+    let mut h = idle_tracing_meeting(&asr, &llm, &opener, MeetingOpts::default()).await;
     h.cmd(EngineCommand::Suggest);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(opener.traces().is_empty(), "no trace for an idle suggest");
@@ -777,21 +621,13 @@ async fn a_suggestion_while_idle_opens_no_trace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_meetings_in_one_run_each_get_their_own_trace() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Me,
-        vec![
-            OpenPlan::Ok(SourcePlan::endless(200)),
-            OpenPlan::Ok(SourcePlan::endless(200)),
-        ],
-    )]);
     let mut h = tracing_meeting(
         &asr,
         &llm,
-        factory,
-        vec![VadScript::Probs(Vec::new())],
+        endless_me_factory(2),
+        silence_vad(),
         &opener,
         MeetingOpts::default(),
     )
@@ -842,8 +678,7 @@ async fn two_meetings_in_one_run_each_get_their_own_trace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_meeting_with_no_openable_source_ends_the_trace_start_failed() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
     let factory = ScriptedFactory::new(vec![(
         Speaker::Me,
@@ -855,7 +690,7 @@ async fn a_meeting_with_no_openable_source_ends_the_trace_start_failed() {
         &asr,
         &llm,
         factory,
-        vec![VadScript::Probs(Vec::new())],
+        silence_vad(),
         &opener,
         MeetingOpts::default(),
     )
@@ -879,17 +714,12 @@ async fn a_meeting_with_no_openable_source_ends_the_trace_start_failed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_panicking_component_ends_the_trace_with_panic() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Me,
-        vec![OpenPlan::Ok(SourcePlan::endless(200))],
-    )]);
     let mut h = tracing_meeting(
         &asr,
         &llm,
-        factory,
+        endless_me_factory(1),
         vec![VadScript::PanicsAt(3)],
         &opener,
         MeetingOpts::default(),
@@ -914,8 +744,7 @@ async fn a_panicking_component_ends_the_trace_with_panic() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_during_a_meeting_ends_the_trace_with_shutdown() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
     let mut h = running_me_with(&asr, &llm, trace_opts(&opener)).await;
     finish(&mut h).await;
@@ -932,8 +761,7 @@ async fn shutdown_during_a_meeting_ends_the_trace_with_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_command_channel_ends_the_trace_channel_closed() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
     let h = running_me_with(&asr, &llm, trace_opts(&opener)).await;
     let engine = h.engine;
@@ -965,8 +793,7 @@ async fn a_dropped_command_channel_ends_the_trace_channel_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_notes_file_is_recorded_once_per_meeting() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
     let path = temp_path("notes");
     std::fs::write(&path, "I am Tobrun").expect("write notes");
@@ -975,8 +802,7 @@ async fn the_notes_file_is_recorded_once_per_meeting() {
         ..trace_opts(&opener)
     };
     let mut h = running_me_with(&asr, &llm, opts).await;
-    stop_and_wait(&h).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    let bodies = stopped_bodies(&h, &opener).await;
     assert_eq!(
         bodies
             .iter()
@@ -997,12 +823,10 @@ async fn the_notes_file_is_recorded_once_per_meeting() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_notes_path_there_is_no_notes_record() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     let opener = opener();
     let mut h = running_me_with(&asr, &llm, trace_opts(&opener)).await;
-    stop_and_wait(&h).await;
-    let bodies = last_bodies(&single_trace(&opener));
+    let bodies = stopped_bodies(&h, &opener).await;
     assert!(
         !bodies.iter().any(|b| matches!(b, Body::Notes { .. })),
         "no notes record: {bodies:#?}"
@@ -1012,34 +836,16 @@ async fn without_a_notes_path_there_is_no_notes_record() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_policy_records_its_waiting_and_fired_outcomes() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.enqueue_final(Respond::text("what happens to the budget next quarter?"));
     llm.enqueue(LlmReply::stream(&["It doubles."]));
     let opener = opener();
-    let (frames, probs) = pattern(&[(11, 0.0), (20, 0.9), (25, 0.0)]);
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Them,
-        vec![OpenPlan::Ok(SourcePlan {
-            frames,
-            speed: 1000.0,
-            never_end: true,
-        })],
-    )]);
+    let (factory, vad) = one_them_turn();
     let opts = MeetingOpts {
         start_profile: AssistProfile::Interview,
-        ..trace_opts(&opener)
+        ..MeetingOpts::default()
     };
-    let mut h = tracing_meeting(
-        &asr,
-        &llm,
-        factory,
-        vec![VadScript::Probs(probs)],
-        &opener,
-        opts,
-    )
-    .await;
-    start_running(&h).await;
+    let mut h = running_tracing_meeting(&asr, &llm, factory, vad, &opener, opts).await;
     assert!(
         llm.wait_bodies(1, WAIT).await,
         "the automatic request fires"
@@ -1096,28 +902,11 @@ async fn the_policy_records_its_waiting_and_fired_outcomes() {
     finish(&mut h).await;
 }
 
-/// Poll the newest trace's bodies until `done` accepts them.
-async fn loop_bodies_until(
-    opener: &Arc<MemoryOpener>,
-    done: impl Fn(&Vec<Body>) -> bool,
-) -> Vec<Body> {
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let bodies = last_bodies(&single_trace(opener));
-        if done(&bodies) || tokio::time::Instant::now() >= deadline {
-            return bodies;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_opener_warns_and_the_meeting_runs_unrecorded() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
+    let (asr, llm) = start_mocks().await;
     asr.set_default_final(Respond::text("unrecorded words"));
-    let (frames, probs) = pattern(&[(11, 0.0), (10, 0.9), (25, 0.0)]);
-    let _ = frames;
+    let (_, probs) = pattern(&[(11, 0.0), (10, 0.9), (25, 0.0)]);
     let opts = MeetingOpts {
         trace: Some(Arc::new(FailingOpener::new("disk full"))),
         ..MeetingOpts::default()
@@ -1131,11 +920,7 @@ async fn a_failing_opener_warns_and_the_meeting_runs_unrecorded() {
     )
     .await;
     start_running(&h).await;
-    h.wait_until(WAIT, |e| {
-        e.iter()
-            .any(|e| matches!(e, clueless_types::events::UiEvent::TranscriptFinal(_)))
-    })
-    .await;
+    h.wait_final().await;
     let statuses = h.statuses();
     let warns: Vec<_> = statuses
         .iter()
@@ -1162,20 +947,12 @@ async fn a_failing_opener_warns_and_the_meeting_runs_unrecorded() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_location_with_audio_announces_the_directory_with_audio() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
-    let opener = Arc::new(MemoryOpener::with_location(Location {
-        dir: PathBuf::from("/tmp/clueless-session"),
-        audio: true,
-    }));
+    let (asr, llm) = start_mocks().await;
+    let opener = location_opener(true);
     let mut h = running_me_with(&asr, &llm, trace_opts(&opener)).await;
     let statuses = h.statuses();
     assert!(
-        statuses.iter().any(|(source, level, text)| {
-            *source == StatusSource::App
-                && *level == StatusLevel::Info
-                && text == "recording to /tmp/clueless-session (with audio)"
-        }),
+        announces(&statuses, "recording to /tmp/clueless-session (with audio)"),
         "the Info line names the directory and the audio: {statuses:?}"
     );
     stop_and_wait(&h).await;
@@ -1184,20 +961,12 @@ async fn a_location_with_audio_announces_the_directory_with_audio() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_location_without_audio_announces_the_directory_alone() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
-    let opener = Arc::new(MemoryOpener::with_location(Location {
-        dir: PathBuf::from("/tmp/clueless-session"),
-        audio: false,
-    }));
+    let (asr, llm) = start_mocks().await;
+    let opener = location_opener(false);
     let mut h = running_me_with(&asr, &llm, trace_opts(&opener)).await;
     let statuses = h.statuses();
     assert!(
-        statuses.iter().any(|(source, level, text)| {
-            *source == StatusSource::App
-                && *level == StatusLevel::Info
-                && text == "recording to /tmp/clueless-session"
-        }),
+        announces(&statuses, "recording to /tmp/clueless-session"),
         "the Info line names only the directory: {statuses:?}"
     );
     assert!(
@@ -1212,17 +981,12 @@ async fn a_location_without_audio_announces_the_directory_alone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_default_harness_never_announces_a_recording() {
-    let asr = MockAsr::start().await;
-    let llm = MockLlm::start().await;
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Me,
-        vec![OpenPlan::Ok(SourcePlan::endless(200))],
-    )]);
+    let (asr, llm) = start_mocks().await;
     let mut h = MeetingHarness::start(
         &asr,
         &llm,
-        factory,
-        vec![VadScript::Probs(Vec::new())],
+        endless_me_factory(1),
+        silence_vad(),
         MeetingOpts::default(),
     )
     .await;
@@ -1235,20 +999,4 @@ async fn the_default_harness_never_announces_a_recording() {
         h.statuses()
     );
     finish(&mut h).await;
-}
-
-// ------------------------------------------------------------------ shared setups
-
-/// A running Me-only meeting over an endless silent source.
-async fn running_me_with(asr: &MockAsr, llm: &MockLlm, opts: MeetingOpts) -> MeetingHarness {
-    let opener_present = opts.trace.is_some();
-    let _ = opener_present;
-    let factory = ScriptedFactory::new(vec![(
-        Speaker::Me,
-        vec![OpenPlan::Ok(SourcePlan::endless(200))],
-    )]);
-    let h =
-        MeetingHarness::start(asr, llm, factory, vec![VadScript::Probs(Vec::new())], opts).await;
-    start_running(&h).await;
-    h
 }

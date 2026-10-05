@@ -16,10 +16,14 @@ use axum::extract::State;
 use axum::http::header::{self, HeaderMap};
 use axum::response::Response;
 use axum::routing::post;
+use futures_util::StreamExt;
+use llm::client::LlmClient;
+use llm::types::{ChatRequest, Message, StreamPart};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 /// One scripted action on the response connection.
 #[derive(Debug, Clone)]
@@ -303,4 +307,60 @@ pub fn usage_frame(usage: serde_json::Value) -> String {
         "choices": [],
     });
     format!("data: {chunk}\n\n")
+}
+
+/// A client with the tests' shared defaults (2 s connect, 10 s stall, no key)
+/// pointed at `base_url`.
+pub fn test_client(base_url: &str) -> LlmClient {
+    LlmClient::new(
+        base_url,
+        "mock-model",
+        None,
+        Duration::from_secs(2),
+        Duration::from_secs(10),
+    )
+}
+
+/// The standard chat request the tests stream (short max tokens, thinking off).
+pub fn test_request(include_usage: bool) -> ChatRequest {
+    ChatRequest::new(
+        "mock-model",
+        vec![Message::user("hi")],
+        220,
+        0.4,
+        Some(false),
+        include_usage,
+    )
+}
+
+/// Everything a cancellation test cancels: the mock (streams one `first`
+/// chunk, then holds the connection open), the cancel token wired into the
+/// stream, and the live stream.
+pub struct CancelRun {
+    pub mock: Mock,
+    pub cancel: CancellationToken,
+    pub stream: futures_util::stream::BoxStream<'static, Result<StreamPart, llm::client::LlmError>>,
+}
+
+/// Start a mock that streams one content chunk and then holds, open a stream
+/// against it, and consume the first part (asserting it is `first` content).
+pub async fn cancel_run(include_usage: bool) -> CancelRun {
+    let mock = Mock::start(Reply::Stream(vec![
+        Step::Chunk("first".into()),
+        Step::Hold(Duration::from_secs(10)),
+    ]))
+    .await;
+    let client = test_client(&mock.base_url);
+    let cancel = CancellationToken::new();
+    let mut stream = Box::pin(client.stream(test_request(include_usage), cancel.clone()));
+    assert_eq!(
+        stream.next().await,
+        Some(Ok(StreamPart::Content("first".to_string()))),
+        "the stream yields one content delta before the cancel"
+    );
+    CancelRun {
+        mock,
+        cancel,
+        stream,
+    }
 }

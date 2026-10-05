@@ -226,6 +226,32 @@ pub async fn asr_transcribe(State(mock): State<AsrMock>) -> impl IntoResponse {
     )
 }
 
+/// A test's temp home wired to the mock servers: a fresh directory whose
+/// `.env` points at a mock ASR answering `asr_text` and an LLM streaming
+/// `llm_parts` (its chat requests are counted in `llm_calls`).
+pub struct Mocked {
+    pub dir: TempDir,
+    /// The mock ASR's port, for re-pointing the env file later.
+    pub asr: u16,
+    /// The `.env` file inside `dir`.
+    pub env: PathBuf,
+    /// How many chat requests the LLM mock served.
+    pub llm_calls: Arc<AtomicUsize>,
+}
+
+pub async fn mock_home(tag: &str, asr_text: &str, llm_parts: &[&str]) -> Mocked {
+    let dir = TempDir::new(tag);
+    let asr = spawn_asr_mock(asr_text).await;
+    let (llm, llm_calls) = spawn_counting_llm_mock(llm_parts).await;
+    let env = write_mock_env(&dir, llm, asr);
+    Mocked {
+        dir,
+        asr,
+        env,
+        llm_calls,
+    }
+}
+
 pub async fn spawn_asr_mock(text: &str) -> u16 {
     let state = AsrMock {
         model: "test-model".to_string(),

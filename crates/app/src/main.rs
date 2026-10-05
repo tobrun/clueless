@@ -5,7 +5,6 @@
 //! `--compare`), which read files only and therefore run before the server
 //! settings are read (D-inspect-tools).
 
-use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,12 +122,9 @@ fn run_replay(mut config: Config, cli: &Cli, replay: Replay) -> ExitCode {
     // A WAV replay records a session like a live meeting, with origin
     // `replay_wav` (D-wav-replay-records).
     let trace = recording::opener(&config, cli, Origin::ReplayWav, replay.speed);
-    let runtime = match tokio::runtime::Runtime::new() {
+    let runtime = match rerun::replay_runtime() {
         Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("replay: cannot start a tokio runtime: {error}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     match runtime.block_on(replay_loop(config, factory, trace, replay.ask)) {
         Ok(()) => ExitCode::SUCCESS,
@@ -145,37 +141,19 @@ async fn replay_loop(
     trace_opener: Arc<dyn TraceOpener>,
     ask: bool,
 ) -> Result<(), String> {
-    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
-    let ui: StatusSink = Arc::new(move |event| {
-        let _ = events_tx.send(event);
-    });
-    let (commands, receiver) = meeting::command_channel();
-    let mut deps = EngineDeps::production(factory, ui);
-    deps.trace = trace_opener;
-    let engine = meeting::Engine::new(config, deps);
-    let running = tokio::spawn(engine.run(receiver));
-    commands
-        .send(EngineCommand::StartMeeting)
-        .map_err(|_| "the engine loop exited before the meeting started".to_string())?;
+    let rerun::RunningMeeting {
+        commands,
+        mut events,
+        running,
+    } = rerun::start_meeting(config, factory, trace_opener)?;
 
     let outcome = tokio::time::timeout(REPLAY_LIMIT, async {
         let mut asked = false;
         let mut printer = replay_print::SuggestionPrinter::default();
-        while let Some(event) = events_rx.recv().await {
+        while let Some(event) = events.recv().await {
+            rerun::print_meeting_event(&mut printer, &event);
             match event {
-                UiEvent::TranscriptFinal(final_) => replay_print::print_final(&final_),
-                UiEvent::Status {
-                    source,
-                    level,
-                    text,
-                } => replay_print::print_status(source, level, &text),
-                UiEvent::SuggestionDelta { id, text } => {
-                    let mut out = std::io::stdout();
-                    printer.delta(id, &text, &mut out);
-                    let _ = out.flush();
-                }
-                UiEvent::SuggestionEnd { id, end } => {
-                    printer.end(id, &end, &mut std::io::stdout(), &mut std::io::stderr());
+                UiEvent::SuggestionEnd { .. } => {
                     // `SourcesDrained` only arrives once nothing is running
                     // or waiting, so after the asked request was sent this
                     // is its end.
@@ -197,9 +175,13 @@ async fn replay_loop(
     })
     .await;
 
-    let _ = commands.send(EngineCommand::Shutdown);
-    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
-    outcome.map_err(|_| format!("replay did not finish within {} s", REPLAY_LIMIT.as_secs()))
+    rerun::finish_meeting(
+        &commands,
+        running,
+        outcome,
+        &format!("replay did not finish within {} s", REPLAY_LIMIT.as_secs()),
+    )
+    .await
 }
 
 /// GUI mode: the single-instance lock, the engine with live capture on a
