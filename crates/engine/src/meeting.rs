@@ -593,13 +593,16 @@ impl Engine {
         };
         let compress_cancel = CancellationToken::new();
         let compress_task = tokio::spawn(compress::run(
-            store.clone(),
-            llm.clone(),
-            self.deps.compress_threshold_tokens,
-            timings.compress_retry,
-            self.config.llm.temperature as f64,
-            self.config.llm.enable_thinking,
-            self.config.llm.include_usage,
+            compress::CompressDeps {
+                store: store.clone(),
+                llm: llm.clone(),
+                threshold: self.deps.compress_threshold_tokens,
+                retry: timings.compress_retry,
+                temperature: self.config.llm.temperature as f64,
+                enable_thinking: self.config.llm.enable_thinking,
+                include_usage: self.config.llm.include_usage,
+                trace: sink.clone(),
+            },
             pipeline.commits(),
             self.deps.ui.clone(),
             compress_cancel.clone(),
@@ -769,6 +772,19 @@ impl Engine {
         );
         let cancel = CancellationToken::new();
         meeting.policy.request_started(origin, Instant::now());
+        // One call id belongs to this whole request: it is on the request
+        // record and on every delta and end record the stream produces (C-llm-call-id).
+        let call = meeting.sink.next_call();
+        let body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+        meeting.sink.record(Body::LlmRequest {
+            call,
+            purpose: trace::record::Purpose::Suggestion,
+            suggestion: Some(id),
+            origin: Some(origin.into()),
+            profile: Some(profile.into()),
+            body,
+        });
+        let trace = meeting.sink.clone();
         let task = tokio::spawn(suggest::run(
             id,
             meeting.llm.clone(),
@@ -777,6 +793,8 @@ impl Engine {
             self.deps.ui.clone(),
             origin == Origin::Auto,
             finished_tx.clone(),
+            trace,
+            call,
         ));
         meeting.suggestion = Some(RunningSuggestion { id, task, cancel });
     }
