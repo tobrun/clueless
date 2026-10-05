@@ -301,3 +301,59 @@ fn bad_backend_error_lists_the_three_allowed_forms() {
     assert!(msg.contains("cpal_loopback"), "error was: {msg}");
     assert!(msg.contains("device:<name>"), "error was: {msg}");
 }
+
+#[test]
+fn a_config_without_the_trace_table_records_text_but_not_audio() {
+    let cfg = load("", "no-trace", &[]).unwrap();
+    assert!(cfg.trace.enabled, "recording is on by default");
+    assert!(!cfg.trace.audio, "audio is opt-in");
+}
+
+#[test]
+fn the_trace_table_switches_audio_on() {
+    let cfg = load("[trace]\naudio = true\n", "trace-audio", &[]).unwrap();
+    assert!(cfg.trace.enabled);
+    assert!(cfg.trace.audio);
+}
+
+#[test]
+fn the_trace_table_can_switch_recording_off() {
+    let cfg = load("[trace]\nenabled = false\n", "trace-off", &[]).unwrap();
+    assert!(!cfg.trace.enabled);
+}
+
+#[test]
+fn an_unknown_key_in_the_trace_table_is_named() {
+    let err = load("[trace]\naudoi = true\n", "trace-typo", &[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unknown key trace.audoi"), "error was: {msg}");
+}
+
+#[test]
+fn trace_enabled_must_be_a_boolean_naming_the_key() {
+    let err = load("[trace]\nenabled = \"yes\"\n", "trace-str", &[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("trace.enabled"), "error was: {msg}");
+}
+
+#[test]
+fn include_usage_defaults_to_true() {
+    let map = env(&[]);
+    let cfg = Config::load(None, &lookup(&map)).unwrap();
+    assert!(cfg.llm.include_usage);
+}
+
+#[test]
+fn include_usage_reads_the_variable() {
+    let map = env(&[("LLM_INCLUDE_USAGE", "false")]);
+    let cfg = Config::load(None, &lookup(&map)).unwrap();
+    assert!(!cfg.llm.include_usage);
+}
+
+#[test]
+fn include_usage_refuses_anything_but_true_or_false_naming_the_variable() {
+    let map = env(&[("LLM_INCLUDE_USAGE", "maybe")]);
+    let err = Config::load(None, &lookup(&map)).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("LLM_INCLUDE_USAGE"), "error was: {msg}");
+}

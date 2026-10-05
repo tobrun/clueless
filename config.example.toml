@@ -24,6 +24,10 @@ hide_from_capture = true      # sets the panel's sharingType to none
 [assist]
 start_profile = "manual"      # "manual" | "interview" | "brainstorm"; manual sends nothing by itself
 
+[trace]
+enabled = true                # write a trace directory per meeting under the data dir
+audio = false                 # also record the meeting audio to WAV files (opt-in)
+
 [hotkeys]
 # meeting-only keys (registered only while a meeting runs):
 suggest = "cmd+Enter"

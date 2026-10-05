@@ -6,6 +6,7 @@ members = [
     "crates/asr",
     "crates/llm",
     "crates/context",
+    "crates/trace",
     "crates/engine",
     "crates/capture",
     "crates/overlay",
@@ -31,6 +32,7 @@ segmenter = { path = "crates/segmenter" }
 asr = { path = "crates/asr" }
 llm = { path = "crates/llm" }
 context = { path = "crates/context" }
+trace = { path = "crates/trace" }
 engine = { path = "crates/engine" }
 capture = { path = "crates/capture" }
 overlay = { path = "crates/overlay" }
