@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask bundle [--identity ID] [--out DIR]
-//! cargo xtask run
+//! cargo xtask run [--adhoc]
 //! ```
 //!
 //! `bundle` builds the app, assembles `clueless.app` and signs it, by default
@@ -11,6 +11,9 @@
 //! (a stable signature is what keeps the grants attached to the app).
 //! `run` bundles, makes sure a root `.env` exists and launches the bundle
 //! with `open`, so the app itself is responsible for its permission prompts.
+//! `run` refuses to build when the default identity is missing, because the
+//! silent ad-hoc fallback quietly breaks permission grants on every rebuild;
+//! pass `--adhoc` to choose that state knowingly.
 //! `open` neither shows the app's stderr nor passes on its exit code, so
 //! `run` reads back what the app appended to its log during the launch and
 //! fails with the message when the app logged a startup failure.
@@ -40,7 +43,7 @@ fn main() {
         Some("run") => cmd_run(&args[1..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask bundle [--identity ID] [--out DIR] [--binary PATH] | cargo xtask run"
+                "usage: cargo xtask bundle [--identity ID] [--out DIR] [--binary PATH] | cargo xtask run [--adhoc]"
             );
             eprintln!("  --identity ID   codesign identity to use; \"-\" means ad-hoc");
             Err("no valid subcommand given".to_string())
@@ -89,10 +92,39 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err(format!("run takes no arguments, got {args:?}"));
+    let mut adhoc = false;
+    for arg in args {
+        match arg.as_str() {
+            "--adhoc" => adhoc = true,
+            other => return Err(format!("unknown run argument {other:?}")),
+        }
     }
-    cmd_bundle(&[])?;
+    // An ad-hoc signature changes every build, so permission grants are lost
+    // on every rebuild. `run` is the developer loop where that hurts, so it
+    // refuses to sign ad-hoc unless asked to.
+    if !adhoc {
+        let names = codesigning_identities()?;
+        if !names.iter().any(|name| name == DEFAULT_IDENTITY) {
+            return Err(format!(
+                "codesigning identity {DEFAULT_IDENTITY:?} was not found in the login \
+                 keychain; create it with scripts/make-dev-cert.sh, or pass --adhoc to sign \
+                 ad-hoc and re-grant permissions after every rebuild"
+            ));
+        }
+    }
+    let bundle_args: Vec<String> = if adhoc {
+        ["--identity", "-"].iter().map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    cmd_bundle(&bundle_args)?;
+    if adhoc {
+        eprintln!(
+            "warning: signed ad-hoc; an ad-hoc signature changes every build, so macOS \
+             permission grants will not survive rebuilds.\n\
+             warning: run scripts/make-dev-cert.sh once to fix this."
+        );
+    }
     launch_and_check(&workspace_root()?)
 }
 

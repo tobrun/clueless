@@ -1,8 +1,7 @@
 //! End-to-end tests for `cargo xtask run`: the real xtask binary, with the
 //! app build skipped, a stand-in app binary, a throwaway `HOME` (so the log
-//! file is ours) and a fake `open` first on `PATH`. `open` is the operating
-//! system boundary: the real one starts the app through LaunchServices,
-//! which ignores this test's environment and needs a desktop session.
+//! file is ours), a fake `security` (so the identity check does not depend
+//! on this machine's keychain) and a fake `open` first on `PATH`.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -28,10 +27,26 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Runs `xtask run` with `open_script` as the body of the fake `open`, after
-/// putting `seeded_log` (when given) in the log file. Returns the output and
-/// the log path.
+/// Runs `xtask run --adhoc` with `open_script` as the body of the fake
+/// `open`, after putting `seeded_log` (when given) in the log file. Returns
+/// the output and the log path.
 fn xtask_run(test: &str, seeded_log: Option<&str>, open_script: &str) -> (Output, PathBuf) {
+    xtask_run_with(test, seeded_log, open_script, &["--adhoc"])
+}
+
+/// `xtask_run` with explicit run arguments.
+///
+/// `open` is the operating system boundary: the real one starts the app
+/// through LaunchServices, which ignores this test's environment and needs a
+/// desktop session. A fake `security` reporting an empty keychain keeps the
+/// identity check deterministic: these tests never depend on whether this
+/// machine happens to have the dev identity.
+fn xtask_run_with(
+    test: &str,
+    seeded_log: Option<&str>,
+    open_script: &str,
+    args: &[&str],
+) -> (Output, PathBuf) {
     let dir = scratch(test);
     let log = dir.join("Library/Logs/clueless/clueless.log");
     fs::create_dir_all(log.parent().expect("log dir")).expect("log dir");
@@ -56,21 +71,29 @@ fn xtask_run(test: &str, seeded_log: Option<&str>, open_script: &str) -> (Output
     let open = bin.join("open");
     fs::write(&open, format!("#!/bin/sh\n{open_script}\n")).expect("fake open");
     fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let security = bin.join("security");
+    fs::write(
+        &security,
+        "#!/bin/sh\nprintf '     0 valid identities found\\n'\n",
+    )
+    .expect("fake security");
+    fs::set_permissions(&security, fs::Permissions::from_mode(0o755)).expect("chmod");
 
     let path = format!(
         "{}:{}",
         bin.display(),
         std::env::var("PATH").expect("PATH is set")
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xtask"));
+    command
         .arg("run")
+        .args(args)
         .current_dir(workspace_root())
         .env("PATH", path)
         .env("HOME", &dir)
         .env("CARGO_TARGET_DIR", dir.join("target"))
-        .env("CLUELESS_XTASK_SKIP_BUILD", "1")
-        .output()
-        .expect("xtask runs");
+        .env("CLUELESS_XTASK_SKIP_BUILD", "1");
+    let output = command.output().expect("xtask runs");
     (output, log)
 }
 
@@ -145,4 +168,21 @@ fn run_points_the_app_at_the_workspace_env_file() {
         workspace_root().join(".env").to_str().expect("utf-8 path"),
         "args: {args}"
     );
+}
+
+#[test]
+fn run_without_the_dev_identity_fails_naming_the_cert_script() {
+    let (output, _) = xtask_run_with("no-identity", None, "exit 0", &[]);
+    let all = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{all}");
+    assert!(all.contains("scripts/make-dev-cert.sh"), "{all}");
+    assert!(all.contains("--adhoc"), "{all}");
+}
+
+#[test]
+fn run_adhoc_without_the_identity_warns_about_permission_grants() {
+    let (output, _) = xtask_run("adhoc-warning", None, "exit 0");
+    let all = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{all}");
+    assert!(all.contains("will not survive rebuilds"), "{all}");
 }
