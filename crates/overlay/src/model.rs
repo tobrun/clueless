@@ -187,9 +187,18 @@ impl UiModel {
                 if self.terminate_now() {
                     changes.terminate = true;
                 }
-                if state == MeetingState::Starting && !self.feed.is_empty() {
-                    self.feed.clear();
-                    changes.suggestion = true;
+                if state == MeetingState::Starting {
+                    if !self.feed.is_empty() {
+                        self.feed.clear();
+                        changes.suggestion = true;
+                    }
+                    // A stale error from a previous meeting must not keep
+                    // the line red in a healthy new one; the sources post
+                    // their statuses again right after `Starting`.
+                    if !self.status.is_empty() {
+                        self.status.clear();
+                        changes.status = true;
+                    }
                 }
                 changes
             }
@@ -317,7 +326,9 @@ impl UiModel {
     }
 
     /// The status line: the profile name (with " ..." while a request is
-    /// running), then all per-source texts, joined by the separator.
+    /// running), then all per-source texts worst level first, joined by the
+    /// separator. Within one level the fixed [`source_rank`] order applies,
+    /// so a capture failure is never pushed off the clipped right edge.
     pub fn status_line(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if let Some(profile) = self.profile {
@@ -328,8 +339,39 @@ impl UiModel {
             };
             parts.push(format!("{}{working}", profile.name()));
         }
-        parts.extend(self.status.iter().map(|(_, _, text)| text.clone()));
+        let mut entries: Vec<&(StatusSource, StatusLevel, String)> = self.status.iter().collect();
+        entries.sort_by_key(|(source, level, _)| (level_rank(*level), source_rank(*source)));
+        parts.extend(
+            entries
+                .into_iter()
+                .map(|(source, level, text)| status_text(*source, *level, text)),
+        );
         parts.join("  |  ")
+    }
+
+    /// Capture sources whose latest status is an `Error`, as
+    /// `(speaker label, prefixed status text)` in fixed source order. Every
+    /// such Error is terminal for that source (contract on
+    /// [`StatusLevel::Error`]), so a non-empty result means that side is
+    /// down for the rest of the meeting.
+    pub fn sources_down(&self) -> Vec<(&'static str, String)> {
+        let mut down: Vec<(u8, &'static str, String)> = self
+            .status
+            .iter()
+            .filter(|(_, level, _)| *level == StatusLevel::Error)
+            .filter_map(|(source, _, text)| {
+                let label = speaker_label(capture_speaker(*source)?);
+                Some((
+                    source_rank(*source),
+                    label,
+                    status_text(*source, StatusLevel::Error, text),
+                ))
+            })
+            .collect();
+        down.sort_by_key(|(rank, _, _)| *rank);
+        down.into_iter()
+            .map(|(_, label, text)| (label, text))
+            .collect()
     }
 
     /// The worst level currently shown, for status line coloring.
@@ -373,6 +415,48 @@ pub fn speaker_label(speaker: Speaker) -> &'static str {
         Speaker::Me => "Me",
         Speaker::Them => "Them",
     }
+}
+
+/// Display rank of a level: worst first, so a failure leads the status line.
+fn level_rank(level: StatusLevel) -> u8 {
+    match level {
+        StatusLevel::Error => 0,
+        StatusLevel::Warn => 1,
+        StatusLevel::Info => 2,
+    }
+}
+
+/// Fixed display order within one level: the capture sources first (they
+/// decide whether a meeting can work at all), then the servers, then the
+/// app's own notes.
+fn source_rank(source: StatusSource) -> u8 {
+    match source {
+        StatusSource::SystemAudio => 0,
+        StatusSource::Mic => 1,
+        StatusSource::Asr => 2,
+        StatusSource::Llm => 3,
+        StatusSource::App => 4,
+    }
+}
+
+/// The speaker whose capture a source feeds, `None` for non-capture sources.
+fn capture_speaker(source: StatusSource) -> Option<Speaker> {
+    match source {
+        StatusSource::Mic => Some(Speaker::Me),
+        StatusSource::SystemAudio => Some(Speaker::Them),
+        _ => None,
+    }
+}
+
+/// A status text as displayed: a capture source error names the side that
+/// is off, e.g. "Them audio off: Grant Screen Recording ...".
+fn status_text(source: StatusSource, level: StatusLevel, text: &str) -> String {
+    if level == StatusLevel::Error
+        && let Some(speaker) = capture_speaker(source)
+    {
+        return format!("{} audio off: {text}", speaker_label(speaker));
+    }
+    text.to_string()
 }
 
 #[cfg(test)]
@@ -777,6 +861,132 @@ mod tests {
         assert_eq!(m.status()[0].1, StatusLevel::Info);
         assert_eq!(m.status()[0].2, "ASR ready");
         assert_eq!(m.status_line(), "ASR ready");
+    }
+
+    // --- status line ordering and source-down surfacing ---
+
+    /// The Oct 5 live sequence: a Screen Recording failure arrived third and
+    /// was clipped off the right edge. It must lead the line instead.
+    #[test]
+    fn the_oct_5_sequence_puts_the_them_error_right_after_the_profile() {
+        let mut m = UiModel::default();
+        m.apply(UiEvent::Profile(AssistProfile::Interview));
+        m.apply(UiEvent::MeetingState(MeetingState::Starting));
+        for (source, level, text) in [
+            (
+                StatusSource::App,
+                StatusLevel::Info,
+                "recording to /Users/x/.clueless/sessions/s",
+            ),
+            (
+                StatusSource::Asr,
+                StatusLevel::Info,
+                "ASR server reachable, model istupakov/parakeet-tdt-0.6b-v3-onnx",
+            ),
+            (
+                StatusSource::Llm,
+                StatusLevel::Info,
+                "LLM server reachable, model qwen38-flash-next",
+            ),
+            (
+                StatusSource::SystemAudio,
+                StatusLevel::Error,
+                "Grant Screen Recording in System Settings, then restart clueless",
+            ),
+        ] {
+            m.apply(UiEvent::Status {
+                source,
+                level,
+                text: text.into(),
+            });
+        }
+        let line = m.status_line();
+        assert_eq!(
+            line,
+            "Interview  |  Them audio off: Grant Screen Recording in System Settings, \
+             then restart clueless  |  ASR server reachable, \
+             model istupakov/parakeet-tdt-0.6b-v3-onnx  |  LLM server reachable, \
+             model qwen38-flash-next  |  recording to /Users/x/.clueless/sessions/s"
+        );
+        // `status()` itself keeps first-seen order.
+        assert_eq!(
+            m.status().iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+            vec![
+                StatusSource::App,
+                StatusSource::Asr,
+                StatusSource::Llm,
+                StatusSource::SystemAudio,
+            ]
+        );
+    }
+
+    #[test]
+    fn warn_sorts_before_info_in_the_status_line() {
+        let mut m = UiModel::default();
+        m.apply(UiEvent::Status {
+            source: StatusSource::App,
+            level: StatusLevel::Info,
+            text: "ready".into(),
+        });
+        m.apply(UiEvent::Status {
+            source: StatusSource::Mic,
+            level: StatusLevel::Warn,
+            text: "Microphone delivers silence".into(),
+        });
+        assert_eq!(m.status_line(), "Microphone delivers silence  |  ready");
+    }
+
+    #[test]
+    fn meeting_start_clears_stale_statuses() {
+        let mut m = UiModel::default();
+        m.apply(UiEvent::Status {
+            source: StatusSource::SystemAudio,
+            level: StatusLevel::Error,
+            text: "Grant Screen Recording".into(),
+        });
+        let changes = m.apply(UiEvent::MeetingState(MeetingState::Starting));
+        assert!(m.status().is_empty());
+        assert!(changes.status, "the red line repaints away");
+        assert_eq!(m.status_line(), "");
+        assert_eq!(m.status_level(), None);
+    }
+
+    #[test]
+    fn sources_down_reports_the_speaker_for_capture_errors_only() {
+        let mut m = UiModel::default();
+        m.apply(UiEvent::Status {
+            source: StatusSource::SystemAudio,
+            level: StatusLevel::Warn,
+            text: "System audio stream restarted".into(),
+        });
+        assert!(m.sources_down().is_empty(), "a Warn is not a source down");
+        m.apply(UiEvent::Status {
+            source: StatusSource::Llm,
+            level: StatusLevel::Error,
+            text: "LLM server offline".into(),
+        });
+        assert!(
+            m.sources_down().is_empty(),
+            "an Asr/Llm Error is not a capture source down"
+        );
+        m.apply(UiEvent::Status {
+            source: StatusSource::SystemAudio,
+            level: StatusLevel::Error,
+            text: "Grant Screen Recording".into(),
+        });
+        m.apply(UiEvent::Status {
+            source: StatusSource::Mic,
+            level: StatusLevel::Error,
+            text: "no default input device".into(),
+        });
+        let down = m.sources_down();
+        assert_eq!(
+            down,
+            vec![
+                ("Them", "Them audio off: Grant Screen Recording".to_string()),
+                ("Me", "Me audio off: no default input device".to_string()),
+            ]
+        );
     }
 
     // --- meeting state, hotkeys, quit ---

@@ -53,6 +53,11 @@ pub enum MeetingState {
 pub enum StatusLevel {
     Info,
     Warn,
+    /// A source that reports `Error` has stopped working for this meeting:
+    /// every `Error` emitted today (open failure, exhausted rebuilds,
+    /// permission missing) is terminal for its source. The overlay renders
+    /// such statuses first in the status line and marks them as a source
+    /// being down; a new meeting clears them.
     Error,
 }
 

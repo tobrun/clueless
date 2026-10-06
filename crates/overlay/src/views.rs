@@ -200,6 +200,17 @@ fn install_status_label(
         objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewMinYMargin,
     );
+    // One line that truncates its tail: the status line orders problems
+    // first, so anything the width cuts off is the least important part.
+    // Same untyped-cell pattern as `install_ticker_label`.
+    // SAFETY: -cell returns the NSTextFieldCell; setLineBreakMode: takes an
+    // NSInteger enum.
+    unsafe {
+        let cell: Option<Retained<AnyObject>> = msg_send![&status, cell];
+        if let Some(cell) = cell {
+            let _: () = msg_send![&cell, setLineBreakMode: 5isize];
+        }
+    }
     status
 }
 
