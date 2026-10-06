@@ -239,6 +239,13 @@ D-screen-change: What if displays change while the app runs?
   ⊘ not doing - no screen-change handling exists today, AppKit moves the titled window by itself, and the overlay is fitted again on the next switch to hidden mode (D-fit); reopen if the overlay is reported stranded off screen after unplugging a display
   (2026-10-03)
 
+D-status-order: How do several statuses share the one status line?
+  ✓ problems first - status_line puts capture-source Errors right after the profile name, then Warn, then Info, each group in the fixed source order SystemAudio, Mic, Asr, Llm, App, and the menu-bar label truncates at the front so the tail never hides an error verify: the Oct 5 status sequence test in model.rs
+  ✓ menu-bar mark and disabled menu items - a ! on the circle and one disabled menu item per down source carry the full error text even with both windows closed
+  ✓ clear statuses when a meeting starts - a stale Error from the previous meeting would keep the line red in a healthy one
+  ✗ first-seen order - on 2026-10-05 the healthy App/ASR/LLM Info texts pushed the Screen Recording error past the right edge of the label, and a Them-less meeting of 73 minutes went by unnoticed
+  (2026-10-06)
+
 ## Capture
 
 D-system-audio: How is the other side's audio captured?
@@ -264,9 +271,18 @@ D-mic-silence: How is a denied microphone detected?
   (2026-10-02)
 
 D-device-change: What happens when the microphone changes (AirPods connect)?
-  ✓ rely on cpal - cpal 0.18 reroutes a default-device stream by itself, and the app rebuilds the stream only on a DeviceNotAvailable or StreamInvalidated error verify: the sample rate after a reroute
-  ✗ Core Audio property listener - extra unsafe code for a case cpal claims to handle
-  (2026-10-02)
+  ✓ rebuild on stream errors - a DeviceNotAvailable or StreamInvalidated error sets an atomic flag and a helper thread selects the device afresh, so the mic_select rules run again after the change
+  ✗ rely on cpal rerouting - corrected 2026-10-06: cpal 0.18.2 does not move an input stream to a new default device by itself, the rebuild is the only reroute path; a stream on a device that merely stopped being the default keeps streaming until it errors
+  ✗ Core Audio property listener - extra unsafe code for the rarer half of the case
+  (2026-10-02, updated 2026-10-06)
+
+D-mic-bluetooth: Which input does the Me source open?
+  ✓ three-state mic_device - absent means Auto (system default, unless its transport is Bluetooth, then prefer BuiltIn over Usb over other wired; Warn if only Bluetooth remains), "default" always follows the system default, any other string opens that exact name
+  ✓ transport by device UID through CoreAudio - cpal exposes no transport, so enumerate kAudioHardwarePropertyDevices and match kAudioDevicePropertyDeviceUID; the translate-uid property answers 'what' on current macOS
+  ✓ never auto-pick Virtual/Aggregate/Continuity/AirPlay/Unknown - those inputs would silently record silence, so Auto only steers onto BuiltIn/Usb/Other and names the choice in the Mic status
+  ✗ always open the system default - opening a Bluetooth headset mic drags the whole device from A2DP into HFP, so every output on the headset drops to ~16 kHz for the rest of the meeting (reproduced live 2026-10-06)
+  ✗ steer whenever the device name looks like a headset - name matching breaks on renamed devices; the transport is the ground truth
+  (2026-10-06)
 
 D-watchdog: What happens when the system-audio stream stops delivering?
   ✓ restart on stop error - when ScreenCaptureKit reports that the stream stopped, a helper thread restarts it, up to 5 times without a sample in between; a no-samples timer exists but is off by default ⚠ a stream that goes quiet without reporting a stop is not recovered until the timer is switched on
@@ -282,10 +298,12 @@ D-sleep-wake: Is sleep or display change handled specially?
 
 D-dev-signing: How is the dev app signed so macOS remembers the Microphone and Screen Recording grants?
   ✓ self-signed local certificate - chosen deliberately (2026-10-02); free and stable across rebuilds verify: codesign accepts the untrusted self-signed identity without a trust step
+  ✓ dedicated build keychain with a root CA (2026-10-06) - scripts/make-dev-cert.sh keeps the identity in ~/Library/Keychains/clueless-build.keychain-db (passphrase file next to it, 0600) instead of the login keychain, so Security Agent dialogs never interrupt development, and signs a "Clueless Dev Root CA" leaf with an 825-day validity (the maximum macOS accepts); set-key-partition-list runs unattended because the keychain password is on disk ⚠ grants belong to the leaf's stable subject, so renewing must reuse the CA
   ✗ Apple Development certificate - needs an Apple ID set up in Xcode on the build machine
   ✗ ad-hoc signing - the signature changes every build, so macOS can forget the grants
   ✗ run the bare binary from a terminal - the grants then belong to the terminal app
-  (2026-10-02)
+  ✗ the leaf alone in the login keychain - every unattended set-key-partition-list prompted for a password, and a bare self-signed leaf is not accepted as an Authority by codesign's default policy (2026-10-06)
+  (2026-10-02, updated 2026-10-06)
 
 D-app-launch: How is the dev app started?
   ✓ launch the bundle with open - macOS then treats the app as responsible for its own permission prompts verify: prompts name clueless, not the terminal

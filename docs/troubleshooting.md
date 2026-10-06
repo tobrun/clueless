@@ -24,13 +24,22 @@ Health checks run at meeting start against `GET /v1/models` on both servers.
 
 The first start of the system stream asks for Screen Recording.
 macOS does not apply that grant to a running process: quit clueless and start it again after allowing it.
+The Mic panel shows "Grant Screen Recording in System Settings, then restart clueless" while Them is blocked; the Me side keeps working meanwhile.
 If the panel keeps showing only Me lines, check the grant in System Settings (Privacy & Security, Screen Recording), and watch the menu bar status label for the restart message.
 macOS sometimes asks to re-approve this grant after updates; the same restart applies.
+Use `cargo xtask run` rather than the bare binary: the bundle is signed with the stable `clueless-dev` identity, so the grant survives rebuilds (run `scripts/make-dev-cert.sh` once); an ad-hoc signature changes every build and macOS forgets the grant.
 
 ## No Me lines (microphone)
 
 - Allow Microphone in System Settings (Privacy & Security); the app warns in the status label when the mic delivers only digital silence.
-- Check the input device: `system_audio_backend` covers Them, while `[audio] mic_device` pins the mic (default input when unset).
+- Check the input device: `system_audio_backend` covers Them, while `[audio] mic_device` picks the mic: unset (Auto) uses the system default unless it is Bluetooth, `"default"` always follows the system default, any other string opens that exact name.
+- The Mic status line at meeting start names the live input and why it was chosen.
+
+## Headset audio degrades during a meeting
+
+Opening a Bluetooth headset's microphone switches the device from A2DP to HFP, which drops every output on it to phone-call quality for as long as the mic is open.
+This is why `mic_device` defaults to Auto: it steers the Me source onto the built-in or another wired input when the system default is Bluetooth.
+If you set `mic_device = "default"` or name the headset and hear the quality drop, that is the trade-off you asked for; remove the setting to get the steering back.
 
 ## Hotkeys do nothing
 

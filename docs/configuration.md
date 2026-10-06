@@ -89,7 +89,7 @@ Lookup order: the path given by `--config`, else `~/.config/clueless/config.toml
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `system_audio_backend` | `"sck"` | `"sck"`, `"cpal_loopback"` or `"device:<name>"`, see [system-audio.md](system-audio.md) |
-| `mic_device` | default input | Exact coreaudio device name |
+| `mic_device` | Auto | unset: system default input, steered onto a built-in or wired input when the default is Bluetooth; `"default"`: always the system default; any other string: that exact input device name |
 | `watchdog_restarts` | 5 | Stream restarts that are allowed without a sample in between; 0 turns the watchdog off |
 | `watchdog_silence_secs` | 0 | Restart after this long without samples; 0 turns the timer off |
 
