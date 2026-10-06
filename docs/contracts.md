@@ -24,6 +24,7 @@ C-prompt-prefix-stable: between two compressions, the user message built after N
 
 ## Engine
 
+
 C-finals-in-order: for one speaker, TranscriptFinal events are emitted in increasing seq order, and each seq at most once
   guaranteed by: engine final worker (one request at a time per stream) verified 2026-10-02 (engine/tests/transcribe.rs::slow_first_final_keeps_order_and_single_flight)
   relied on by: context transcript store, overlay ticker
@@ -38,6 +39,13 @@ C-server-read-only: the app sends only GET /v1/models, POST /v1/audio/transcript
   guaranteed by: asr and llm clients, engine workers (asr_worker, Engine::run, context::assist policy) verified 2026-10-02, extended 2026-10-03 (clients hit only those routes; mock servers in engine/tests/support/mod.rs serve nothing else and every suite passes through them; engine/tests/transcribe.rs::slow_first_final_keeps_order_and_single_flight; engine/tests/meeting.rs::compression_fires_once_and_summary_leads_the_transcript; engine/tests/assist.rs::brainstorm_spaces_requests_by_four_times_the_gap_and_never_overlaps asserts one request in flight and the spacing; engine/tests/assist.rs::brainstorm_does_not_cancel_a_running_answer_and_asks_once_after_it asserts an automatic request waits for the open one)
   relied on by: the shared inference server (other users of it)
   (2026-10-02)
+
+## UI status
+
+C-status-error-marks-a-down-source: an Error-level UiEvent::Status is only ever emitted for a capture source that failed to open or died and will not recover within the meeting; the overlay puts Error statuses first in the status line, marks the menu-bar dot with "!" and lists each down source as a disabled menu item while any is down, and every status is logged at its own level
+  guaranteed by: the capture/engine status producers (Error is used only for Mic/SystemAudio open and stream-death paths) and UiModel::status_line/sources_down plus trace_tap verified 2026-10-06 (overlay model tests the_oct_5_sequence_puts_the_them_error_right_after_the_profile, warn_sorts_before_info_in_the_status_line and sources_down_reports_the_speaker_for_capture_errors_only; engine trace_tap test replays the 2026-10-05 sequence; live: a bogus mic_device produced the menu-bar "!", the disabled item with the full error and an ERROR log line)
+  relied on by: the menu-bar "!" meaning exactly "a speaker source is down", docs/troubleshooting.md, log-based diagnosis
+  (2026-10-06, D-status-order)
 
 ## Session traces
 
