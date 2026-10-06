@@ -28,6 +28,8 @@ Run from the repo root after `cargo xtask bundle` (assembles `target/debug/cluel
 - [ ] Play a meeting video with system sound: Them lines appear; the mic hearing the speakers does not also produce Me lines (echo filter).
 - [ ] Unplug the mic mid-meeting: a warning status appears and capture restarts (watchdog); replugging recovers it.
 - [ ] Mute system audio for a minute: no crash, no interim spam.
+- [ ] Bluetooth headset as the default input and output, `mic_device` unset, start a meeting: the output rate does not drop (check `system_profiler SPAudioDataType` for the headset before and during the meeting), the status line names the built-in mic ("kept headset audio full quality"), and speaking toward the built-in mic yields Me lines; `mic_device = "default"` reproduces the headset call-mode degradation as the documented override.
+- [ ] Revoked Screen Recording (`tccutil reset ScreenCapture be.tobrun.clueless`, restart): starting a meeting shows "Them: Them audio off: Grant Screen Recording..." first in the status line after the profile, the menu bar icon gains a `!`, its menu leads with a disabled item holding the full error text, the log has an ERROR line, and the meeting still works with Me lines; re-granting and restarting clears all of it.
 
 ## Suggestions
 

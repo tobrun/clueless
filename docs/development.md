@@ -14,8 +14,10 @@ cargo xtask run                      # bundle + codesign + open the dev app
 ```
 
 `cargo xtask run` exits 1 and prints the startup error when the app dies during startup, for example on an invalid `config.toml`.
+It also refuses to start when the `clueless-dev` identity is missing, because the ad-hoc fallback drops permission grants on every rebuild; run `scripts/make-dev-cert.sh` once, or pass `--adhoc` to sign ad-hoc knowingly (expect to re-grant after every rebuild).
 
 `cargo xtask bundle` assembles `target/debug/clueless.app` (binary, `Info.plist`, icon) and signs it with the `clueless-dev` identity.
+The identity lives in a dedicated build keychain (`~/Library/Keychains/clueless-build.keychain-db`), created by `scripts/make-dev-cert.sh` together with its "Clueless Dev Root CA", so signing never prompts for a keychain password.
 Options: `--identity ID` (`-` for ad-hoc signing), `--out DIR`, `--binary PATH`.
 Ad-hoc signing works but macOS treats each rebuild as a new app and drops permission grants.
 
