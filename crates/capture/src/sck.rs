@@ -79,6 +79,9 @@ fn preflight_screen_recording() -> Result<(), SourceError> {
         return Ok(());
     }
     unsafe { CGRequestScreenCaptureAccess() };
+    tracing::warn!(
+        "screen recording permission missing, ScreenCaptureKit cannot capture system audio"
+    );
     Err(SourceError::PermissionMissing(
         "Grant Screen Recording in System Settings, then restart clueless".into(),
     ))
@@ -331,6 +334,10 @@ impl SckSource {
             status,
         });
         shared.open_stream()?;
+        tracing::info!(
+            rate = TARGET_RATE,
+            "system audio source opened (ScreenCaptureKit output capture)"
+        );
         Ok(Self { shared, reader })
     }
 }
