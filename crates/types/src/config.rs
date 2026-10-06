@@ -63,12 +63,54 @@ fn de_default_backend() -> SystemAudioBackend {
     SystemAudioBackend::Sck
 }
 
+/// `audio.mic_device`: which input the Me source opens. Opening a Bluetooth
+/// headset's mic drags the whole device into the call profile and narrows
+/// every output on it, which is why `Auto` steers away from Bluetooth
+/// (the reasoning is in `docs/decisions.md`, D-mic-bluetooth).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum MicChoice {
+    /// Key absent: follow the system default input unless it is Bluetooth,
+    /// in which case prefer a wired replacement.
+    #[default]
+    Auto,
+    /// The literal `"default"`: always follow the system default input,
+    /// Bluetooth or not.
+    SystemDefault,
+    /// Any other value: open exactly that input device, the explicit
+    /// Bluetooth opt-in.
+    Named(String),
+}
+
+impl MicChoice {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        if s.trim().is_empty() {
+            return Err("audio.mic_device must be \"default\" or an input device name".to_string());
+        }
+        if s == "default" {
+            Ok(Self::SystemDefault)
+        } else {
+            Ok(Self::Named(s.to_string()))
+        }
+    }
+}
+
+fn de_mic_device<'de, D>(d: D) -> Result<MicChoice, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<String>::deserialize(d)? {
+        None => Ok(MicChoice::Auto),
+        Some(s) => MicChoice::parse(&s).map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AudioConfig {
     #[serde(deserialize_with = "de_backend", default = "de_default_backend")]
     pub system_audio_backend: SystemAudioBackend,
-    pub mic_device: Option<String>,
+    #[serde(default, deserialize_with = "de_mic_device")]
+    pub mic_device: MicChoice,
     pub watchdog_restarts: u32,
     pub watchdog_silence_secs: u64,
 }
@@ -77,7 +119,7 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             system_audio_backend: SystemAudioBackend::Sck,
-            mic_device: None,
+            mic_device: MicChoice::Auto,
             watchdog_restarts: 5,
             watchdog_silence_secs: 0,
         }

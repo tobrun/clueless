@@ -13,12 +13,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use clueless_types::{
-    SampleSource, SourceError, SourceRead, Speaker, StatusLevel, StatusSink, StatusSource, UiEvent,
+    MicChoice, SampleSource, SourceError, SourceRead, Speaker, StatusLevel, StatusSink,
+    StatusSource, UiEvent,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, ErrorKind, Host, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 
 use crate::convert::SilenceDetector;
+use crate::coreaudio::transport_of_uid;
+use crate::mic_select::{self, InputInfo};
 use crate::ring::{RingReader, ring_pair_with};
 
 /// Ring capacity: 5 s of audio at the stream rate.
@@ -31,9 +34,10 @@ const REBUILD_WAIT: Duration = Duration::from_millis(500);
 /// Which cpal endpoint a source reads from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
-    /// the system default input device
-    DefaultInput,
-    /// a named input device
+    /// the Me microphone, resolved per the [`MicChoice`] policy (a rebuild
+    /// re-resolves, so unplugging a wired mic falls back where it can)
+    Mic(MicChoice),
+    /// a named input device (the Them side of `system_audio_backend = "..."`)
     NamedInput(String),
     /// the default output device, captured through the cpal loopback tap
     Loopback,
@@ -82,30 +86,82 @@ pub fn device_name(device: &Device) -> String {
         .unwrap_or_default()
 }
 
-fn select_device(host: &Host, endpoint: &Endpoint) -> Result<Device, SourceError> {
+/// Flatten the host's inputs into `(device, info)` pairs: name, CoreAudio
+/// transport (Unknown when the lookup fails) and whether it is the default.
+fn list_inputs(host: &Host) -> Result<Vec<(Device, InputInfo)>, SourceError> {
+    let devices = host
+        .input_devices()
+        .map_err(|e| SourceError::Backend(format!("cannot list input devices: {e}")))?;
+    // cpal is inconsistent about the `coreaudio:` host prefix: ids from
+    // `input_devices()` carry it, the one from `default_input_device()` does
+    // not. Compare the raw uid of both.
+    let raw_uid = |device: &Device| {
+        device
+            .id()
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+            .strip_prefix("coreaudio:")
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let default_uid = host.default_input_device().map(|d| raw_uid(&d));
+    let mut out = Vec::new();
+    for device in devices {
+        let name = device_name(&device);
+        let uid = device.id().map(|id| id.to_string()).unwrap_or_default();
+        let transport = transport_of_uid(&uid).unwrap_or(mic_select::Transport::Unknown);
+        let is_default = default_uid.as_deref() == Some(raw_uid(&device).as_str());
+        out.push((
+            device,
+            InputInfo {
+                name,
+                transport,
+                is_default,
+            },
+        ));
+    }
+    Ok(out)
+}
+
+/// Resolve an endpoint to a cpal device. The Me endpoint additionally
+/// reports the choice through `status` (which mic is live and why).
+fn select_device(
+    host: &Host,
+    endpoint: &Endpoint,
+    status: &StatusSink,
+) -> Result<Device, SourceError> {
     match endpoint {
-        Endpoint::DefaultInput => host
-            .default_input_device()
-            .ok_or_else(|| SourceError::DeviceNotFound("no default input device".into())),
         Endpoint::Loopback => host
             .default_output_device()
             .ok_or_else(|| SourceError::DeviceNotFound("no default output device".into())),
         Endpoint::NamedInput(want) => {
-            let devices = host
-                .input_devices()
-                .map_err(|e| SourceError::Backend(format!("cannot list input devices: {e}")))?;
-            let mut names = Vec::new();
-            for device in devices {
-                let name = device_name(&device);
-                if &name == want {
-                    return Ok(device);
+            let inputs = list_inputs(host)?;
+            match inputs.iter().position(|(_, i)| &i.name == want) {
+                Some(index) => Ok(inputs.into_iter().nth(index).expect("just found").0),
+                None => {
+                    let infos: Vec<InputInfo> = inputs.iter().map(|(_, i)| i.clone()).collect();
+                    Err(SourceError::DeviceNotFound(format!(
+                        "input device \"{want}\" not found; available input devices: {}",
+                        mic_select::list_names(&infos)
+                    )))
                 }
-                names.push(name);
             }
-            Err(SourceError::DeviceNotFound(format!(
-                "input device \"{want}\" not found; available input devices: {}",
-                names.join(", ")
-            )))
+        }
+        Endpoint::Mic(choice) => {
+            let inputs = list_inputs(host)?;
+            let infos: Vec<InputInfo> = inputs.iter().map(|(_, i)| i.clone()).collect();
+            let picked = mic_select::pick(choice, &infos).map_err(SourceError::DeviceNotFound)?;
+            let (level, text) = mic_select::status_for(&picked, &infos);
+            (status)(UiEvent::Status {
+                source: StatusSource::Mic,
+                level,
+                text,
+            });
+            Ok(inputs
+                .into_iter()
+                .nth(picked.index)
+                .expect("picked an index")
+                .0)
         }
     }
 }
@@ -123,6 +179,20 @@ fn f32_config(device: &Device, endpoint: &Endpoint) -> Result<SupportedStreamCon
         )));
     }
     Ok(config)
+}
+
+/// One-line device description logged whenever an input stream opens or
+/// rebuilds, so the chosen device and transport are verifiable from the log
+/// (spec D-mic-bluetooth).
+fn describe_stream(device: &Device, config: &SupportedStreamConfig) -> String {
+    let uid = device.id().map(|id| id.to_string()).unwrap_or_default();
+    let transport = transport_of_uid(&uid).unwrap_or(mic_select::Transport::Unknown);
+    format!(
+        "input stream open: device {:?} transport {transport:?} rate {} channels {}",
+        device_name(device),
+        config.sample_rate(),
+        config.channels(),
+    )
 }
 
 /// Build a playing stream whose callback downmixes into a fresh ring;
@@ -161,8 +231,9 @@ fn build_stream(
             },
             move |err: cpal::Error| {
                 // May run on the audio thread: only touch the atomic.
-                // cpal reroutes DeviceChanged by itself;
-                // only these two kinds need a rebuild.
+                // cpal 0.18.2 does not move an input stream to another
+                // device by itself, so every error that can follow a device
+                // change must raise the flag; the rebuild selects afresh.
                 if matches!(
                     err.kind(),
                     ErrorKind::DeviceNotAvailable | ErrorKind::StreamInvalidated
@@ -187,12 +258,13 @@ impl CpalSource {
         status: StatusSink,
     ) -> Result<Self, SourceError> {
         let host = cpal::default_host();
-        let device = select_device(&host, &endpoint)?;
+        let device = select_device(&host, &endpoint, &status)?;
         let config = f32_config(&device, &endpoint)?;
         let dropped = Arc::new(AtomicU64::new(0));
         let rebuild = Arc::new(AtomicBool::new(false));
         let (stream, reader, rate) =
             build_stream(&device, &config, Arc::clone(&dropped), Arc::clone(&rebuild))?;
+        tracing::info!("{}", describe_stream(&device, &config));
         let shared = Arc::new(Shared {
             endpoint,
             rebuild,
@@ -290,7 +362,7 @@ fn rebuild_once(shared: &Shared) -> Result<(), SourceError> {
     // Drop the old stream first: it may be holding the device.
     *shared.stream.lock().unwrap() = None;
     let host = cpal::default_host();
-    let device = select_device(&host, &shared.endpoint)?;
+    let device = select_device(&host, &shared.endpoint, &shared.status)?;
     let config = f32_config(&device, &shared.endpoint)?;
     let (stream, reader, rate) = build_stream(
         &device,
@@ -298,6 +370,7 @@ fn rebuild_once(shared: &Shared) -> Result<(), SourceError> {
         Arc::clone(&shared.dropped),
         Arc::clone(&shared.rebuild),
     )?;
+    tracing::info!("{}", describe_stream(&device, &config));
     shared.rate.store(rate, Ordering::Relaxed);
     *shared.new_reader.lock().unwrap() = Some(reader);
     *shared.stream.lock().unwrap() = Some(stream);
@@ -321,7 +394,7 @@ mod tests {
         // stream is built: selection fails before any device is touched.
         let sources = crate::backend::LiveSources::new(
             clueless_types::SystemAudioBackend::Device("NoSuchDevice".into()),
-            None,
+            clueless_types::MicChoice::Auto,
             5,
             0,
         );
@@ -351,13 +424,41 @@ mod tests {
     #[test]
     fn unknown_mic_device_names_the_mic_and_lists_inputs() {
         let err = match CpalSource::open(
-            Endpoint::NamedInput("NoSuchMic".into()),
+            Endpoint::Mic(MicChoice::Named("NoSuchMic".into())),
             Speaker::Me,
             null_status(),
         ) {
             Ok(_) => panic!("NoSuchMic cannot exist"),
             Err(e) => e,
         };
-        assert!(matches!(err, SourceError::DeviceNotFound(_)));
+        let SourceError::DeviceNotFound(message) = err else {
+            panic!("expected DeviceNotFound, got {err:?}");
+        };
+        assert!(message.contains("\"NoSuchMic\" not found"), "{message}");
+        assert!(message.contains("available input devices"), "{message}");
+    }
+
+    #[test]
+    fn auto_resolves_against_the_real_host_without_error() {
+        // Whatever this machine has, Auto must resolve (a Mac always has a
+        // default input in CI) and report the pick through the status sink.
+        let seen = Arc::new(Mutex::new(Vec::<(StatusLevel, String)>::new()));
+        let sink_seen = Arc::clone(&seen);
+        let status: StatusSink = Arc::new(move |event| {
+            if let UiEvent::Status { level, text, .. } = event {
+                sink_seen.lock().unwrap().push((level, text));
+            }
+        });
+        let opened = CpalSource::open(Endpoint::Mic(MicChoice::Auto), Speaker::Me, status);
+        let statuses = seen.lock().unwrap();
+        if cpal::default_host().default_input_device().is_some() {
+            let _source = opened.expect("Auto must open when there is a default input");
+            assert!(
+                statuses.iter().any(|(_, t)| t.starts_with("Mic: ")),
+                "the pick must be reported, got {statuses:?}"
+            );
+        } else {
+            assert!(matches!(opened, Err(SourceError::DeviceNotFound(_))));
+        }
     }
 }
