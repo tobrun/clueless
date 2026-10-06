@@ -1,24 +1,25 @@
 # Architecture
 
-Purpose: clueless is a macOS meeting copilot for one user on one Mac. During a meeting it records the microphone ("Me") and the system audio ("Them") as two streams, cuts each into utterances, transcribes each utterance on a speech-to-text server over HTTP, and shows a rolling transcript in a standard window or a hidden overlay panel. On a hotkey it asks an LLM server over HTTP what to say next and streams the answer into whichever window is on screen. Three built-in assist profiles (Manual, Interview, Brainstorm) decide whether the app also asks by itself at the end of a turn; Manual, the default, asks only on the hotkey. While a meeting runs the engine also writes a session trace under the data directory (`~/.clueless` by default): the transcript, commands and every model call as JSON lines, plus the speaker WAVs when audio recording is on; the same binary re-runs a recorded session through the current build and compares the two traces. Audio flows capture -> ring buffer -> engine stream thread (resample, voice detection, segmenter) -> ASR worker -> transcript store -> UI event -> overlay; a suggestion flows hotkey (or, in Interview and Brainstorm, a finished turn) -> engine command -> prompt builder -> LLM stream -> overlay.
+Purpose: clueless is a macOS meeting copilot for one user on one Mac. During a meeting it records the microphone ("Me") and the system audio ("Them") as two streams, cuts each into utterances, transcribes each utterance on a speech-to-text server over HTTP, and shows a rolling transcript in a standard window or a hidden overlay panel. On a hotkey it asks an LLM server over HTTP what to say next and streams the answer into whichever window is on screen. Three built-in assist profiles (Manual, Interview, Brainstorm) decide whether the app also asks by itself at the end of a turn; Manual, the default, asks only on the hotkey. While a meeting runs the engine also writes a session trace under the data directory (~/.clueless by default): the transcript, commands and every model call as JSON lines, plus the speaker WAVs when audio recording is on; the same binary re-runs a recorded session through the current build and compares the two traces. Audio flows capture -> ring buffer -> engine stream thread (resample, voice detection, segmenter) -> ASR worker -> transcript store -> UI event -> overlay; a suggestion flows hotkey (or, in Interview and Brainstorm, a finished turn) -> engine command -> prompt builder -> LLM stream -> overlay.
 
-Captured: 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.env`, the switchable window modes were added, and continuous assistance with assist profiles was added; updated 2026-10-05 for the trace crate, session recording, re-run and compare.
+Captured: 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.env`, the switchable window modes were added, and continuous assistance with assist profiles was added; updated 2026-10-05 for the trace crate, session recording, re-run and compare; updated 2026-10-06 for the transport-aware mic picker, the failing-source-first status line and the build keychain.
 
 ## Components
 
 | Component | Responsibility | Lives at | Talks to |
 | --------- | -------------- | -------- | -------- |
-| types | shared data types, config, source traits | `crates/types/` | nothing |
+| types | shared data types, config, source traits | `crates/types/`, `config.example.toml` | nothing |
 | segmenter | resample, VAD wrapper, utterance state machine, dedup | `crates/segmenter/` | types |
 | asr | WAV encoding and transcription client | `crates/asr/` | types |
 | llm | streaming chat client | `crates/llm/` | types |
 | context | transcript store, prompt builder, assist profiles and trigger policy, echo test, token estimate | `crates/context/` | types |
 | trace | record types, sink traits, disk writer, audio files, reader, compare, list, show | `crates/trace/` | types |
 | engine | threads, queues, meeting state, suggestions, replay | `crates/engine/` | types, segmenter, asr, llm, context, trace |
-| capture | microphone and system-audio sources | `crates/capture/` | types |
+| capture | transport-aware microphone and system-audio sources | `crates/capture/` | types |
 | overlay | standard window, hidden overlay panel, mode switch, views, hotkeys, menu-bar item | `crates/overlay/` | types |
 | app | binary: wiring, command line, logging | `crates/app/` | all of the above |
 | xtask | bundle, sign, run | `xtask/` | nothing |
+| build scripts | dev codesigning identity, test fixtures, server smoke checks | `scripts/` | nothing |
 
 ## Flows
 
@@ -61,14 +62,14 @@ Captured: 2026-10-02, updated 2026-10-03 when the server endpoints moved to `.en
 
 ### Recording
 
-1. `start_meeting` opens a trace directory under the data directory (`~/.clueless` by default) and writes `manifest.json`; the overlay gets one Info status line naming where the meeting is stored and whether audio is included (`crates/engine/`, `crates/trace/`).
+1. `start_meeting` opens a trace directory under the data directory (~/.clueless by default) and writes manifest.json; the overlay gets one Info status line naming where the meeting is stored and whether audio is included (`crates/engine/`, `crates/trace/`).
 2. The engine wraps the UI sink so every `UiEvent` is also a record, and the stream threads, ASR workers, engine loop and LLM tasks record segments, ASR calls, commands, policy decisions and full model requests and answers (`crates/engine/`).
-3. A writer thread drains bounded queues into `events.jsonl` and the speaker WAVs; a full queue drops messages and counts them in a `records_lost` record, so recording never blocks or fails the meeting (`crates/trace/`).
+3. A writer thread drains bounded queues into events.jsonl and the speaker WAVs; a full queue drops messages and counts them in a `records_lost` record, so recording never blocks or fails the meeting (`crates/trace/`).
 4. `stop_meeting` flushes and closes the trace before the engine reports `Idle` (or 2 s pass trying), so the files are complete when the app exits on `Idle` (`crates/engine/`).
 
 ### Session re-run
 
-1. The binary reads a session's `events.jsonl`, manifest and WAVs and feeds them to the same engine: per-speaker audio at its timeline position, recorded hotkey presses and profile changes at their recorded times, at `--speed` (`crates/app/`, `crates/engine/`).
+1. The binary reads a session's events.jsonl, manifest and WAVs and feeds them to the same engine: per-speaker audio at its timeline position, recorded hotkey presses and profile changes at their recorded times, at `--speed` (`crates/app/`, `crates/engine/`).
 2. The re-run writes its own trace plus the session's notes to `<session>/runs/<run id>/` and prints the same stdout as `--replay`, then `run: <path>` on stderr (`crates/trace/`).
 
 ### Compare
