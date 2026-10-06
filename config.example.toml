@@ -8,7 +8,11 @@
 
 [audio]
 system_audio_backend = "sck"  # "sck" | "cpal_loopback" | "device:<name>"
-# mic_device = "MacBook Pro Microphone" # none means the default input
+# mic_device absent: pick the system default input, but steer onto a wired
+# mic when the default is a Bluetooth headset (opening that drops the
+# headset to call quality for everyone in the meeting).
+# mic_device = "default"         # always follow the system default input
+# mic_device = "some device"     # open exactly this input
 watchdog_restarts = 5         # stream restarts without a sample in between; 0 turns off
 watchdog_silence_secs = 0     # restart after this long with no samples; 0 turns the timer off
 

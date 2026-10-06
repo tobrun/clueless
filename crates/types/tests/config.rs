@@ -1,7 +1,7 @@
 //! Config loading: optional TOML defaults, unknown and moved keys,
 //! environment building, and the `.env` variable rules.
 
-use clueless_types::config::{Config, SystemAudioBackend};
+use clueless_types::config::{Config, MicChoice, SystemAudioBackend};
 use clueless_types::profile::AssistProfile;
 use std::collections::HashMap;
 use std::path::Path;
@@ -59,7 +59,7 @@ fn every_toml_key_may_be_absent_and_every_env_default_applies() {
     assert_eq!(cfg.asr.api_key, None);
     assert_eq!(cfg.asr.language, None);
     assert_eq!(cfg.audio.system_audio_backend, SystemAudioBackend::Sck);
-    assert_eq!(cfg.audio.mic_device, None);
+    assert_eq!(cfg.audio.mic_device, MicChoice::Auto);
     assert_eq!(cfg.audio.watchdog_restarts, 5);
     assert_eq!(cfg.audio.watchdog_silence_secs, 0);
     assert_eq!(cfg.vad.start_threshold, 0.5);
@@ -272,6 +272,33 @@ fn a_misspelled_toggle_mode_key_is_reported_as_unknown() {
     .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("hotkeys.toggle_modes"), "error was: {msg}");
+}
+
+#[test]
+fn mic_device_is_the_three_state_mic_choice() {
+    // absent key -> Auto, "default" -> SystemDefault, anything else -> Named
+    let cfg = load("", "mic-absent", &[]).unwrap();
+    assert_eq!(cfg.audio.mic_device, MicChoice::Auto);
+    let cfg = load("[audio]\nmic_device = \"default\"\n", "mic-default", &[]).unwrap();
+    assert_eq!(cfg.audio.mic_device, MicChoice::SystemDefault);
+    let cfg = load(
+        "[audio]\nmic_device = \"MacBook Pro Microphone\"\n",
+        "mic-named",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.audio.mic_device,
+        MicChoice::Named("MacBook Pro Microphone".into())
+    );
+}
+
+#[test]
+fn an_empty_mic_device_is_rejected_with_a_hint() {
+    let err = load("[audio]\nmic_device = \"\"\n", "mic-empty", &[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("mic_device"), "error was: {msg}");
+    assert!(msg.contains("\"default\""), "error was: {msg}");
 }
 
 #[test]

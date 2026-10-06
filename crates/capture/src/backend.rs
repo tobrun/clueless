@@ -1,12 +1,14 @@
 //! The live [`SourceFactory`]: what the engine opens at meeting start.
 //!
-//! "Me" is always a cpal input stream (default or named device).
+//! "Me" is always a cpal input stream, resolved per `audio.mic_device`
+//! (auto-picking a wired mic over a Bluetooth default keeps the headset on
+//! high-quality audio; see `docs/decisions.md` D-mic-bluetooth).
 //! "Them" follows `audio.system_audio_backend`: ScreenCaptureKit (default),
 //! the cpal loopback tap on the default output device, or a named input
 //! device such as BlackHole (the rationale is in `docs/decisions.md`).
 
 use clueless_types::{
-    SampleSource, SourceError, SourceFactory, Speaker, StatusSink, SystemAudioBackend,
+    MicChoice, SampleSource, SourceError, SourceFactory, Speaker, StatusSink, SystemAudioBackend,
 };
 
 use crate::mic::{CpalSource, Endpoint};
@@ -15,7 +17,7 @@ use crate::sck::SckSource;
 /// Opens real microphone and system-audio sources.
 pub struct LiveSources {
     backend: SystemAudioBackend,
-    mic_device: Option<String>,
+    mic: MicChoice,
     watchdog_restarts: u32,
     watchdog_silence_secs: u64,
 }
@@ -24,22 +26,15 @@ impl LiveSources {
     /// Take the four `audio.*` config values the sources need.
     pub fn new(
         backend: SystemAudioBackend,
-        mic_device: Option<String>,
+        mic: MicChoice,
         watchdog_restarts: u32,
         watchdog_silence_secs: u64,
     ) -> Self {
         Self {
             backend,
-            mic_device,
+            mic,
             watchdog_restarts,
             watchdog_silence_secs,
-        }
-    }
-
-    fn mic_endpoint(&self) -> Endpoint {
-        match &self.mic_device {
-            Some(name) => Endpoint::NamedInput(name.clone()),
-            None => Endpoint::DefaultInput,
         }
     }
 }
@@ -58,7 +53,7 @@ impl SourceFactory for LiveSources {
     ) -> Result<Box<dyn SampleSource>, SourceError> {
         match speaker {
             Speaker::Me => Ok(Box::new(CpalSource::open(
-                self.mic_endpoint(),
+                Endpoint::Mic(self.mic.clone()),
                 Speaker::Me,
                 status,
             )?)),
