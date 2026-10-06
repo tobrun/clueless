@@ -55,8 +55,30 @@ impl Current {
 
 /// Wrap a UI sink so every event is also recorded while [`Current`] holds a
 /// sink; the event always reaches the original sink.
+///
+/// Statuses additionally go to the log at their level, whatever the trace
+/// slot holds: a source that fails to open must leave a line in
+/// `~/Library/Logs/clueless/clueless.log` even outside a meeting trace.
 pub fn wrap_ui(ui: StatusSink, current: Current) -> StatusSink {
     Arc::new(move |event| {
+        if let clueless_types::events::UiEvent::Status {
+            source,
+            level,
+            text,
+        } = &event
+        {
+            match level {
+                clueless_types::events::StatusLevel::Error => {
+                    tracing::error!(source = ?source, %text, "status")
+                }
+                clueless_types::events::StatusLevel::Warn => {
+                    tracing::warn!(source = ?source, %text, "status")
+                }
+                clueless_types::events::StatusLevel::Info => {
+                    tracing::info!(source = ?source, %text, "status")
+                }
+            }
+        }
         current.record(Body::from(&event));
         (ui)(event);
     })
@@ -105,5 +127,113 @@ pub fn session_start(
             llm_stall_ms: deps.timings.llm_stall.as_millis() as u64,
         },
         compress_threshold_tokens: deps.compress_threshold_tokens as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clueless_types::events::{StatusLevel, StatusSource, UiEvent};
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+
+    /// A subscriber that stores `(level, source, text)` for every event.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<(String, String, String)>>>);
+
+    struct VisitStatus {
+        level: String,
+        source: String,
+        text: String,
+    }
+
+    impl Visit for VisitStatus {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            match field.name() {
+                "source" => self.source = rendered,
+                "text" => self.text = rendered,
+                _ => {}
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "text" {
+                self.text = value.to_owned();
+            }
+        }
+    }
+
+    impl Subscriber for Capture {
+        fn enabled(&self, _meta: &tracing::Metadata) -> bool {
+            true
+        }
+        fn event(&self, event: &Event) {
+            let mut v = VisitStatus {
+                level: event.metadata().level().as_str().to_owned(),
+                source: String::new(),
+                text: String::new(),
+            };
+            event.record(&mut v);
+            self.0.lock().unwrap().push((v.level, v.source, v.text));
+        }
+        fn exit(&self, _span: &tracing::Id) {}
+        fn enter(&self, _span: &tracing::Id) {}
+        fn new_span(&self, _attrs: &tracing::span::Attributes) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record) {}
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+    }
+
+    fn captured(sub: &Capture) -> Vec<(String, String, String)> {
+        sub.0.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn statuses_reach_the_log_at_their_level_with_source_and_text() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let ui_seen = seen.clone();
+        let ui: StatusSink = Arc::new(move |e| ui_seen.lock().unwrap().push(e));
+        let tap = wrap_ui(ui, Current::new());
+
+        tap(UiEvent::Status {
+            source: StatusSource::SystemAudio,
+            level: StatusLevel::Error,
+            text: "Grant Screen Recording in System Settings, then restart clueless".into(),
+        });
+        tap(UiEvent::Status {
+            source: StatusSource::Mic,
+            level: StatusLevel::Warn,
+            text: "Microphone delivers silence".into(),
+        });
+        tap(UiEvent::Status {
+            source: StatusSource::Asr,
+            level: StatusLevel::Info,
+            text: "ASR server reachable".into(),
+        });
+        tap(UiEvent::ClearSuggestion);
+
+        let lines = captured(&capture);
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    "ERROR".into(),
+                    "SystemAudio".into(),
+                    "Grant Screen Recording in System Settings, then restart clueless".into(),
+                ),
+                (
+                    "WARN".into(),
+                    "Mic".into(),
+                    "Microphone delivers silence".into()
+                ),
+                ("INFO".into(), "Asr".into(), "ASR server reachable".into()),
+            ],
+        );
+        // The event still reaches the original sink unchanged.
+        assert_eq!(seen.lock().unwrap().len(), 4);
     }
 }
