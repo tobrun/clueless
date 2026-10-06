@@ -103,8 +103,14 @@ fn actions() -> &'static Mutex<HashMap<u32, HotkeyAction>> {
 fn refresh_menu(ui: &Ui, mtm: MainThreadMarker) {
     let running = ui.model.meeting() == MeetingState::Running;
     let profile = ui.model.profile().unwrap_or_default();
+    let source_errors: Vec<String> = ui
+        .model
+        .sources_down()
+        .into_iter()
+        .map(|(label, text)| format!("{label}: {text}"))
+        .collect();
     ui.status_item
-        .rebuild_menu(running, ui.presentation, profile, mtm);
+        .rebuild_menu(running, ui.presentation, profile, &source_errors, mtm);
 }
 
 /// Bring this app to the front for the standard window. Hotkey presses
@@ -297,12 +303,16 @@ fn repaint_views(ui: &mut Ui, changes: &Changes) {
     }
 }
 
-/// Keep the menu-bar item in step with the meeting state: its icon and its
-/// menu, whose titles depend on the mode as well (spec D-mode-menu).
+/// Keep the menu-bar item in step with the meeting state and the capture
+/// sources: its icon and its menu, whose titles depend on the mode as well
+/// (spec D-mode-menu).
 fn update_meeting_indicator(ui: &Ui, changes: &Changes, mtm: MainThreadMarker) {
-    if changes.meeting {
-        ui.status_item
-            .set_meeting_running(ui.model.meeting() == MeetingState::Running, mtm);
+    if changes.meeting || changes.status {
+        ui.status_item.set_meeting_running(
+            ui.model.meeting() == MeetingState::Running,
+            !ui.model.sources_down().is_empty(),
+            mtm,
+        );
     }
     refresh_menu_if_needed(ui, changes, mtm);
 }
@@ -313,9 +323,10 @@ fn refresh_menu_if_needed(ui: &Ui, changes: &Changes, mtm: MainThreadMarker) {
     }
 }
 
-/// The menu titles depend on the meeting state and on the profile.
+/// The menu titles depend on the meeting state and on the profile, and the
+/// disabled source-error items on the statuses.
 fn menu_needs_refresh(changes: &Changes) -> bool {
-    changes.meeting || changes.profile
+    changes.meeting || changes.profile || changes.status
 }
 
 /// Re-register the meeting-only hotkeys when the model says the wanted set
@@ -564,7 +575,7 @@ pub fn run(mtm: MainThreadMarker, config: Config, commands: CommandSink) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn menu_refreshes_on_meeting_or_profile_changes_only() {
+    fn menu_refreshes_on_meeting_profile_or_status_changes() {
         let none = Changes::NONE;
         assert!(!menu_needs_refresh(&none));
         assert!(menu_needs_refresh(&Changes {
@@ -575,7 +586,7 @@ mod tests {
             profile: true,
             ..Changes::NONE
         }));
-        assert!(!menu_needs_refresh(&Changes {
+        assert!(menu_needs_refresh(&Changes {
             status: true,
             ..Changes::NONE
         }));

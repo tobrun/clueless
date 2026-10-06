@@ -119,6 +119,9 @@ pub struct MenuCallbacks {
 
 const MEETING_RUNNING_TITLE: &str = "●";
 const MEETING_IDLE_TITLE: &str = "○";
+/// Appended to the circle while a capture source is down, so a failure is
+/// visible in the menu bar even with both windows hidden.
+const SOURCE_DOWN_MARKER: &str = "!";
 
 /// Owns the retained status item (spec: NSStatusItem kept retained - letting
 /// it drop removes the item from the menu bar).
@@ -140,8 +143,8 @@ impl StatusItemController {
         let item = bar.statusItemWithLength(NSVariableStatusItemLength);
         let handler = MenuHandler::new(mtm, callbacks);
         let controller = Self { item, handler };
-        controller.rebuild_menu(meeting_running, presentation, profile, mtm);
-        controller.set_meeting_running(meeting_running, mtm);
+        controller.rebuild_menu(meeting_running, presentation, profile, &[], mtm);
+        controller.set_meeting_running(meeting_running, false, mtm);
         controller
     }
 
@@ -151,33 +154,52 @@ impl StatusItemController {
         &self.handler
     }
 
-    /// Hollow circle when idle, filled circle while a meeting runs.
-    pub fn set_meeting_running(&self, running: bool, mtm: MainThreadMarker) {
-        let title = if running {
+    /// Hollow circle when idle, filled circle while a meeting runs, plus a
+    /// `!` marker while a capture source is down (spec: a failed source
+    /// cannot be missed).
+    pub fn set_meeting_running(&self, running: bool, source_down: bool, mtm: MainThreadMarker) {
+        let base = if running {
             MEETING_RUNNING_TITLE
         } else {
             MEETING_IDLE_TITLE
         };
+        let title = if source_down {
+            format!("{base}{SOURCE_DOWN_MARKER}")
+        } else {
+            base.to_string()
+        };
         // The title lives on the item's button; `NSStatusItem::setTitle` is
         // deprecated in favour of exactly this.
         if let Some(button) = self.item.button(mtm) {
-            button.setTitle(&NSString::from_str(title));
+            button.setTitle(&NSString::from_str(&title));
         }
     }
 
     /// Rebuild the menu after a meeting-state or presentation change so the
     /// item titles stay truthful (spec D-mode-menu: titles come from
-    /// [`mode::menu_titles`]).
+    /// [`mode::menu_titles`]). `source_errors` holds the full text of every
+    /// down capture source and lands as disabled items at the top, so the
+    /// exact failure is readable without the windows.
     pub fn rebuild_menu(
         &self,
         running: bool,
         p: Presentation,
         profile: AssistProfile,
+        source_errors: &[String],
         mtm: MainThreadMarker,
     ) {
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
         let handler = &*self.handler;
+        for text in source_errors {
+            let item = NSMenuItem::new(mtm);
+            item.setTitle(&NSString::from_str(text));
+            item.setEnabled(false);
+            menu.addItem(&item);
+        }
+        if !source_errors.is_empty() {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
         let (meeting_title, visibility_title, mode_title) = mode::menu_titles(running, p);
 
         let meeting_item = unsafe {
